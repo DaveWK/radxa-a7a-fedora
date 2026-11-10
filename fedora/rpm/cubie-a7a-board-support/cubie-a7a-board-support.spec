@@ -1,6 +1,6 @@
 Name:           cubie-a7a-board-support
 Version:        0.16
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -160,6 +160,19 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-3
+- pinctrl-sun60i-a733 (built for 7.2 and 7.3 kernels): backport of
+  "pinctrl: sunxi: a733: do not switch the mux to read IRQ lines" (Vinicius
+  Pedrosa, list posting of 2026-11-10; not in mainline v7.4-rc3). The main
+  controller no longer sets irq_read_needs_mux: reading a GPIO that is in
+  use as an interrupt left the pin on function 6 instead of the A733
+  interrupt function 14, so its interrupt stopped. On this board that is
+  the microSD card-detect line PF6 (mmc0 cd-gpios); R-PIO never had the
+  flag. The kernel's own driver, which 7.4 kernels use, still has it
+- Its own release on purpose: 0.16-2 has the bank supply lock only, for
+  counting boots against the refcount race
+- Checked by a build. Not yet run on a board
+
 * Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-2
 - pinctrl-sun60i-a733 (built for 7.2 and 7.3 kernels): a mutex per pin bank
   around the bank supply bookkeeping in sunxi_pmx_request() and
