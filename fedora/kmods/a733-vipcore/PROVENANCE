@@ -85,3 +85,11 @@ Changes:
     so a short buffer was read and written past its end); physical_num is
     bounded by MAX_WRAP_USER_PHYSICAL_TABLE_SIZE. /dev/vipcore is created
     0660 (was 0666); cubie-a7a-npu's udev rule gives it group vipcore
+  - VIPCORE_CAPTURE=1 builds only (CAPTURE.md; the packaged module is
+    built without it and is unchanged): os/linux/vip_drv_capture.[ch]
+    (new, GPL-2.0-only), the debugfs command-stream capture;
+    memory/vip_drv_video_memory.[ch]: vipdrv_mem_capture_walk();
+    task/vip_drv_task_common.c: capture hooks before the trigger and at
+    the end of vipdrv_task_wait(); os/linux/vip_drv_device_driver.c:
+    creates and removes the debugfs directory; Makefile: VIPCORE_CAPTURE.
+    capture/: the board-side runner and the splitter (GPL-2.0-only)

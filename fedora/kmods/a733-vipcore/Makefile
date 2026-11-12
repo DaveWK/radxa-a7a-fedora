@@ -31,6 +31,12 @@ vipcore-y := vip_drv_interface.o vip_drv_hardware.o vip_drv_device.o \
 	os/linux/allocator/vip_drv_mem_allocator_wrap_user_memory.o \
 	os/linux/allocator/vip_drv_mem_allocator_wrap_dma_buf.o \
 	os/linux/platform/allwinner/platform_a733.o
+# VIPCORE_CAPTURE=1: command-stream capture through debugfs (CAPTURE.md);
+# never in the packaged module
+ifeq ($(VIPCORE_CAPTURE),1)
+ccflags-y += -DVIPDRV_NPU_CAPTURE=1
+vipcore-y += os/linux/vip_drv_capture.o
+endif
 else
 KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
@@ -41,6 +47,7 @@ clean:
 mrproper: clean
 help:
 	@echo "modules KDIR=...  build vipcore.ko"
+	@echo "  VIPCORE_CAPTURE=1  with the debugfs command-stream capture (CAPTURE.md)"
 	@echo "clean             remove build outputs; mrproper: the same"
 .PHONY: modules clean mrproper help
 endif

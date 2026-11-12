@@ -1424,3 +1424,78 @@ vip_status_e vipdrv_mem_get_info(
 
     return status;
 }
+
+#if VIPDRV_NPU_CAPTURE
+vip_status_e vipdrv_mem_capture_walk(
+    vip_uint32_t pid,
+    vip_uint32_t need_flags,
+    vip_uint8_t cache,
+    vipdrv_mem_capture_cb_t cb,
+    void *arg
+    )
+{
+    vipdrv_context_t* context = (vipdrv_context_t*)vipdrv_get_context(VIPDRV_CONTEXT_PROP_ALL);
+    vipdrv_mem_control_block_t* mcb = VIP_NULL;
+    vip_uint32_t i = 0;
+
+    if (VIP_NULL == context || 0 == context->initialize) {
+        return VIP_ERROR_FAILURE;
+    }
+
+    for (i = 1; i < vipdrv_database_free_pos(&context->mem_database); i++) {
+        vipdrv_video_mem_handle_t* ptr = VIP_NULL;
+        vipdrv_allocator_t* allocator = VIP_NULL;
+        vipdrv_mem_capture_info_t info;
+        vip_uint8_t* logical = VIP_NULL;
+        vip_bool_e mapped = vip_false_e;
+
+        if (VIP_SUCCESS != vipdrv_database_use(&context->mem_database, i, (void**)&mcb)) {
+            continue;
+        }
+        if ((VIP_NULL == mcb) || (VIP_NULL == mcb->handle) || (mcb->process_id != pid) ||
+            ((mcb->handle->mem_flag & need_flags) != need_flags)) {
+            vipdrv_database_unuse(&context->mem_database, i);
+            continue;
+        }
+        ptr = mcb->handle;
+        allocator = ptr->allocator;
+
+        vipdrv_os_zero_memory(&info, sizeof(info));
+        info.mem_id = vipdrv_mem_index2id(i);
+        info.mem_flag = ptr->mem_flag;
+        info.allocator_type = ptr->allocator_type;
+        info.physical_num = ptr->physical_num;
+        info.vip_address = (vip_uint64_t)ptr->vip_address;
+        info.physical0 = (ptr->physical_num > 0 && VIP_NULL != ptr->physical_table) ?
+                         (vip_uint64_t)ptr->physical_table[0] : 0;
+        info.size = (vip_uint64_t)ptr->size;
+        info.allocator_name = (VIP_NULL != allocator) ? allocator->name : VIP_NULL;
+
+        logical = ptr->kerl_logical;
+        if ((VIP_NULL == logical) && (VIP_NULL != allocator) &&
+            (VIP_NULL != allocator->callback.map_kernel_logical) &&
+            (VIP_NULL != allocator->callback.unmap_kernel_logical)) {
+            if (VIP_SUCCESS == allocator->callback.map_kernel_logical(ptr)) {
+                logical = ptr->kerl_logical;
+                mapped = vip_true_e;
+            }
+        }
+        #if vpmdENABLE_FLUSH_CPU_CACHE
+        if ((VIP_NULL != logical) && (VIP_NULL != allocator) &&
+            (VIP_NULL != allocator->callback.flush_cache)) {
+            allocator->callback.flush_cache(ptr, cache);
+        }
+        #endif
+
+        cb(arg, &info, logical);
+
+        if (vip_true_e == mapped) {
+            allocator->callback.unmap_kernel_logical(ptr);
+            ptr->kerl_logical = VIP_NULL;
+        }
+        vipdrv_database_unuse(&context->mem_database, i);
+    }
+
+    return VIP_SUCCESS;
+}
+#endif

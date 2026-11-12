@@ -60,6 +60,7 @@
 #include <vip_drv_interface.h>
 #include <vip_drv_context.h>
 #include <linux/capability.h>
+#include <vip_drv_capture.h>
 
 #ifndef DEVICE_NAME
 #define DEVICE_NAME              "vipcore"
@@ -1113,6 +1114,9 @@ static void drv_exit(void)
 #if vpmdENABLE_DEBUGFS
     vipdrv_debug_destroy_fs();
 #endif
+#if VIPDRV_NPU_CAPTURE
+    vipdrv_capture_exit();
+#endif
 
 #if vpmdENABLE_VIDEO_MEMORY_HEAP
     drv_unprepare_video_memory(kdriver);
@@ -1199,6 +1203,11 @@ static vip_int32_t drv_init(void)
     ret = vipdrv_debug_create_fs();
     if (ret < 0) {
        PRINTK("create viplite fs failed, error = %d.\n", ret);
+    }
+#endif
+#if VIPDRV_NPU_CAPTURE
+    if (vipdrv_capture_init() < 0) {
+       PRINTK("create vipcore_capture debugfs failed\n");
     }
 #endif
 

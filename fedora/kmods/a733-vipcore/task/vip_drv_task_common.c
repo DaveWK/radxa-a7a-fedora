@@ -57,6 +57,7 @@
 #include <vip_drv_context.h>
 #include <vip_drv_task_descriptor.h>
 #include <vip_drv_mmu.h>
+#include <vip_drv_capture.h>
 
 #undef VIPDRV_LOG_ZONE
 #define VIPDRV_LOG_ZONE  VIPDRV_LOG_ZONE_TASK
@@ -738,6 +739,45 @@ onError:
     return status;
 }
 
+#if VIPDRV_NPU_CAPTURE
+/* VIPCORE_CAPTURE=1 builds: record the command buffers of this submission
+   (flags bit 4 set on init/preload buffers linked in front of it) and the
+   submitting process's video memory, before the trigger. */
+static void vipdrv_task_capture_submit(
+    vipdrv_task_t* task,
+    vip_uint32_t trigger_physical,
+    vip_uint32_t pid,
+    vip_bool_e init_linked,
+    vip_bool_e preload_linked
+    )
+{
+    vip_uint32_t mem_id = 0, physical = 0, size = 0, i = 0;
+    vip_uint8_t* logical = VIP_NULL;
+
+    if (vip_false_e == vipdrv_capture_task_begin(task, pid, trigger_physical)) {
+        return;
+    }
+    if (VIP_SUCCESS == vipdrv_task_get_cmd_info(task, VIPDRV_TASK_CMD_INIT, 0,
+        &mem_id, &logical, &physical, &size, VIP_NULL)) {
+        vipdrv_capture_cmd(task, VIPDRV_CAPTURE_CMD_INIT | (init_linked ? 0x10 : 0), 0,
+                           mem_id, physical, logical, size);
+    }
+    if (VIP_SUCCESS == vipdrv_task_get_cmd_info(task, VIPDRV_TASK_CMD_PRELOAD, 0,
+        &mem_id, &logical, &physical, &size, VIP_NULL)) {
+        vipdrv_capture_cmd(task, VIPDRV_CAPTURE_CMD_PRELOAD | (preload_linked ? 0x10 : 0), 0,
+                           mem_id, physical, logical, size);
+    }
+    for (i = 0; i < task->subtask_count; i++) {
+        if (VIP_SUCCESS == vipdrv_task_get_cmd_info(task, VIPDRV_TASK_CMD_SUBTASK,
+            task->subtask_index + i, &mem_id, &logical, &physical, &size, VIP_NULL)) {
+            vipdrv_capture_cmd(task, VIPDRV_CAPTURE_CMD_SUBTASK, task->subtask_index + i,
+                               mem_id, physical, logical, size);
+        }
+    }
+    vipdrv_capture_task_submitted(task, pid);
+}
+#endif
+
 /*
 submit the task to hardware
  command order:
@@ -862,6 +902,14 @@ static vip_status_e vipdrv_task_submit_bottom_half(
             hardware->flush_mmu = vip_false_e;
         }
     }
+#endif
+
+#if VIPDRV_NPU_CAPTURE
+#if vpmdPRELOAD_COEFF > 1
+    vipdrv_task_capture_submit(task, trigger_physical, pid, !init_done, need_preload);
+#else
+    vipdrv_task_capture_submit(task, trigger_physical, pid, !init_done, vip_false_e);
+#endif
 #endif
 
     VIPDRV_SHOW_TASK_INFO(task, "submit to hw");
@@ -1090,6 +1138,9 @@ vip_status_e vipdrv_task_wait(
 
         PRINTK_I("dev%d wait task_id=0x%x done\n", device->device_index, task->task_id);
     }
+#if VIPDRV_NPU_CAPTURE
+    vipdrv_capture_task_done(task, status);
+#endif
     return status;
 
 Exception:
@@ -1141,6 +1192,9 @@ Exception:
 #endif
 onError:
     PRINTK_E("fail to wait task_id=0x%x complete status=%d\n", task->task_id, status);
+#if VIPDRV_NPU_CAPTURE
+    vipdrv_capture_task_done(task, status);
+#endif
     return status;
 }
 #endif

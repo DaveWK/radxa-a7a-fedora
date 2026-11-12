@@ -295,4 +295,43 @@ vip_status_e vipdrv_mem_get_info(
     vip_size_t* size,
     vip_uint32_t* pid
     );
+
+#ifndef VIPDRV_NPU_CAPTURE
+#define VIPDRV_NPU_CAPTURE 0
+#endif
+#if VIPDRV_NPU_CAPTURE
+/* one video memory block, for the command-stream capture (VIPCORE_CAPTURE=1) */
+typedef struct _vipdrv_mem_capture_info
+{
+    vip_uint32_t       mem_id;
+    vip_uint32_t       mem_flag;
+    vip_uint32_t       allocator_type;
+    vip_uint32_t       physical_num;
+    vip_uint64_t       vip_address;
+    vip_uint64_t       physical0;
+    vip_uint64_t       size;
+    const vip_char_t   *allocator_name;
+} vipdrv_mem_capture_info_t;
+
+typedef void (*vipdrv_mem_capture_cb_t)(
+    void *arg,
+    const vipdrv_mem_capture_info_t *info,
+    const vip_uint8_t *logical
+    );
+
+/*
+@brief call cb for each video memory block owned by process pid (and carrying
+       all of need_flags), with a kernel mapping of it (NULL if it has none).
+       Blocks without a kernel mapping are mapped for the call and unmapped
+       after. cache (vipdrv_cache_type_e) is applied first, as the runtime
+       does: CLEAN before a submission, INVALID after one. May sleep.
+*/
+vip_status_e vipdrv_mem_capture_walk(
+    vip_uint32_t pid,
+    vip_uint32_t need_flags,
+    vip_uint8_t cache,
+    vipdrv_mem_capture_cb_t cb,
+    void *arg
+    );
+#endif
 #endif
