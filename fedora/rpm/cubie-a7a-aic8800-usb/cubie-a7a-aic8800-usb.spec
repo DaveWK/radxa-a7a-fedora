@@ -1,7 +1,7 @@
 Name:           cubie-a7a-aic8800-usb
-Version:        0.3
-Release:        2%{?dist}
-Summary:        AIC8800D80 USB Wi-Fi and Bluetooth driver for the Cubie A7A (firmware from linux-firmware)
+Version:        0.4
+Release:        1%{?dist}
+Summary:        AIC8800D80 USB Wi-Fi driver and firmware loader for the Cubie A7A (firmware from linux-firmware)
 License:        GPL-2.0-only
 BuildArch:      noarch
 # DKMS version = package version-release: every build is a new DKMS version,
@@ -36,8 +36,11 @@ Recommends:     NetworkManager-wifi wpa_supplicant bluez iw wireless-regdb
 %description
 The AICSemi AIC8800 USB driver (Radxa's radxa-pkg/aic8800, pinned) for the
 AIC8800D80 Wi-Fi 6 / Bluetooth 5 module of the Radxa Cubie A7A, built by DKMS
-against Fedora's own kernel: aic_load_fw (loads the firmware into the chip),
-aic8800_fdrv (Wi-Fi, cfg80211) and aic_btusb (Bluetooth, BlueZ).
+against Fedora's own kernel: aic_load_fw (loads the Wi-Fi and Bluetooth
+firmware into the chip) and aic8800_fdrv (Wi-Fi, cfg80211). Public fixes from
+the radxa-pkg/aic8800 and shenmintao/aic8800d80 forks are applied (scan
+use-after-free, command timeout, bounds checks on firmware-supplied data,
+unplug teardown).
 
 No firmware is included: the driver loads Fedora's linux-firmware files
 (/lib/firmware/aic/aic8800d80/), which this package requires. Files a user
@@ -48,9 +51,10 @@ anything. linux-firmware 20261019's Wi-Fi image is the SDIO build, which the
 loader refuses for this USB chip, so until a USB build is there the chip stays
 unbound and the log says why. Read /usr/share/cubie-a7a/WIFI-FIRMWARE.md.
 
-Also: aic_btusb, not the stock btusb, drives the D80's Bluetooth interface
-(modprobe.d softdep, udev hand-over), and a chip without an eFuse MAC address
-gets a stable locally administered one (udev).
+Bluetooth runs on the kernel's own btusb, which binds the D80's standard
+Bluetooth interface once the firmware runs; the vendor aic_btusb is not built
+and is blacklisted (modprobe.d). A chip without an eFuse MAC address gets a
+stable locally administered one (udev).
 
 %prep
 %setup -q -n aic8800-usb-%{version}
@@ -106,6 +110,23 @@ install -Dpm0755 %{SOURCE6} %{buildroot}%{_libexecdir}/cubie-a7a/aic-udev
 %{_libexecdir}/cubie-a7a/aic-udev
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.4-1
+- Bluetooth on the mainline btusb: aic_btusb is no longer built or shipped
+  (aic_load_fw uploads the Bluetooth patch set itself); modprobe.d
+  blacklists it (blacklist + install /bin/false) instead of the softdep,
+  and the udev hand-over to aic_btusb is gone
+- Scan request use-after-free fixed (shenmintao/aic8800d80 da47f20;
+  radxa-pkg/aic8800 PR #110)
+- A timed-out command is taken off the queue, so a late confirmation no
+  longer writes into a returned stack frame (radxa-pkg/aic8800 issue #84,
+  PR #113; the unlink part, without its device reset)
+- Bounds checks on firmware-supplied data from radxa-pkg/aic8800 PR #114,
+  its 9 patches with USB parts: confirmation copy length, message ids and
+  vif/sta/chan indices, RX lengths and TIDs, RX aggregate lengths, BT
+  patch-table parsers and ext patch count, CAP_NET_ADMIN on private
+  commands, no BUG_ON on an unknown frequency, command allocation failure
+- Unplug teardown lifetime (shenmintao/aic8800d80 PR #106)
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.3-2
 - Recommends wpa_supplicant next to NetworkManager-wifi (it needs
   wpa_supplicant or iwd; without the Wi-Fi plugin wlan0 is unmanaged)
