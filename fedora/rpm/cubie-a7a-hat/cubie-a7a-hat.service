@@ -1,0 +1,13 @@
+[Unit]
+Description=Cubie A7A: load the router HAT (PCIe), NPU, GPU, display and video decoder drivers
+After=network-online.target sshd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+SyslogIdentifier=cubie-a7a-hat
+ExecStart=/usr/libexec/cubie-a7a/hat-enable
+
+[Install]
+WantedBy=multi-user.target

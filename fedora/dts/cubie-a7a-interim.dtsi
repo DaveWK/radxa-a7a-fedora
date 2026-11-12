@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * INTERIM additions to the Cubie A7A device tree, until mainline grows the
+ * drivers. The EHCI/OHCI nodes here rely on the oreboot firmware having already
+ * initialised the hardware (clocks, resets, power domains, PHYs, PCIe link,
+ * Ethernet PHY); the nodes deliberately name no clocks, resets, PHYs or
+ * power domains, so Linux uses the hardware as left and must run with
+ * clk_ignore_unused pd_ignore_unused (cubie-a7a-board-support sets both).
+ * Native paired USB3/PCIe ownership is in cubie-a7a-native-io.dtsi.
+ * Remove each interim piece once its real binding and driver are upstream.
+ */
+
+/ {
+	/* Stamp checked by the cubie-a7a-dtb kernel-install hook. */
+	cubie-a7a,dtb-version = <DTB_VERSION>;
+	cubie-a7a,dtb-origin = DTB_ORIGIN;
+
+	aliases {
+		/* FdtPlatformDxe writes the firmware MAC into ethernet0. */
+		ethernet0 = &gmac0;
+	};
+};
+
+/*
+ * oreboot main resets the Maxio MAE0621A and runs its vendor init; mainline
+ * has no Maxio driver, and another reset from Linux would undo that init.
+ */
+&ext_rgmii0_phy {
+	/delete-property/ reset-gpios;
+	/delete-property/ reset-assert-us;
+	/delete-property/ reset-deassert-us;
+};
+
+&{/soc} {
+	/* USB (oreboot main/src/usb.rs powers, clocks and tunes these). */
+	ehci0: usb@4101000 {
+		compatible = "generic-ehci";
+		reg = <0x4101000 0x100>;
+		interrupts = <GIC_SPI 157 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	ohci0: usb@4101400 {
+		compatible = "generic-ohci";
+		reg = <0x4101400 0x100>;
+		interrupts = <GIC_SPI 158 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	ehci1: usb@4200000 {
+		compatible = "generic-ehci";
+		reg = <0x4200000 0x100>;
+		interrupts = <GIC_SPI 159 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	ohci1: usb@4200400 {
+		compatible = "generic-ohci";
+		reg = <0x4200400 0x100>;
+		interrupts = <GIC_SPI 160 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+};
+
+/*
+ * The SPI NOR is never written from Fedora (A7A rule: the NOR stays as it
+ * is). One whole-chip read-only partition makes Linux's MTD device
+ * read-only, so not even root can erase or write it by accident.
+ *
+ * The flash is also disabled until NOR work is authorised: at 40 MHz on
+ * stock spi-sun6i the first probe (7.3.3) read a corrupt SFDP BFPT (UBSAN
+ * shift exponent 142 in spi_nor_parse_bfpt), and spi-nor derives address
+ * width, erase opcodes and status-register handling from that table.
+ * Without a probe Linux sends the NOR no command at all. Re-enable only
+ * after a read-only SFDP check at a lower spi-max-frequency.
+ */
+&spi0 {
+	flash@0 {
+		status = "disabled";
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "spi-nor";
+				reg = <0x0 0x800000>;
+				read-only;
+			};
+		};
+	};
+};

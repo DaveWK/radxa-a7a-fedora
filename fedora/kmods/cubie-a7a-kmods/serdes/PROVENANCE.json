@@ -1,0 +1,24 @@
+{
+  "license": "GPL-2.0-only; Allwinner notices retained",
+  "primary": {
+    "repository": "https://github.com/alexcaoys/allwinner-bsp",
+    "commit": "656a550c826787e7e72fae58ca793df9e0988ac8",
+    "path": "drivers/phy/sunxi-cadence-combophy.c",
+    "sha256": "73d63f03b6b2a578582455d790a1679c2d245fdc32ce4017801dffd8b3109580"
+  },
+  "source_role": "fixed A7A normal USB0 default USB+DP table and PCIe1 internal100MHz; native Linux ownership/error handling",
+  "firmware_table_cross_reference": {
+    "oreboot_commit": "6969fae28c7da99a728cab5c479f1f04df208316",
+    "usb_table_effects": 234,
+    "pcie_table_effects": 86
+  },
+  "vendor_documentation": {
+    "role": "local lane reset field semantics only",
+    "note": "values checked against vendor documentation, not cited per policy"
+  },
+  "production_files": {
+    "tables.h": "cbd663aed9a1ae71bf7454785bce901cd34c5e53de3ac7ae0910f5d3777ebf47",
+    "phy-core.h": "431ba59d362c6754a736f92fe5fc7a3c3f87cef7d76d23a69297a6a03d231bee",
+    "phy-sun60i-a733.c": "a3f4458cca8f5534e5ca463c5268eb006872e31ff3dc2d45ae5247df4c797385"
+  }
+}

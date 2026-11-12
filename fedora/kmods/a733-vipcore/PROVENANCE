@@ -1,0 +1,87 @@
+VeriSilicon VIPLite kernel driver 2.0.3 ("vipcore") for the Allwinner A733
+NPU (VIP9000).
+
+Source: https://github.com/radxa/allwinner-bsp
+Commit: c83016d2e725d42430048487e7c1d910b40ccaf3
+Path:   drivers/npu/aw_nna_vip/vip2 (sha256 of the unmodified files in
+        UPSTREAM.sha256)
+License: dual MIT / GPL per file (MODULE_LICENSE "Dual MIT/GPL").
+
+Changes:
+  - vendor Kbuild replaced by Makefile (same objects and defines for a
+    platform device without the vendor IOMMU)
+  - os/linux/platform/allwinner/vip_drv_device_platform.[ch] and
+    vip_drv_device_ion.[ch] removed: they need the vendor kernel's sunxi-sid,
+    sunxi-smc, devfreq-cooling and ION headers. platform_a733.c (new,
+    GPL-2.0-only) replaces them: clocks, resets, runtime PM on the PCK-600
+    NPU domain, fixed module clock rate from the node's clock-frequency;
+    module parameter alt_rate (test only) takes the module clock from an
+    existing mux parent instead of pll-npu.
+    A rate above 492 MHz (852 MHz only) is used when the efuse speed bin
+    (nvmem cell "dvfs", SID 0x4c) lists it at the rail's voltage; the bin
+    table is the vendor's vf_mapping_table and npu-opp-table (SPEED.md)
+  - platform_a733.c clears SYS_CFG+0x8 bit 1 at probe (module parameter
+    sram_to_npu, default 1) to route the shared SRAM to the NPU, as the
+    vendor U-Boot and radxa/allwinner-bsp 57c4003 (cubie-aiot-v1.4.8,
+    not on the pinned cubie-aiot-v1.5.0 commit) do
+  - mainline-compat.h (new): nth_page()
+  - os/linux/vip_drv_device_driver.c: platform remove callback returns void
+  - os/linux/allocator/vip_drv_mem_allocator_common.c: MODULE_IMPORT_NS takes
+    a string
+  - os/linux/allocator/vip_drv_mem_allocator_common.c: vipdrv_map_user(),
+    vipdrv_map_user_dma_map() and vipdrv_map_user_dma_buf() set up the VMA
+    vm_mmap() returned (vm_flags_set, vm_page_prot, remap_pfn_range /
+    dma_mmap_coherent / dma_buf_mmap) under mmap_write_lock() instead of
+    down_read() (or no lock): with per-VMA locks vm_flags_set() asserts the
+    mmap write lock and warned on every NPU buffer map. The VMA must still
+    cover the whole range, and the mapping is vm_munmap()ed when setup fails
+    (it leaked). os/linux/vip_drv_device_driver.h: vipdrv_mmap_write_lock()
+  - os/linux/allocator/vip_drv_mem_allocator_wrap_user_memory.c: read the
+    VMA's flags and end before dropping mmap_lock
+  - os/linux/allocator/vip_drv_mem_allocator_common.c: vipdrv_import_pfn_map()
+    (wrapping a VM_PFNMAP mapping, e.g. another driver's dma-buf) resolves
+    each page with follow_pfnmap_start()/follow_pfnmap_end() under
+    mmap_read_lock(), faulting in an unpopulated PTE (or a read-only one in
+    a writable VMA) once with fixup_user_fault(). From 6.6 the vendor compiled the PTE lookup out (the
+    pte_offset_map_lock() module API went away in 6.5) and handed the NPU
+    uninitialised PFNs; a lookup failure also returned VIP_SUCCESS. Every
+    failure, a PFN without a struct page, and kernels 6.6 - 6.11 now return
+    an error. vipdrv_import_page_map() pins with FOLL_LONGTERM, unpins when
+    the cache setup fails and when pin_user_pages() returns a negative
+    errno (it walked pages[] up to the errno cast to unsigned).
+  - os/linux/allocator/vip_drv_mem_allocator_wrap_user_memory.c: a wrap
+    range that starts in, or crosses, a hole between VMAs is refused
+  - NPU write access follows what the kernel grants the caller (the vendor
+    mapped every wrapped buffer NPU-writable unless userspace passed
+    NPU_READ_ONLY, so a read-only file mapping could be DMA-written).
+    os/linux/allocator/vip_drv_mem_allocator_wrap_user_memory.c: an
+    NPU-writable wrap needs VM_WRITE on every VMA of the range;
+    vipdrv_import_page_map() pins with FOLL_WRITE only then, and GUP
+    refuses that pin on a VMA that is not VM_WRITE; vipdrv_import_pfn_map()
+    walks with write set from the NPU access, so it needs VM_WRITE and a
+    writable PTE. os/linux/allocator/vip_drv_mem_allocator_wrap_dma_buf.c:
+    an NPU-writable wrap needs a dma-buf exported writable (FMODE_WRITE),
+    a read-only one is mapped DMA_TO_DEVICE and its MAP_USER mapping is
+    PROT_READ without VM_MAYWRITE (vipdrv_map_user_access()); the
+    dma_buf_get() reference is kept instead of dropped and re-taken, an
+    ERR_PTR from dma_buf_attach() is caught, and the attachment is mapped
+    with the _unlocked calls. memory/vip_drv_video_memory.c: the user
+    memory, dma-buf and physical wraps set the NPU MMU writable bit only
+    for an NPU-writable wrap (the dma-buf and physical wraps ignored
+    NPU_READ_ONLY)
+  - os/linux/allocator/vip_drv_mem_allocator_common.c: the page-list flush
+    handle records its DMA direction. A buffer the NPU only reads is
+    mapped DMA_TO_DEVICE and its CPU cache is never invalidated (no
+    FROM_DEVICE sync), so a cache invalidate cannot drop other writers'
+    dirty lines of a page the process may only read.
+    flush_cache_destroy_pages() unmaps with the direction it mapped with
+    (the vendor mapped BIDIRECTIONAL and unmapped FROM_DEVICE);
+    flush_cache_init_pages() frees its handle when
+    sg_alloc_table_from_pages() fails (it leaked)
+  - os/linux/vip_drv_device_driver.c: VIPDRV_INTRFACE_WRAP_USER_PHYSICAL
+    (vip_create_buffer_from_physical: NPU and MAP_USER access to any
+    physical address) needs CAP_SYS_RAWIO and an argument of exactly
+    sizeof(vipdrv_wrap_user_physical_t) (it is not in vipdrv_command_data,
+    so a short buffer was read and written past its end); physical_num is
+    bounded by MAX_WRAP_USER_PHYSICAL_TABLE_SIZE. /dev/vipcore is created
+    0660 (was 0666); cubie-a7a-npu's udev rule gives it group vipcore

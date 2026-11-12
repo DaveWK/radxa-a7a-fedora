@@ -1,0 +1,19 @@
+{
+  "source": "drivers/pmdomain/sunxi/sun55i-pck600.c",
+  "base": "signed Fedora kernel7.2.9-200.fc44 SRPM +redhat patch",
+  "source_sha256": "1e31b18cc776afcbb9ad3c7f52c317f4c2023560671db4690fb51b76cfbf7daf",
+  "changes": [
+    "initialize callback backpointer",
+    "read stable PWSR ON/OFF, reject other initial states",
+    "honor actual initial genpd state, bounded power-on for always-on domains",
+    "retain A733 PCIe/USB domains for shared SERDES baseline; deep power open",
+    "permanent provider module without module_exit",
+    "GPU_CORE as a subdomain of GPU_TOP; parents of always-on domains switched on first",
+    "a domain that will not switch on at probe is published off, not fatal to the provider",
+    "optional inner-device clocks and reset (GPU_CORE: gpu, gpu-bus, gpu) held for the transition only; PPU state dumped on a stuck transition",
+    "full PPU frame and ID logging at probe, around GPU_CORE transitions and in debugfs pck600-regs; static requests clear the dynamic enable; GPU_CORE experiments gpu_core_seq (0 extended settle_ms wait, 1 request left pending, 2 dynamic policy)",
+    "GPU power on demand (2026-11-12): GPU_CORE not always-on by default, so neither GPU domain is switched on at probe; genpd switches them when the GPU device attaches/resumes. Module parameter gpu_core_always_on=1 restores the always-on GPU_CORE. GPU_TOP holds optional clocks (gpu-ahb, gpu-mbus: the GPU bus master gates) while it is on"
+  ],
+  "genpd_attach_sha256": "32e2f6b0988eba52a2f662fdc2d7132022fbe980f281b2a82babcf3d7f46e18a",
+  "production_sha256": "da640b61a4951b0121fc989c79323381f133ce18e3362fc692de0694a4a8b0a7"
+}

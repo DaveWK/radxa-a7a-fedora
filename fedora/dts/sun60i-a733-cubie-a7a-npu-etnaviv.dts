@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Opt-in test tree: the Fedora Cubie A7A device tree with the NPU bound to
+ * the mainline etnaviv driver instead of vipcore. Not built by the Makefile
+ * and not packaged; see cubie-a7a-npu-etnaviv.dtsi. Build it like the main
+ * tree:
+ *
+ *   cpp -nostdinc -undef -D__DTS__ -x assembler-with-cpp -P -I . -I include \
+ *       -DDTB_VERSION=$(cat DTB_VERSION) -DDTB_ORIGIN='"etnaviv-test"' \
+ *       sun60i-a733-cubie-a7a-npu-etnaviv.dts > npu-etnaviv.pre.dts
+ *   dtc -q -I dts -O dtb -@ -o sun60i-a733-cubie-a7a-npu-etnaviv.dtb \
+ *       npu-etnaviv.pre.dts
+ */
+#include "sun60i-a733-cubie-a7a.dts"
+#include "cubie-a7a-npu-etnaviv.dtsi"

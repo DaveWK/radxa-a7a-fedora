@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * DRAFT, not included by sun60i-a733-cubie-a7a.dts and never booted.
+ *
+ * Allwinner A733 IOMMU, as the sun60i-iommu driver built from
+ * fedora/kmods/a733-iommu expects it (binding:
+ * fedora/kmods/a733-iommu/bindings/allwinner,sun60i-a733-iommu.yaml,
+ * design notes: fedora/kmods/a733-iommu/DESIGN.md).
+ *
+ * The vendor sun60iw2p1.dtsi describes one node, mmu_aw, with a 0x20000
+ * frame, two interrupts, six clocks, two resets and master IDs 0-11. That
+ * is two instances of one IP, each with its own 0x10000 frame, interrupt,
+ * clocks, reset and page table base (the vendor driver writes every
+ * common register twice, 0x10000 apart, and picks the second frame for
+ * IDs 6-11), and they are two nodes here. A vendor master ID N is master
+ * N on iommu0 for N < 6 and master N - 6 on iommu1 otherwise:
+ *
+ *   vendor ID  vendor name  here         power domain (ppu)
+ *   0          USB          &iommu0 0    none (always on); no consumer in
+ *                                        the vendor tree
+ *   1          CSI          &iommu0 1    VI      0
+ *   2          ISP          &iommu0 2    VI      0
+ *   3          VE_ENC       &iommu0 3    VE_ENC  3
+ *   4, 5       dummy04/05   -            not implemented: the vendor driver
+ *                                        never touches their registers,
+ *                                        and nothing must name them
+ *   6          VE_DEC0      &iommu1 0    VE_DEC  2
+ *   7          VE_DEC1      &iommu1 1    VE_DEC  2
+ *   8          DE0          &iommu1 2    DE_SYS  1
+ *   9          DI           &iommu1 3    DE_SYS  1
+ *   10         G2D          &iommu1 4    DE_SYS  1
+ *   11         EINK         &iommu1 5    DE_SYS  1
+ *
+ * Vendor consumers: ve (decoder) <&mmu_aw 6 1>, ve1 <&mmu_aw 7 1>, ve2
+ * (encoder) <&mmu_aw 3 1>, de <&mmu_aw 8 1>, deinterlace <&mmu_aw 9 1>,
+ * g2d <&mmu_aw 10 1>, the VIN scaler/CSI nodes <&mmu_aw 1 0> and the
+ * ISP/TDM nodes <&mmu_aw 2 0>. The second vendor cell (1: translate from probe on, 0:
+ * stay bypassed until the master driver asks) is policy and is gone: a
+ * master translates while it is attached to a paging domain, which with
+ * the default DMA API setup is from the probe of its driver on.
+ *
+ * Clocks and resets are translated to this tree's CCU by register:
+ *
+ *   vendor name              here                  CCU register
+ *   CLK_IOMMU0_SYS_H         CLK_AHB_IOMMU0_SYS    0x058c bit 2
+ *   CLK_IOMMU0_SYS_P         CLK_APB_IOMMU0_SYS    0x058c bit 1
+ *   CLK_IOMMU0_SYS_MBUS      CLK_MBUS_IOMMU0_SYS   0x058c bit 0
+ *   CLK_IOMMU0_MBUS_GATE     CLK_MBUS_IOMMU0       0x05e0 bit 0
+ *   RST_BUS_IOMMU0_SY        RST_BUS_IOMMU0_SYS    0x058c bit 16
+ *   CLK_IOMMU1_SYS_H         CLK_AHB_IOMMU1_SYS    0x05b4 bit 2
+ *   CLK_IOMMU1_SYS_P         CLK_APB_IOMMU1_SYS    0x05b4 bit 1
+ *   CLK_IOMMU1_SYS_MBUS      CLK_MBUS_IOMMU1_SYS   0x05b4 bit 0
+ *   CLK_IOMMU1_MBUS_GATE     CLK_MBUS_IOMMU1       0x05e0 bit 1
+ *   RST_BUS_IOMMU1_SY        RST_BUS_IOMMU1_SYS    0x05b4 bit 16
+ *
+ * The vendor node does not name the two MBUS master gates: its CCU leaves
+ * them as the boot firmware set them, and they read enabled on the running
+ * vendor system (0x05e0 = 0xf0010003). GUESS: the page table walker needs
+ * its gate. The vendor CCU writes 0x05e0 with a key in the upper bits;
+ * this tree's CCU does not, so whether it can switch these two gates at
+ * all is not known.
+ *
+ * Before enabling an instance (DESIGN.md, "Enabling one master at a time"):
+ *  - Power domains. With power-domains present the driver defers until the
+ *    PPU driver (sun55i-pck600) is bound, which board-support blacklists
+ *    for now. Attaching to a power domain lets genpd switch it off when
+ *    nothing holds it: every domain named below must have a bound driver
+ *    that holds it while its hardware is in use, or must not be in use at
+ *    all. Without the PPU driver, delete power-domains and
+ *    power-domain-names from the node (/delete-property/); the driver then
+ *    takes the ports of the consumers as always powered, which is only
+ *    true while nothing switches those domains off.
+ *  - Give "iommus" to one master at a time, starting with a master whose
+ *    domain is known to be on (DE0, <&iommu1 2>). A master that scans out
+ *    or captures when its "iommus" takes effect (a firmware framebuffer on
+ *    the display engine) needs its buffer in a reserved-memory node with
+ *    "iommu-addresses", or it faults until its driver reprograms it.
+ *  - For a first test, keep all memory below 4 GiB (mem=3G, or a 4 GiB
+ *    board), so that bits 9:8 of the page table entries stay zero, then
+ *    repeat with the whole memory.
+ */
+
+&{/soc} {
+	iommu0: iommu@3900000 {
+		compatible = "allwinner,sun60i-a733-iommu";
+		reg = <0x03900000 0x10000>;
+		interrupts = <GIC_SPI 170 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_AHB_IOMMU0_SYS>,
+			 <&ccu CLK_APB_IOMMU0_SYS>,
+			 <&ccu CLK_MBUS_IOMMU0_SYS>,
+			 <&ccu CLK_MBUS_IOMMU0>;
+		clock-names = "ahb", "apb", "mbus", "mbus-master";
+		resets = <&ccu RST_BUS_IOMMU0_SYS>;
+		power-domains = <&ppu 0>,	/* CSI: VI */
+				<&ppu 0>,	/* ISP: VI */
+				<&ppu 3>;	/* VE_ENC */
+		power-domain-names = "master1", "master2", "master3";
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	iommu1: iommu@3910000 {
+		compatible = "allwinner,sun60i-a733-iommu";
+		reg = <0x03910000 0x10000>;
+		interrupts = <GIC_SPI 171 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_AHB_IOMMU1_SYS>,
+			 <&ccu CLK_APB_IOMMU1_SYS>,
+			 <&ccu CLK_MBUS_IOMMU1_SYS>,
+			 <&ccu CLK_MBUS_IOMMU1>;
+		clock-names = "ahb", "apb", "mbus", "mbus-master";
+		resets = <&ccu RST_BUS_IOMMU1_SYS>;
+		power-domains = <&ppu 2>,	/* VE_DEC0: VE_DEC */
+				<&ppu 2>,	/* VE_DEC1: VE_DEC */
+				<&ppu 1>,	/* DE0: DE_SYS */
+				<&ppu 1>,	/* DI: DE_SYS */
+				<&ppu 1>,	/* G2D: DE_SYS */
+				<&ppu 1>;	/* EINK: DE_SYS */
+		power-domain-names = "master0", "master1", "master2",
+				     "master3", "master4", "master5";
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+};

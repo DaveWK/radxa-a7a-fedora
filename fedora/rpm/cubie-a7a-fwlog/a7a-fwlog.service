@@ -1,0 +1,24 @@
+[Unit]
+Description=Cubie A7A: copy the firmware (oreboot/EDK2) boot log into the journal
+Documentation=file:/usr/share/doc/cubie-a7a-fwlog/fwlog.md
+# EDK2 publishes the region only when it booted under oreboot.
+ConditionPathExists=/proc/device-tree/chosen/oreboot,firmware-log
+
+[Service]
+Type=oneshot
+SyslogIdentifier=a7a-fwlog
+# Previous boot first, then this one; each preceded by a label line.
+ExecStart=/usr/bin/echo "=== firmware log, previous boot (a7a-fwlog -p) ==="
+ExecStart=/usr/bin/a7a-fwlog -p
+ExecStart=/usr/bin/echo "=== firmware log, this boot (a7a-fwlog) ==="
+ExecStart=/usr/bin/a7a-fwlog
+# 1 = no (valid) log, e.g. the previous one did not survive a power cycle.
+SuccessExitStatus=1
+# Reading /dev/mem needs root with CAP_SYS_RAWIO; nothing else.
+CapabilityBoundingSet=CAP_SYS_RAWIO
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

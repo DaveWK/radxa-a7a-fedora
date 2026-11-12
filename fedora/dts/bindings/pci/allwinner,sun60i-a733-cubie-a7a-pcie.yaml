@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/allwinner,sun60i-a733-cubie-a7a-pcie.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Cubie A7A native A733 PCIe host
+maintainers:
+  - DaveWK <13626476+DaveWK@users.noreply.github.com>
+allOf:
+  - $ref: /schemas/pci/snps,dw-pcie.yaml#
+properties:
+  compatible:
+    const: allwinner,sun60i-a733-cubie-a7a-pcie
+  reg:
+    maxItems: 4
+  reg-names:
+    items:
+      - const: dbi
+      - const: config
+      - const: atu
+      - const: app
+  clocks:
+    maxItems: 3
+  clock-names:
+    items:
+      - const: aux
+      - const: slv
+      - const: mstr
+  resets:
+    maxItems: 3
+  reset-names:
+    items:
+      - const: app
+      - const: pwr
+      - const: core
+  phys:
+    maxItems: 1
+  phy-names:
+    const: pcie-phy
+  power-domains:
+    maxItems: 1
+  pcie1v8-supply:
+    description: BLDO1 PCIe 1.8V supply.
+  pcie3v3-supply:
+    description: DCDC1 PCIe 3.3V supply.
+  power-gpios:
+    maxItems: 1
+    description: PE11 endpoint power enable, active high.
+  reset-gpios:
+    maxItems: 1
+    description: PE13 endpoint PERST, active low.
+  wake-gpios:
+    maxItems: 1
+    description: PE12 endpoint WAKE input, active low. PME support is pending.
+  num-lanes:
+    const: 1
+  max-link-speed:
+    const: 3
+  interrupts:
+    maxItems: 2
+  interrupt-names:
+    items:
+      - const: app
+      - const: msi
+  legacy-interrupt-controller:
+    type: object
+    properties:
+      interrupt-controller: true
+      "#interrupt-cells":
+        const: 1
+      "#address-cells":
+        const: 0
+    required:
+      - interrupt-controller
+      - "#interrupt-cells"
+      - "#address-cells"
+    additionalProperties: false
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - phys
+  - phy-names
+  - power-domains
+  - pcie1v8-supply
+  - pcie3v3-supply
+  - power-gpios
+  - reset-gpios
+  - wake-gpios
+  - interrupts
+  - interrupt-names
+  - interrupt-map
+  - interrupt-map-mask
+  - legacy-interrupt-controller
+unevaluatedProperties: false

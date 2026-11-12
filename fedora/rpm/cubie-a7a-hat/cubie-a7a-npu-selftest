@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Run the VIPLite sample network on the A733 NPU and report what the driver
+# and the runtime say: versions, chip id, inference time and cycles.
+#
+#   cubie-a7a-npu-selftest [loops]      default 10 loops
+#
+# Needs the vipcore module (cubie-a7a-npu) and the VIPLite runtime with
+# vpm_run under /opt/viplite, which is not packaged (see /opt/README-a7a-ai.txt).
+set -u
+loops=${1:-10}
+dir=${VIPLITE_SAMPLE_DIR:-/opt/viplite/vpm_run}
+
+[ -c /dev/vipcore ] || { echo "npu-selftest: /dev/vipcore is missing (modprobe vipcore)"; exit 2; }
+[ -x "$dir/vpm_run" ] && [ -f "$dir/sample.txt" ] || {
+    echo "npu-selftest: no vpm_run sample in $dir"
+    exit 2
+}
+cd "$dir" || exit 2
+out=$(timeout 120 ./vpm_run -s sample.txt -l "$loops" -b 0 --show_top5 1 2>&1)
+rc=$?
+printf '%s\n' "$out" | grep -i -E 'version|cid=|inference time|cycle|top5|^ *[0-9]+: ' | head -40
+if [ $rc -ne 0 ]; then
+    echo "npu-selftest: vpm_run exit $rc"
+    printf '%s\n' "$out" | tail -15
+fi
+for f in vip_info clk_freq core_loading; do
+    [ -r /sys/kernel/debug/viplite/$f ] && { echo "debugfs $f:"; head -20 /sys/kernel/debug/viplite/$f; }
+done
+exit $rc

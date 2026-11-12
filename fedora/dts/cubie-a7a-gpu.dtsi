@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Allwinner A733 GPU: Imagination BXM-4-64 (BVNC 36.56.104.183), driven by
+ * the mainline drm/imagination driver (powervr.ko in Fedora's kernel).
+ * Register frame, interrupt, clocks, reset and power domain as the vendor
+ * sun60iw2p1.dtsi describes them.
+ *
+ * Clock: the module clock is parented to PERI0 600 MHz. The vendor table
+ * runs 400 and 600 MHz at 800 mV on every efuse speed bin; 800 MHz and
+ * 1008 MHz (pll-gpu0) need up to 840 mV and 860-960 mV, which nothing in
+ * this tree scales yet.
+ *
+ * Supply: the GPU has its own rail, DCDC4 (the vendor image's regulator
+ * summary lists the GPU as its only consumer). The mainline binding names
+ * no supply here, so the rail is kept on; without that the regulator core
+ * switches an unclaimed rail off after boot. It stays on with the GPU
+ * domains off, as on the vendor image: the PPU power switches, not the
+ * rail, take the GPU's power away.
+ *
+ * Firmware: powervr/rogue_36.56.104.183_v1.fw, which linux-firmware does
+ * not carry (fedora/mk-a733-gpu-fw.py).
+ */
+
+&{/soc} {
+	gpu: gpu@1800000 {
+		compatible = "allwinner,sun60i-a733-gpu", "img,img-bxm-4-64",
+			     "img,img-rogue";
+		reg = <0x01800000 0x90000>;
+		interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_GPU0>, <&ccu CLK_BUS_GPU0>;
+		clock-names = "core", "sys";
+		assigned-clocks = <&ccu CLK_GPU0>;
+		assigned-clock-parents = <&ccu CLK_PLL_PERIPH0_600M>;
+		assigned-clock-rates = <600000000>;
+		resets = <&ccu RST_BUS_GPU0>;
+		/*
+		 * Both GPU domains, outer first. powervr attaches each and
+		 * links them, so a domain that is not on fails the runtime
+		 * resume before any GPU register is read; with only GPU_TOP
+		 * listed, a GPU_CORE left off stalled the bus on the first
+		 * register read.
+		 */
+		power-domains = <&ppu 5>, <&ppu 6>;
+		power-domain-names = "a", "b";
+	};
+};
+
+/*
+ * The PPU switches GPU_CORE on only when the GPU answers on its power-control
+ * channel, so the provider clocks the GPU and releases its reset for that
+ * transition (it hands the reset back before powervr binds). Index 0 stays
+ * the PPU bus clock. The module clock is parked on PERI0 600 MHz first, as
+ * for the GPU itself, rather than on pll-gpu0.
+ *
+ * Power on demand (binding stamp 20): GPU_TOP and GPU_CORE stay off until
+ * the GPU device attaches (powervr, through the power-domains above), and
+ * the GPU clocks stay gated until it enables them. The GPU's AHB and MBUS
+ * master gates, which the GPU binding cannot name, are named here
+ * (gpu-ahb, gpu-mbus): the provider holds them while GPU_TOP is on. They
+ * were critical (always on) before. assigned-clocks only set the rate and
+ * parent; they enable nothing.
+ */
+&ppu {
+	clocks = <&s_prcm CLK_BUS_R_PPU>, <&ccu CLK_GPU0>, <&ccu CLK_BUS_GPU0>,
+		 <&ccu CLK_AHB_GPU0>, <&ccu CLK_MBUS_GPU0>;
+	clock-names = "bus", "gpu", "gpu-bus", "gpu-ahb", "gpu-mbus";
+	resets = <&ccu RST_BUS_GPU0>;
+	reset-names = "gpu";
+	assigned-clocks = <&ccu CLK_GPU0>;
+	assigned-clock-parents = <&ccu CLK_PLL_PERIPH0_600M>;
+	assigned-clock-rates = <600000000>;
+};
+
+&reg_dcdc4 {
+	regulator-always-on;
+};

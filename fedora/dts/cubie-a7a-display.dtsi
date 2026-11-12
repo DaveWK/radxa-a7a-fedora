@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Included by sun60i-a733-cubie-a7a.dts from binding stamp 15; not yet run
+ * on hardware. Only the sunxidrm module (cubie-a7a-display) binds these
+ * nodes, and cubie-a7a-hat.service loads it after sun55i-pck600: DE and HDMI
+ * name PCK-600 domains, so without that driver they stay deferred.
+ *
+ * Allwinner A733 display path for HDMI, as the vendor sunxi-drm driver built
+ * from fedora/kmods/a733-sunxi-drm (sunxidrm.ko) expects it:
+ *
+ *   DE v352 (port 0) -> tcon-tv0 (behind tcon-top1) -> DW HDMI 2.0 TX
+ *
+ * Compatibles, clock-names, reset-names, the "top" phandle, the hdmi_*
+ * properties and the OF-graph shape are that driver's own interface, not
+ * mainline bindings; they stay as the driver reads them. Register frames
+ * and interrupts are the vendor sun60iw2p1.dtsi's. Clocks, resets and
+ * power domains are translated to this tree's CCU and PPU:
+ *
+ *   vendor name              here                    CCU register
+ *   CLK_DE0                  CLK_DE0                 0x0a00
+ *   CLK_BUS_DE0              CLK_BUS_DE0             0x0a04 bit 0
+ *   CLK_DE_AHB_GATE          CLK_AHB_DE              0x05c0 bit 5
+ *   CLK_MBUS_DESYS_GATE      CLK_MBUS_DESYS          0x05e0 bit 11
+ *   CLK_DPSS_TOP1            CLK_BUS_DPSS_TOP1       0x16cc bit 0
+ *   CLK_VID_OUT1_AHB_GATE    CLK_AHB_VID_COUT1       0x05c0 bit 4
+ *   CLK_TCONTV0              CLK_BUS_TCON_TV0        0x1604 bit 0
+ *   CLK_HDMI_REF             CLK_HDMI_CEC            0x1680
+ *   CLK_HDMI                 CLK_BUS_HDMI_TV         0x168c bit 0
+ *   CLK_HDMI_SFR             CLK_HDMI_SFR            0x1690
+ *   CLK_HDCP_ESM             CLK_HDCP_ESM            0x1694
+ *   rtc_ccu CLK_DCXO         hosc (26 MHz)           -
+ *   pck600 PD_DE_SYS/PD_VO1  ppu 1 / ppu 10
+ *
+ * Not carried over: iommus (no IOMMU driver here; the driver then allocates
+ * contiguous buffers with the DMA API and programs bus addresses) and nsi
+ * (the driver never reads it).
+ *
+ * GUESS marks what is inferred and not checked on hardware.
+ */
+
+/ {
+	/* Component master; the driver collects every bound sub-device. */
+	display-subsystem {
+		compatible = "allwinner,sunxi-drm";
+	};
+};
+
+&{/soc} {
+	de: display-engine@5000000 {
+		compatible = "allwinner,display-engine-v352";
+		reg = <0x05000000 0x400000>;
+		interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_DE0>, <&ccu CLK_BUS_DE0>,
+			 <&ccu CLK_AHB_DE>, <&ccu CLK_MBUS_DESYS>;
+		clock-names = "clk_de", "clk_bus_de",
+			      "ahb_vid_out", "mbus_vo_sys";
+		resets = <&ccu RST_BUS_DE0>, <&ccu RST_BUS_DE_SYS>;
+		reset-names = "rst_bus_de", "rst_bus_de_sys";
+		/*
+		 * GUESS: the vendor tree runs DE0 at 600 MHz from pll-de-3x.
+		 * Whether this CCU's pll-de can be set to give that rate has
+		 * not been checked.
+		 */
+		assigned-clocks = <&ccu CLK_DE0>;
+		assigned-clock-parents = <&ccu CLK_PLL_DE_3X>;
+		assigned-clock-rates = <600000000>;
+		power-domains = <&ppu 1>;	/* DE_SYS */
+		/* Channel-to-mixer routing table 0, as the vendor board file. */
+		chn_cfg_mode = <0>;
+
+		/*
+		 * One port per CRTC; only display 0 is described. The
+		 * endpoint reg is the TCON index the driver programs into
+		 * the DE and tcon-top muxes: 4 is tcon-tv0 and must stay 4.
+		 */
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				disp0_out_tcon3: endpoint@4 {
+					reg = <4>;
+					remote-endpoint = <&tcon3_in_disp0>;
+				};
+			};
+		};
+	};
+
+	vo1: tcon-top@5510000 {
+		compatible = "allwinner,tcon-top1";
+		reg = <0x05510000 0x1000>;
+		clocks = <&ccu CLK_BUS_DPSS_TOP1>, <&ccu CLK_AHB_VID_COUT1>;
+		clock-names = "clk_bus_dpss_top", "clk_ahb_gate";
+		resets = <&ccu RST_BUS_DPSS_TOP1>, <&ccu RST_BUS_VIDEO_OUT1>;
+		reset-names = "rst_bus_dpss_top", "rst_bus_reg";
+		power-domains = <&ppu 10>;	/* VO1 */
+	};
+
+	tv0: tcon-tv@5730000 {
+		compatible = "allwinner,tcon-tv";
+		reg = <0x05730000 0x1000>;
+		interrupts = <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_TCON_TV0>;
+		clock-names = "clk_bus_tcon";
+		resets = <&ccu RST_BUS_TCON_TV0>;
+		reset-names = "rst_bus_tcon";
+		top = <&vo1>;
+		/*
+		 * No power-domains, as in the vendor tree: the driver holds
+		 * tcon-top1 (and so VO1) through the "top" device while the
+		 * TCON runs. GUESS that this is enough for register access
+		 * at bind time.
+		 */
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				tcon3_in_disp0: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&disp0_out_tcon3>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				tcon3_out_hdmi0: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&hdmi0_in_tcon3>;
+				};
+			};
+		};
+	};
+
+	hdmi0: hdmi@5520000 {
+		compatible = "allwinner,sunxi-hdmi";
+		/* DW controller, byte-wide registers; top PHY at +0xe0000. */
+		reg = <0x05520000 0x100000>;
+		interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_HDMI_CEC>, <&ccu CLK_BUS_HDMI_TV>,
+			 <&ccu CLK_HDMI_SFR>, <&ccu CLK_HDCP_ESM>, <&hosc>;
+		clock-names = "clk_cec", "clk_hdmi", "clk_hdmi_24M",
+			      "clk_hdcp", "clk_dcxo";
+		/*
+		 * GUESS: which of the three reset bits (0x168c bits 16-18)
+		 * each name is follows this tree's reset header names only.
+		 */
+		resets = <&ccu RST_BUS_HDMI_SUB>, <&ccu RST_BUS_HDMI_MAIN>,
+			 <&ccu RST_BUS_HDMI_HDCP>;
+		reset-names = "rst_bus_sub", "rst_bus_main", "rst_bus_hdcp";
+		power-domains = <&ppu 10>;	/* VO1 */
+
+		/*
+		 * Board properties, from the vendor-kernel Cubie A7A board
+		 * file. GUESS: the two rails are taken from that file, not
+		 * from a schematic. The driver looks each name up as
+		 * "<name>-supply" and only enables it.
+		 */
+		hdmi_power_cnt = <2>;
+		hdmi_power0 = "dcdc2";
+		hdmi_power1 = "cldo2";
+		dcdc2-supply = <&reg_dcdc2>;
+		cldo2-supply = <&reg_cldo2>;
+
+		/* Pixel clock from the HDMI PHY PLL (0), not the CCU (1). */
+		hdmi_clock_source = <0>;
+		/* On-board calibration resistor (1), not the on-chip one (0). */
+		hdmi_resistor_select = <1>;
+		/*
+		 * HDCP 2.x is not built and 1.x is left off; CEC is off until
+		 * the video path has run once.
+		 */
+		hdmi_hdcp1x_enable = <0>;
+		hdmi_hdcp2x_enable = <0>;
+		hdmi_cec_enable = <0>;
+		/*
+		 * hdmi_ddc_index (the fixed I2C adapter number the driver
+		 * registers its DDC bus under) is left at the driver default
+		 * of 31; the vendor board file uses 20. GUESS that neither
+		 * collides with a dynamically numbered bus here.
+		 */
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				hdmi0_in_tcon3: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&tcon3_out_hdmi0>;
+				};
+			};
+		};
+	};
+};

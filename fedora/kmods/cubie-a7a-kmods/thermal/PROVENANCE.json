@@ -1,0 +1,26 @@
+{
+  "source": {
+    "sun8i_thermal.c": {
+      "path": "drivers/thermal/sun8i_thermal.c",
+      "sha256": "37d856590ecda92ca69b1148a05e0c9f9d47a84efd00bd2806d5db82bebab394"
+    },
+    "thermal_hwmon.h": {
+      "path": "drivers/thermal/thermal_hwmon.h",
+      "sha256": "c992845de5a485422d1a3efe4e60051dd0b20588d203875dce3f9fe5f303313c"
+    }
+  },
+  "base": "linux-7.2.10 + patch-7.2-redhat.patch from kernel-7.2.10-200.fc44.src.rpm (signed Fedora SRPM)",
+  "license": "GPL-2.0 (upstream notices retained)",
+  "changes": [
+    "MAX_SENSOR_NUM 5",
+    "A733 chip entry sun60i_a733_ths (compatible allwinner,sun60i-a733-ths): 5 sensors, bus clock + reset, mod clock, H6 register layout",
+    "sun60i_a733_ths_calc_temp: two line segments meeting at code 1769",
+    "sun60i_a733_ths_calibrate: factory temperature + five packed 12-bit codes in three SID words",
+    "interrupt optional (platform_get_irq_optional): the A733 node names none, the thermal core polls"
+  ],
+  "facts": "register map, SID calibration layout and temperature curve from freebsd-src OpiK1 sys/arm/allwinner/a733/a733_ths.c and aw_sid.c (BSD-2-Clause, our own); no vendor code",
+  "production_sha256": {
+    "sun8i_thermal.c": "3d3025493e9ec68c62edb317489dcc1081af4d49ad0da275016e401899de5517",
+    "thermal_hwmon.h": "c992845de5a485422d1a3efe4e60051dd0b20588d203875dce3f9fe5f303313c"
+  }
+}

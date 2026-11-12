@@ -1,0 +1,12 @@
+[Unit]
+Description=Cubie A7A: record the firmware devicetree version, update the ESP override
+ConditionPathExists=/sys/firmware/devicetree/base/compatible
+RequiresMountsFor=/boot/efi /var/lib
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/cubie-a7a/install-dtb
+
+[Install]
+WantedBy=multi-user.target

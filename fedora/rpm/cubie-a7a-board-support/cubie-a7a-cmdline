@@ -1,0 +1,92 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Interim kernel arguments for the Cubie A7A with a stock Fedora kernel.
+#
+# The interim device tree describes PCIe and USB without clocks or power
+# domains (the firmware initialised them), so Linux must not switch off
+# "unused" clocks and power domains at late init.
+#
+# regulator_ignore_unused is TEMPORARY: it stops the regulator core from
+# switching off unclaimed PMIC rails about 30 s after boot, which on the
+# first boot cut DCDC1/SWOUT2 and killed the console. The real fix is
+# regulator-always-on on those rails (fedora/dts/cubie-a7a-tuning.dtsi);
+# this is belt and braces while the router HAT leaves Ethernet as the only
+# way in. TODO: drop it once a boot without it keeps console and Ethernet
+# past 30 s. Removing it from ARGS does not take it off installed entries:
+# the package update that drops it must also run grubby --remove-args and
+# strip it from /etc/kernel/cmdline.
+#
+# cma=512M: Fedora's kernel reserves a 64 MiB CMA pool
+# (CONFIG_CMA_SIZE_MBYTES=64). The video decoder (cubie-a7a-vdec) takes
+# physically contiguous buffers below 4 GiB (no IOMMU): 1080p H.264 with a
+# full reference list needs about 100 MiB, 4K H.264/H.265 300-400 MiB, and
+# the HDMI scan-out buffers (cubie-a7a-display) come from the same pool.
+# The arm64 default places the pool below 4 GiB. CMA pages still serve
+# movable allocations while no device uses them. Only added when no cma= is
+# on the command line yet, so a value set by hand stays; only this exact
+# value is removed again.
+#
+# usage: cubie-a7a-cmdline add|remove
+
+set -eu
+ARGS="clk_ignore_unused pd_ignore_unused regulator_ignore_unused"
+CMA="cma=512M"
+
+# Is a cma= argument already on this command line?
+has_cma() {
+	case " $1 " in *" cma="*) return 0 ;; esac
+	return 1
+}
+
+case "${1:-}" in
+add)
+	if command -v grubby >/dev/null && [ -d /boot/loader/entries ]; then
+		grubby --update-kernel=ALL --args="$ARGS" >/dev/null 2>&1 || :
+		# Per entry, so that an entry with its own cma= keeps it.
+		for e in /boot/loader/entries/*.conf; do
+			[ -f "$e" ] || continue
+			opts=$(sed -n 's/^options[[:space:]]*//p' "$e")
+			has_cma "$opts" ||
+				grubby --update-kernel="$(sed -n 's/^linux[[:space:]]*//p' "$e")" \
+					--args="$CMA" >/dev/null 2>&1 || :
+		done
+	fi
+	# New kernels: kernel-install copies /etc/kernel/cmdline into the
+	# BLS entry, when the file exists.
+	if [ -f /etc/kernel/cmdline ]; then
+		line=$(cat /etc/kernel/cmdline)
+		for a in $ARGS; do
+			case " $line " in *" $a "*) ;; *) line="$line $a" ;; esac
+		done
+		has_cma "$line" || line="$line $CMA"
+		printf '%s\n' "$line" >/etc/kernel/cmdline
+	fi
+	;;
+remove)
+	if command -v grubby >/dev/null && [ -d /boot/loader/entries ]; then
+		grubby --update-kernel=ALL --remove-args="$ARGS" >/dev/null 2>&1 || :
+		for e in /boot/loader/entries/*.conf; do
+			[ -f "$e" ] || continue
+			case " $(sed -n 's/^options[[:space:]]*//p' "$e") " in
+			*" $CMA "*)
+				grubby --update-kernel="$(sed -n 's/^linux[[:space:]]*//p' "$e")" \
+					--remove-args=cma >/dev/null 2>&1 || :
+				;;
+			esac
+		done
+	fi
+	if [ -f /etc/kernel/cmdline ]; then
+		line=" $(cat /etc/kernel/cmdline) "
+		for a in $ARGS $CMA; do
+			line=$(printf '%s' "$line" | sed "s/ $a / /g")
+		done
+		# shellcheck disable=SC2116,SC2086 # collapse the remaining whitespace
+		printf '%s\n' "$(echo $line)" >/etc/kernel/cmdline
+	fi
+	;;
+*)
+	echo "usage: $0 add|remove" >&2
+	exit 2
+	;;
+esac

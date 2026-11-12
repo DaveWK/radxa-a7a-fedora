@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Radxa Cubie A7A: thermal sensors, thermal zones and the fan.
+ *
+ * The A733 THS has five sensors in the H6 register layout; the stock
+ * sun8i_thermal and nvmem_sunxi_sid drivers carry the A733 entries through
+ * cubie-a7a-board-support (kmods thermal/ and nvmem/). The sensor
+ * numbering (0 little cluster, 1 DRAM, 2 NPU, 3 big cluster, 4 GPU) is the
+ * one our FreeBSD a733_ths driver documents; the vendor tree maps its zones
+ * differently, so the first boot checks it against load. No interrupt is
+ * named: the thermal core polls.
+ *
+ * Over-temperature protection is the firmware's (PMIC power-off at 115 C,
+ * the EL3 handler for the SoC trip, A0.10): the critical trips here only
+ * ask the kernel for an orderly power-off first.
+ *
+ * Fan: two-wire 5 V fan switched by Q1 from PL9 (schematic sheets 7/19,
+ * high = on; the vendor drives the same pin as s_pwm0 channel 7). Until an
+ * R_PWM driver exists it is an on/off gpio-fan, switched on by the
+ * 60 C active trips of the CPU and GPU zones and off again below 55 C.
+ */
+
+#include <dt-bindings/thermal/thermal.h>
+
+&{/soc} {
+	sid: efuse@3006000 {
+		compatible = "allwinner,sun60i-a733-sid";
+		reg = <0x03006000 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ths_calibration: thermal-sensor-calibration@44 {
+			reg = <0x44 0xc>;
+		};
+	};
+
+	ths: thermal-sensor@2522000 {
+		compatible = "allwinner,sun60i-a733-ths";
+		reg = <0x02522000 0x500>;
+		clocks = <&ccu CLK_BUS_THS0>, <&ccu CLK_GPADC0_24M>;
+		clock-names = "bus", "mod";
+		resets = <&ccu RST_BUS_THS0>;
+		nvmem-cells = <&ths_calibration>;
+		nvmem-cell-names = "calibration";
+		#thermal-sensor-cells = <1>;
+	};
+};
+
+/ {
+	fan0: gpio-fan {
+		compatible = "gpio-fan";
+		gpios = <&s_gpio 0 9 GPIO_ACTIVE_HIGH>; /* PL9 */
+		gpio-fan,speed-map = <0 0>, <3000 1>;
+		#cooling-cells = <2>;
+	};
+
+	thermal-zones {
+		cpu-little-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&ths 0>;
+
+			trips {
+				cpu_little_fan: fan-on {
+					temperature = <60000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				cpu_little_hot: hot {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_little_crit: critical {
+					temperature = <110000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_little_fan>;
+					cooling-device = <&fan0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		dram-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&ths 1>;
+
+			trips {
+				dram_crit: critical {
+					temperature = <110000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+
+		npu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&ths 2>;
+
+			trips {
+				npu_crit: critical {
+					temperature = <110000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+
+		cpu-big-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&ths 3>;
+
+			trips {
+				cpu_big_fan: fan-on {
+					temperature = <60000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				cpu_big_hot: hot {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_big_crit: critical {
+					temperature = <110000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_big_fan>;
+					cooling-device = <&fan0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&ths 4>;
+
+			trips {
+				gpu_fan: fan-on {
+					temperature = <60000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				gpu_crit: critical {
+					temperature = <110000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gpu_fan>;
+					cooling-device = <&fan0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};

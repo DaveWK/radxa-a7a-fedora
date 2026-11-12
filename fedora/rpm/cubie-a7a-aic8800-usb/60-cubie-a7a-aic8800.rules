@@ -1,0 +1,15 @@
+# Cubie A7A AIC8800D80 (FCU760K on USB, behind the FE1.1S hub port 4).
+# cubie-a7a-aic8800-usb. Mask with: ln -s /dev/null /etc/udev/rules.d/60-cubie-a7a-aic8800.rules
+
+# Bluetooth: once its firmware runs, the D80 (a69c:8d81) has a standard
+# Bluetooth interface (class e0/01/01), which both aic_btusb and the stock
+# btusb match. The vendor image binds aic_btusb; modprobe.d loads it before
+# btusb, and this hands the interface over if btusb still won.
+ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="btusb", \
+  ATTR{bInterfaceNumber}=="00", ATTRS{idVendor}=="a69c", ATTRS{idProduct}=="8d81", \
+  RUN+="/usr/libexec/cubie-a7a/aic-udev bt-rebind %k"
+
+# Wi-Fi MAC: with no MAC in the chip's eFuse the driver makes up
+# 88:00:33:77:xx:xx, different on every load; use a stable local one instead.
+ACTION=="add", SUBSYSTEM=="net", DRIVERS=="aic8800_fdrv", ATTR{address}=="88:00:33:77:*", \
+  RUN+="/usr/libexec/cubie-a7a/aic-udev mac %k"

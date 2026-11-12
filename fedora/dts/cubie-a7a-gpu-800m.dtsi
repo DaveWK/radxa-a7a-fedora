@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Opt-in: Allwinner A733 GPU module clock at 800 MHz instead of 600 MHz.
+ * Not included by the board DTS. Include it after cubie-a7a-gpu.dtsi, and
+ * read GPU-800M.md first: nothing here has run on a board.
+ *
+ * Clock: CLK_GPU0 (CCU 0xb20) mux input 1 is PERI0's 800 MHz output, with
+ * the divider at 1; the vendor driver selects the same input for 800 MHz.
+ * The powervr driver never sets a rate: it takes what assigned-clock-rates
+ * left and reports that rate to the GPU firmware.
+ *
+ * Rail: the vendor table lists 800 MHz at 800, 820 or 840 mV depending on
+ * the efuse speed bin, 840 mV where the bin is unknown. The stock driver
+ * reads no bin and names no supply, so DCDC4 (the GPU's own rail) is fixed
+ * at 840 mV: at or above the table's value for every bin, and below every
+ * bin's 1008 MHz voltage (860-960 mV). The regulator core applies a fixed
+ * voltage when the PMIC regulators register, which on this image happens
+ * before the root file system can be mounted, and the GPU clock is only
+ * touched when the GPU device probes, after cubie-a7a-hat-enable has loaded
+ * the power domain driver from that file system.
+ */
+
+&gpu {
+	assigned-clock-parents = <&ccu CLK_PLL_PERIPH0_800M>;
+	assigned-clock-rates = <800000000>;
+};
+
+&reg_dcdc4 {
+	regulator-min-microvolt = <840000>;
+	regulator-max-microvolt = <840000>;
+};

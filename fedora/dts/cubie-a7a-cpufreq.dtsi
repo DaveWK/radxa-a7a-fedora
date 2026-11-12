@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Opt-in: CPU frequency scaling and thermal throttling for the Cubie A7A,
+ * with the a733-cpufreq modules (fedora/kmods/a733-cpufreq) and the stock
+ * cpufreq-dt driver. Not included by the board DTS. Include it after
+ * cubie-a7a-thermal.dtsi (the SID node and the thermal zones), and read
+ * kmods/a733-cpufreq/DESIGN.md and TESTING.md first: nothing here has run
+ * on a board.
+ *
+ * Stages (DESIGN.md, "Stages"). The default build is stage 1 only:
+ *
+ *   stage 1  rates up to the boot firmware's handover rate (A55 1612 MHz,
+ *            A76 1794 MHz), every one at the handover voltage of 940 mV,
+ *            which is at or above the vendor table value for every speed
+ *            bin this board can have (vf0400, vf0500, vf0401, vf0501) and
+ *            for the DSU at its 1222 MHz. The supplies never change.
+ *   stage 2  -DA733_CPUFREQ_STAGE2: the same rates, also at the speed
+ *            bin's own voltages plus a margin (A733_CPUFREQ_MARGIN_UV,
+ *            default 20 mV as in the boot firmware; 820-940 mV), with the
+ *            shared A55/DSU rail held at or above the DSU's need by the
+ *            driver.
+ *   stage 3  -DA733_CPUFREQ_STAGE2 -DA733_CPUFREQ_STAGE3: also the rates
+ *            above the handover rate (A55 1716 and 1794 MHz, A76 1898,
+ *            1950 and 2002 MHz) at the speed bin's voltages plus the
+ *            margin, as far as the 1000 mV rail caps allow;
+ *            -DA733_CPUFREQ_STAGE3_1050 also raises both caps to 1050 mV,
+ *            the highest voltage of the vendor table. A rate whose voltage
+ *            the cap does not allow is left out by the OPP core.
+ *
+ * The module parameter sun60i_a733_cpufreq.stage (default 1) selects at
+ * most what the tree carries.
+ *
+ * Voltages: radxa/allwinner-bsp c83016d2 configs/linux-6.6/
+ * sun60iw2p1-cpu-vf.dtsi, opp-microvolt-26m-* columns (this board has a
+ * 26 MHz oscillator), identical in the vendor 6.6.98 capture of this board
+ * (sys/live.dts). Rails: DCDC5 for the A55 cluster and the DSU, DCDC3 for
+ * the A76 cluster (same capture, live.dts and regulator summary). See
+ * kmods/a733-cpufreq/PROVENANCE.
+ *
+ * soc_dvfs is the same cell, with the same name, as in
+ * cubie-a7a-npu-852m.dtsi: bits 23:16 of the word, or bits 15:8 when those
+ * are zero, are the speed bin code.
+ */
+
+#include <dt-bindings/thermal/thermal.h>
+
+#if defined(A733_CPUFREQ_STAGE3) && !defined(A733_CPUFREQ_STAGE2)
+#error "A733_CPUFREQ_STAGE3 builds on A733_CPUFREQ_STAGE2"
+#endif
+#if defined(A733_CPUFREQ_STAGE3_1050) && !defined(A733_CPUFREQ_STAGE3)
+#error "A733_CPUFREQ_STAGE3_1050 builds on A733_CPUFREQ_STAGE3"
+#endif
+
+/* Clock indices of the CPU PLL block (sun60i-a733-cpu-ccu.c) */
+#define A733_CPU_CLK_L			0
+#define A733_CPU_CLK_B			1
+#define A733_CPU_CLK_DSU		2
+
+/* opp-supported-hw = <bins stages>; bins: vf0400, vf0500, vf0401, vf0501 */
+#define A733_BINS			0xf
+#define A733_HW_HANDOVER		0x1
+#define A733_HW_ABOVE			0x2
+
+#define A733_HANDOVER_UV		940000
+#define A733_RAIL_CAP_UV		1000000
+#define A733_RAIL_CAP_HV_UV		1050000
+#define A733_LATENCY_NS			244144
+
+#ifndef A733_CPUFREQ_MARGIN_UV
+#define A733_CPUFREQ_MARGIN_UV		20000
+#endif
+#if A733_CPUFREQ_MARGIN_UV < 0
+#error "A733_CPUFREQ_MARGIN_UV must not be negative"
+#endif
+
+/*
+ * Speed bin voltages, stages 2 and 3 only: <target min max>, target = table
+ * value + margin. The minimum is the target, so the supply never goes below
+ * it; the maximum is the rail cap, so the driver's floor for the DSU can
+ * hold the shared rail higher.
+ */
+#ifdef A733_CPUFREQ_STAGE2
+#define A733_TARGET(_v)	((_v) + A733_CPUFREQ_MARGIN_UV)
+#define A733_MAX(_t)	(((_t) > A733_RAIL_CAP_UV) ? (_t) : A733_RAIL_CAP_UV)
+#define A733_UV(_v)	<A733_TARGET(_v) A733_TARGET(_v) A733_MAX(A733_TARGET(_v))>
+#define A733_BIN_UV(_v0400, _v0500, _v0401, _v0501)			\
+	opp-microvolt-26m-vf0400 = A733_UV(_v0400);			\
+	opp-microvolt-26m-vf0500 = A733_UV(_v0500);			\
+	opp-microvolt-26m-vf0401 = A733_UV(_v0401);			\
+	opp-microvolt-26m-vf0501 = A733_UV(_v0501);
+#else
+#define A733_BIN_UV(_v0400, _v0500, _v0401, _v0501)
+#endif
+
+/* Stages 1 and 2: at or below the handover rate */
+#define A733_OPP(_hz, _v0400, _v0500, _v0401, _v0501)		\
+	opp-_hz {							\
+		opp-hz = /bits/ 64 <_hz>;				\
+		opp-microvolt = <A733_HANDOVER_UV>;			\
+		A733_BIN_UV(_v0400, _v0500, _v0401, _v0501)		\
+		clock-latency-ns = <A733_LATENCY_NS>;			\
+		opp-supported-hw = <A733_BINS A733_HW_HANDOVER>;	\
+	}
+
+/* Stage 3: above the handover rate; speed bin voltages only */
+#define A733_OPP_ABOVE(_hz, _v0400, _v0500, _v0401, _v0501)		\
+	opp-_hz {							\
+		opp-hz = /bits/ 64 <_hz>;				\
+		A733_BIN_UV(_v0400, _v0500, _v0401, _v0501)		\
+		clock-latency-ns = <A733_LATENCY_NS>;			\
+		opp-supported-hw = <A733_BINS A733_HW_ABOVE>;		\
+	}
+
+/*
+ * The DSU's table: only read by the driver. opp-microvolt is the highest of
+ * the four bins without margin (stage 1 does not know the bin); stages 2
+ * and 3 read the bin's column, margin included.
+ */
+#define A733_DSU_OPP(_hz, _uv, _v0400, _v0500, _v0401, _v0501)		\
+	opp-_hz {							\
+		opp-hz = /bits/ 64 <_hz>;				\
+		opp-microvolt = <_uv>;					\
+		A733_BIN_UV(_v0400, _v0500, _v0401, _v0501)		\
+	}
+
+/ {
+	cpu_l_opp: opp-table-cpu-l {
+		compatible = "allwinner,sun60i-a733-cubie-a7a-operating-points";
+		opp-shared;
+
+		/*        Hz          vf0400  vf0500  vf0401  vf0501 */
+		A733_OPP(416000000,  800000, 800000, 800000, 800000);
+		A733_OPP(780000000,  800000, 800000, 800000, 800000);
+		A733_OPP(1014000000, 800000, 800000, 800000, 800000);
+		A733_OPP(1196000000, 800000, 800000, 800000, 800000);
+		A733_OPP(1404000000, 840000, 800000, 800000, 800000);
+		A733_OPP(1508000000, 880000, 820000, 820000, 820000);
+		A733_OPP(1612000000, 920000, 860000, 860000, 840000);
+#ifdef A733_CPUFREQ_STAGE3
+		A733_OPP_ABOVE(1716000000, 960000, 900000, 900000, 860000);
+		A733_OPP_ABOVE(1794000000, 1000000, 950000, 950000, 900000);
+#endif
+	};
+
+	cpu_b_opp: opp-table-cpu-b {
+		compatible = "allwinner,sun60i-a733-cubie-a7a-operating-points";
+		opp-shared;
+
+		/*        Hz          vf0400  vf0500  vf0401  vf0501 */
+		A733_OPP(416000000,  800000, 800000, 800000, 800000);
+		A733_OPP(780000000,  800000, 800000, 800000, 800000);
+		A733_OPP(1014000000, 800000, 800000, 800000, 800000);
+		A733_OPP(1196000000, 800000, 800000, 800000, 800000);
+		A733_OPP(1404000000, 800000, 800000, 800000, 800000);
+		A733_OPP(1508000000, 820000, 800000, 800000, 800000);
+		A733_OPP(1612000000, 840000, 820000, 820000, 820000);
+		A733_OPP(1716000000, 870000, 850000, 850000, 840000);
+		A733_OPP(1794000000, 920000, 900000, 900000, 870000);
+#ifdef A733_CPUFREQ_STAGE3
+		A733_OPP_ABOVE(1898000000, 970000, 940000, 940000, 900000);
+		A733_OPP_ABOVE(1950000000, 1000000, 970000, 970000, 930000);
+		A733_OPP_ABOVE(2002000000, 1050000, 1000000, 1000000, 960000);
+#endif
+	};
+
+	dsu_opp: opp-table-dsu {
+		compatible = "allwinner,sun60i-a733-cubie-a7a-operating-points";
+
+		/*            Hz          max     vf0400  vf0500  vf0401  vf0501 */
+		A733_DSU_OPP(312000000,  800000, 800000, 800000, 800000, 800000);
+		A733_DSU_OPP(598000000,  800000, 800000, 800000, 800000, 800000);
+		A733_DSU_OPP(780000000,  800000, 800000, 800000, 800000, 800000);
+		A733_DSU_OPP(910000000,  800000, 800000, 800000, 800000, 800000);
+		A733_DSU_OPP(1066000000, 840000, 840000, 800000, 800000, 800000);
+		A733_DSU_OPP(1144000000, 880000, 880000, 820000, 820000, 820000);
+		A733_DSU_OPP(1222000000, 920000, 920000, 860000, 860000, 840000);
+		A733_DSU_OPP(1248000000, 960000, 960000, 900000, 900000, 860000);
+		A733_DSU_OPP(1274000000, 1000000, 1000000, 950000, 950000, 900000);
+	};
+
+	/* Binds sun60i-a733-cpufreq; the DSU's clock is never changed. */
+	dsu {
+		compatible = "allwinner,sun60i-a733-cubie-a7a-dsu";
+		clocks = <&cpu_ccu A733_CPU_CLK_DSU>;
+		dsu-supply = <&reg_dcdc5>;
+		operating-points-v2 = <&dsu_opp>;
+		nvmem-cells = <&soc_dvfs>;
+		nvmem-cell-names = "dvfs";
+	};
+};
+
+&{/soc} {
+	/* 0x3034 (mux source 0 select) is read; the vendor tree stops at 0x3033 */
+	cpu_ccu: clock-controller@8870000 {
+		compatible = "allwinner,sun60i-a733-cubie-a7a-cpu-ccu";
+		reg = <0x08870000 0x3038>;
+		clocks = <&hosc>;
+		clock-names = "hosc";
+		#clock-cells = <1>;
+	};
+};
+
+&sid {
+	soc_dvfs: soc-dvfs@4c {
+		reg = <0x4c 0x4>;
+	};
+};
+
+/* Vendor sun60iw2p1.dtsi: dynamic-power-coefficient 162 (A55), 598 (A76) */
+#define A733_CPU(_cpu, _clk, _supply, _table, _coeff)			\
+	&_cpu {								\
+		clocks = <&cpu_ccu _clk>;				\
+		cpu-supply = <&_supply>;				\
+		operating-points-v2 = <&_table>;			\
+		dynamic-power-coefficient = <_coeff>;			\
+		#cooling-cells = <2>;					\
+	}
+
+A733_CPU(cpu0, A733_CPU_CLK_L, reg_dcdc5, cpu_l_opp, 162);
+A733_CPU(cpu1, A733_CPU_CLK_L, reg_dcdc5, cpu_l_opp, 162);
+A733_CPU(cpu2, A733_CPU_CLK_L, reg_dcdc5, cpu_l_opp, 162);
+A733_CPU(cpu3, A733_CPU_CLK_L, reg_dcdc5, cpu_l_opp, 162);
+A733_CPU(cpu4, A733_CPU_CLK_L, reg_dcdc5, cpu_l_opp, 162);
+A733_CPU(cpu5, A733_CPU_CLK_L, reg_dcdc5, cpu_l_opp, 162);
+A733_CPU(cpu6, A733_CPU_CLK_B, reg_dcdc3, cpu_b_opp, 598);
+A733_CPU(cpu7, A733_CPU_CLK_B, reg_dcdc3, cpu_b_opp, 598);
+
+/*
+ * Thermal: both clusters throttle at the 90 C passive trip of either CPU
+ * zone. The sensor-to-cluster mapping of cubie-a7a-thermal.dtsi (0 little,
+ * 3 big) is the opposite of the vendor tree's and not yet checked on the
+ * board; throttling both clusters from both zones is right either way. The
+ * fan (60 C) and the 110 C critical trips stay as they are.
+ */
+&{/thermal-zones/cpu-little-thermal/cooling-maps} {
+	map-cpufreq {
+		trip = <&cpu_little_hot>;
+		cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+				 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+	};
+};
+
+&{/thermal-zones/cpu-big-thermal/cooling-maps} {
+	map-cpufreq {
+		trip = <&cpu_big_hot>;
+		cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+				 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+	};
+};
+
+#ifdef A733_CPUFREQ_STAGE2
+/* Supplies change from stage 2 on: wait for them (vendor tree: 250 uV/us) */
+&reg_dcdc3 {
+	regulator-ramp-delay = <250>;
+};
+
+&reg_dcdc5 {
+	regulator-ramp-delay = <250>;
+};
+#endif
+
+#ifdef A733_CPUFREQ_STAGE3_1050
+/*
+ * The top rates of vf0400 parts: A76 2002 MHz is 1050 mV in the vendor
+ * table, A55 1794 MHz is 1000 mV plus the margin.
+ */
+&reg_dcdc3 {
+	regulator-max-microvolt = <A733_RAIL_CAP_HV_UV>;
+};
+
+&reg_dcdc5 {
+	regulator-max-microvolt = <A733_RAIL_CAP_HV_UV>;
+};
+#endif
+
+#ifdef A733_CPUFREQ_TEST_PASSIVE_MC
+/* Test trees only (TESTING.md): the passive trips moved down to see them act */
+&cpu_little_hot {
+	temperature = <A733_CPUFREQ_TEST_PASSIVE_MC>;
+};
+
+&cpu_big_hot {
+	temperature = <A733_CPUFREQ_TEST_PASSIVE_MC>;
+};
+#endif

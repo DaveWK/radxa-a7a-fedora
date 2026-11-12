@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Cubie A7A: values the vendor device tree carries that the mainline-style
+ * series does not yet.
+ *
+ * CPU capacities: 430 for the Cortex-A55 cores and 1024 for the two
+ * Cortex-A76 cores (vendor sun60iw2p1.dtsi), so the scheduler does not treat
+ * the clusters as equal.
+ *
+ * CLDO2 is the HDMI 1.8 V supply (bt0 switches it on). No Linux consumer
+ * claims it yet; kept on so a firmware-initialised display is not cut.
+ *
+ * System rails the regulator core must not switch off when it disables
+ * unclaimed regulators about 30 s after boot. All are regulator-always-on
+ * in the vendor tree and on when firmware hands over:
+ * - DCDC1 (3.3 V) feeds SWOUT1 and SWOUT2; the AXP318 driver makes it their
+ *   supply but takes no reference for a switch nobody has enabled, so
+ *   cutting DCDC1 drops SWOUT2 with it (first boot: console dead right
+ *   after "dcdc1: disabling").
+ * - SWOUT2 is VCC-IO (PB with UART0, PF 3.3 V), VCC-PH, VCC-3V3, VCC-eMMC
+ *   and the card VDD (sheet 4).
+ * - CLDO5 is VCC18-PF, VCC-PC and the SERDES 1.8 V (sheet 4).
+ * - DCDC8, DLDO1 and DLDO6 have no consumer described here and are not
+ *   traced yet; kept as the vendor keeps them until they are.
+ * These are PMIC rails, not the vendor's GPIO "regulator" on PC7, which
+ * board-io deliberately replaces with a hog.
+ *
+ * SWOUT1 (Ethernet PHY 3.3 V, VCC-PD and VCC-PJ through R251/R107) is kept
+ * on as well, although the vendor switches it and dwmac enables it when it
+ * probes: with the router HAT fitted the UART is covered and Ethernet is
+ * the only way into the board, so the PHY rail must never depend on a
+ * module probing in time. Revisit (drop it) once dwmac-sun55i and the PD/PJ
+ * pin users are known to claim it on every boot.
+ * BLDO1 (PCIe 1.8 V, PE/PK) stays switchable: the firmware does no PCIe
+ * bring-up, nothing else uses PE/PK, and sun60i-a733-pcie enables it when
+ * cubie-a7a-hat.service loads the driver.
+ */
+
+&cpu0 { capacity-dmips-mhz = <430>; };
+&cpu1 { capacity-dmips-mhz = <430>; };
+&cpu2 { capacity-dmips-mhz = <430>; };
+&cpu3 { capacity-dmips-mhz = <430>; };
+&cpu4 { capacity-dmips-mhz = <430>; };
+&cpu5 { capacity-dmips-mhz = <430>; };
+&cpu6 { capacity-dmips-mhz = <1024>; };
+&cpu7 { capacity-dmips-mhz = <1024>; };
+
+&reg_cldo2 {
+	regulator-always-on;
+};
+
+&reg_dcdc1 {
+	regulator-always-on;
+};
+
+&reg_swout1 {
+	regulator-always-on;
+};
+
+&reg_swout2 {
+	regulator-always-on;
+};
+
+&reg_cldo5 {
+	regulator-always-on;
+};
+
+&reg_dcdc8 {
+	regulator-always-on;
+};
+
+&reg_dldo1 {
+	regulator-always-on;
+};
+
+&reg_dldo6 {
+	regulator-always-on;
+};
+
+/*
+ * CPU PMU: one generic PMUv3 on PPI 7 (INTID 23) for both clusters, as the
+ * vendor 6.6 tree runs it on this board (arm-pmu requested on all eight
+ * CPUs, no spurious counts). Separate cortex-a55-pmu/cortex-a76-pmu nodes
+ * need ppi-partitions and a 4-cell GIC specifier, which the series' GIC
+ * (#interrupt-cells = 3) does not have; two nodes on the same unpartitioned
+ * PPI would both claim every CPU.
+ */
+/ {
+	pmu {
+		compatible = "arm,armv8-pmuv3";
+		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+/*
+ * microSD slot without a write-protect switch: say so, instead of letting
+ * mmc_sd_setup_card() warn that it cannot read one (mmc_sd_get_ro()).
+ */
+&mmc0 {
+	disable-wp;
+};
+
+/* The 2-wire fan runs from the 5 V input, switched by a transistor (sheet 19). */
+&fan0 {
+	fan-supply = <&reg_vcc5v>;
+};

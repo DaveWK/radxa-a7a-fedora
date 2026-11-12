@@ -1,0 +1,20 @@
+{
+  "kernel": "signed Fedora7.2.9-200.fc44 exact SRPM patched source",
+  "srpm_sha256": "1119f18128f204d0ec00b9f98755e3a69b8d223121eae9ac7d28c3719c2c5d5b",
+  "headers": [
+    {
+      "origin": "drivers/pci/controller/dwc/pcie-designware.h",
+      "sha256": "9c58efbbcbb1e71d64a595738053e6f81f275e95dcb4beb95c52c9772d50ee12",
+      "native": "pcie-designware.h",
+      "native_sha256": "b3f6da67e0cff0a42d12e48394d5561842f6b90cb725b65732995e75cd481035",
+      "adjustment": "one relative include relocation only"
+    },
+    {
+      "origin": "drivers/pci/pci.h",
+      "sha256": "5a333fd6ffb0a961a901ead4c3bf0da18e4349993e7c3e007c662d4c7348d7fe",
+      "native": "pci-internal.h",
+      "native_sha256": "5a333fd6ffb0a961a901ead4c3bf0da18e4349993e7c3e007c662d4c7348d7fe",
+      "adjustment": "byte-identical"
+    }
+  ]
+}

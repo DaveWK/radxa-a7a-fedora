@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Allwinner A733 NPU (VeriSilicon VIP9000), driven by the VIPLite kernel
+ * driver "vipcore" from cubie-a7a-npu. Register frame, interrupt, clocks,
+ * resets and power domain as the vendor sun60iw2p1.dtsi describes them.
+ *
+ * clock-frequency: the vendor table has 492, 852, 1008 and 1044 MHz with a
+ * rail voltage per efuse speed bin. 492 MHz is the rate every bin runs at
+ * 800 mV, the rail's boot voltage (DCDC2, fixed in this tree). Higher rates
+ * need the bin read and the rail raised first.
+ */
+
+&{/soc} {
+	npu: npu@3600000 {
+		compatible = "allwinner,sun60i-a733-npu";
+		reg = <0x03600000 0x1000>;
+		interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_NPU>, <&ccu CLK_PLL_NPU>, <&ccu CLK_BUS_NPU>,
+			 <&ccu CLK_MBUS_NPU>, <&ccu CLK_AHB_NPU>;
+		clock-names = "clk_npu", "clk_parent", "clk_bus",
+			      "clk_mbus_gate", "clk_ahb_gate";
+		resets = <&ccu RST_BUS_NPU_CORE>, <&ccu RST_BUS_NPU_AXI>,
+			 <&ccu RST_BUS_NPU_AHB>;
+		reset-names = "npu_rst", "npu_axi_rst", "npu_ahb_rst";
+		power-domains = <&ppu 4>;
+		clock-frequency = <492000000>;
+	};
+};

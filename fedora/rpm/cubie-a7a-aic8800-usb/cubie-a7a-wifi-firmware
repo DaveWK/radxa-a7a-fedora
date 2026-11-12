@@ -1,0 +1,345 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# cubie-a7a-wifi-firmware: the AIC8800D80 Wi-Fi and Bluetooth firmware of the
+# Radxa Cubie A7A.
+#
+# The driver uses Fedora's linux-firmware files (aic/aic8800d80). This tool reports what the driver will load and, optionally,
+# installs a USB firmware set the user obtained (checked against the pinned
+# manifest, names and SHA256) as an override that takes precedence. It never
+# downloads anything. See WIFI-FIRMWARE.md.
+#
+#   cubie-a7a-wifi-firmware status
+#   cubie-a7a-wifi-firmware install <directory-or-.deb>
+#   cubie-a7a-wifi-firmware remove
+set -euo pipefail
+
+SHARE=/usr/share/cubie-a7a
+MANIFEST=${CUBIE_A7A_WIFI_MANIFEST:-$SHARE/aic8800-d80-usb.manifest}
+FWDIR=${CUBIE_A7A_WIFI_FWDIR:-/usr/lib/firmware/aic8800_fw/USB/aic8800D80}
+# linux-firmware's copy, which the driver uses for every file FWDIR lacks.
+LFDIR=${CUBIE_A7A_LINUX_FWDIR:-/usr/lib/firmware/aic/aic8800d80}
+SYSFS=${CUBIE_A7A_SYSFS:-/sys}
+DOC=$SHARE/WIFI-FIRMWARE.md
+AIC_VID=a69c
+
+die() {
+    echo "cubie-a7a-wifi-firmware: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: cubie-a7a-wifi-firmware status
+       cubie-a7a-wifi-firmware install <directory-or-.deb>
+       cubie-a7a-wifi-firmware remove
+
+The driver loads the AIC8800D80 Wi-Fi/Bluetooth firmware from linux-firmware
+($LFDIR). 'status' shows what it will load.
+'install' (optional) copies the files named in $MANIFEST
+from a directory or a Radxa aic8800-firmware .deb you obtained yourself into
+$FWDIR, after checking every SHA256; they take precedence over
+linux-firmware's. It never downloads.
+Details: $DOC
+EOF
+}
+
+# name size sha256 role, one manifest entry per line.
+entries() {
+    [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing"
+    awk '!/^[[:space:]]*(#|$)/ { print $1, $2, $3, $4 }' "$MANIFEST"
+}
+
+# The file for NAME in DIR: NAME, NAME.xz or NAME.zst (regular files only).
+locate() {
+    local f
+    for f in "$1/$2" "$1/$2.xz" "$1/$2.zst"; do
+        if [ -f "$f" ] && [ ! -L "$f" ]; then
+            printf '%s\n' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Decompressed content of a located file on stdout.
+content() {
+    case $1 in
+    *.xz) xz -dc -- "$1" ;;
+    *.zst) zstd -qdc -- "$1" ;;
+    *) cat -- "$1" ;;
+    esac
+}
+
+sha_of() {
+    content "$1" | sha256sum | cut -d' ' -f1
+}
+
+# --- status ------------------------------------------------------------------
+
+chip_status() {
+    local d pid found=0 i drv
+    for d in "$SYSFS"/bus/usb/devices/*; do
+        [ -f "$d/idVendor" ] && [ "$(cat "$d/idVendor")" = "$AIC_VID" ] || continue
+        found=1
+        pid=$(cat "$d/idProduct")
+        case $pid in
+        8d80) echo "chip:     a69c:8d80 at USB ${d##*/}: ROM mode, no firmware running" ;;
+        8d81) echo "chip:     a69c:8d81 at USB ${d##*/}: firmware running" ;;
+        *) echo "chip:     a69c:$pid at USB ${d##*/}: not an AIC8800D80 id this package knows" ;;
+        esac
+        for i in "$SYSFS/bus/usb/devices/${d##*/}:"*; do
+            [ -e "$i" ] || continue
+            drv=none
+            [ -L "$i/driver" ] && drv=$(basename "$(readlink "$i/driver")")
+            echo "          interface ${i##*/} class $(cat "$i/bInterfaceClass" 2>/dev/null || echo ?): driver $drv"
+        done
+    done
+    [ "$found" = 1 ] || echo "chip:     no AIC8800D80 (a69c:8d80/8d81) on USB (radio powered off, or the USB hub is not up)"
+}
+
+links_status() {
+    local n drv any=0
+    for n in "$SYSFS"/class/net/*; do
+        [ -L "$n/device/driver" ] || continue
+        drv=$(basename "$(readlink "$n/device/driver")")
+        [ "$drv" = aic8800_fdrv ] || continue
+        any=1
+        echo "wifi:     ${n##*/} $(cat "$n/address" 2>/dev/null) (aic8800_fdrv)"
+    done
+    [ "$any" = 1 ] || echo "wifi:     no aic8800_fdrv network interface"
+    any=0
+    for n in "$SYSFS"/class/bluetooth/hci*; do
+        [ -e "$n" ] || continue
+        drv=none
+        [ -L "$n/device/driver" ] && drv=$(basename "$(readlink "$n/device/driver")")
+        case $drv in aic_btusb | btusb) ;; *) continue ;; esac
+        any=1
+        echo "bt:       ${n##*/} ($drv)"
+    done
+    [ "$any" = 1 ] || echo "bt:       no Bluetooth controller on aic_btusb/btusb"
+}
+
+# An AIC8800 Wi-Fi image built for the SDIO host interface (the D80 one in
+# linux-firmware 20261019 is); the USB chip cannot run it, and aic_load_fw
+# refuses it.
+sdio_build() {
+    # Reads the whole file: grep -q would stop the decompressor early, which
+    # pipefail reports as a failure.
+    [ "$(content "$1" | grep -ac 'sdio_func1_h2d')" != 0 ]
+}
+
+cmd_status() {
+    local name size sha role f got req=0 req_ok=0 bad=0 lf_ok=0 lf_files=0 sdio=0
+    chip_status
+    echo "override: $FWDIR"
+    while read -r name size sha role; do
+        if f=$(locate "$FWDIR" "$name"); then
+            got=$(sha_of "$f")
+            if [ "$got" = "$sha" ]; then
+                printf '  ok        %-8s %s\n' "$role" "${f##*/}"
+                [ "$role" != required ] || req_ok=$((req_ok + 1))
+            else
+                printf '  MISMATCH  %-8s %s (sha256 %s, manifest %s)\n' "$role" "${f##*/}" "$got" "$sha"
+                bad=1
+            fi
+        else
+            printf '  missing   %-8s %s\n' "$role" "$name"
+        fi
+        [ "$role" != required ] || req=$((req + 1))
+    done < <(entries)
+    # linux-firmware: the driver's source for each required file the override
+    # lacks. Its patch table names no extension patch, so ext0 is not needed.
+    echo "linux-firmware: $LFDIR"
+    while read -r name size sha role; do
+        [ "$role" = required ] || continue
+        if locate "$FWDIR" "$name" >/dev/null; then
+            continue
+        fi
+        case $name in *_ext[0-9]*.bin) continue ;; esac
+        lf_files=$((lf_files + 1))
+        if f=$(locate "$LFDIR" "$name"); then
+            lf_ok=$((lf_ok + 1))
+            case $name in
+            fmacfw_*)
+                if sdio_build "$f"; then
+                    sdio=1
+                    printf '  present   %s (SDIO build: the USB chip cannot run it)\n' "${f##*/}"
+                    continue
+                fi
+                ;;
+            esac
+            printf '  present   %s\n' "${f##*/}"
+        else
+            printf '  absent    %s\n' "$name"
+        fi
+    done < <(entries)
+    links_status
+    if [ "$bad" = 1 ]; then
+        echo "result:   a file does not match the manifest; run 'cubie-a7a-wifi-firmware remove' and install again"
+        return 4
+    elif [ "$req_ok" = "$req" ]; then
+        echo "result:   firmware installed ($req_ok/$req required files match), the override"
+        return 0
+    elif [ "$sdio" = 1 ]; then
+        echo "result:   linux-firmware's Wi-Fi firmware is the SDIO build, which this USB chip cannot run; Wi-Fi/Bluetooth stay off until a USB build is there (linux-firmware, or the optional override: 'cubie-a7a-wifi-firmware install'). See $DOC"
+        return 3
+    elif [ "$lf_ok" = "$lf_files" ]; then
+        echo "result:   firmware from linux-firmware ($lf_ok/$lf_files files), the override has $req_ok/$req"
+        return 0
+    else
+        echo "result:   firmware not installed ($req_ok/$req required files in the override, $lf_ok/$lf_files in linux-firmware); Wi-Fi/Bluetooth stay off. See $DOC"
+        return 3
+    fi
+}
+
+# --- install -----------------------------------------------------------------
+
+work=
+cleanup() { [ -z "$work" ] || rm -rf -- "$work"; }
+trap cleanup EXIT
+
+# Source directory holding the D80 files, from a directory or a .deb.
+source_dir() {
+    local src=$1 c data
+    if [ -f "$src" ]; then
+        [ "$(head -c 8 -- "$src")" = '!<arch>' ] || die "$src is neither a directory nor a .deb"
+        command -v ar >/dev/null || die "ar (binutils) is needed to read a .deb"
+        mkdir "$work/deb" "$work/root"
+        (cd "$work/deb" && ar x -- "$(realpath -- "$src")") || die "cannot unpack $src"
+        data=$(find "$work/deb" -maxdepth 1 -name 'data.tar*' -type f | head -1)
+        [ -n "$data" ] || die "$src has no data.tar"
+        tar -xf "$data" -C "$work/root" --no-same-owner --no-same-permissions \
+            --wildcards '*aic8800_fw/USB/aic8800D80/*' 2>/dev/null ||
+            die "$src has no aic8800_fw/USB/aic8800D80/ files"
+        src=$work/root
+    fi
+    [ -d "$src" ] || die "$src: no such directory or file"
+    for c in "$src" "$src/aic8800D80" "$src/USB/aic8800D80" "$src/aic8800_fw/USB/aic8800D80" \
+        "$src/lib/firmware/aic8800_fw/USB/aic8800D80" "$src/usr/lib/firmware/aic8800_fw/USB/aic8800D80"; do
+        if [ -d "$c" ] && locate "$c" "$(entries | awk '$4=="required"{print $1; exit}')" >/dev/null; then
+            printf '%s\n' "$c"
+            return 0
+        fi
+    done
+    die "no AIC8800D80 USB firmware files found in $1"
+}
+
+# Probe ROM-mode chips again, so aic_load_fw loads the new firmware now.
+reprobe() {
+    local d i n=0
+    [ -w "$SYSFS/bus/usb/drivers_probe" ] || return 0
+    for d in "$SYSFS"/bus/usb/devices/*; do
+        [ -f "$d/idVendor" ] && [ "$(cat "$d/idVendor")" = "$AIC_VID" ] || continue
+        [ "$(cat "$d/idProduct")" = 8d80 ] || continue
+        modprobe aic_load_fw 2>/dev/null || :
+        for i in "$SYSFS/bus/usb/devices/${d##*/}:"*; do
+            [ -e "$i" ] && [ ! -L "$i/driver" ] || continue
+            echo "${i##*/}" >"$SYSFS/bus/usb/drivers_probe" 2>/dev/null || :
+            n=$((n + 1))
+        done
+    done
+    [ "$n" = 0 ] || echo "probed the AIC8800D80 again; 'cubie-a7a-wifi-firmware status' shows the result"
+}
+
+cmd_install() {
+    local src name size sha role f got stage n=0 bad=0
+    [ $# = 1 ] || {
+        usage >&2
+        exit 2
+    }
+    [ -n "${CUBIE_A7A_WIFI_FWDIR:-}" ] || [ "$(id -u)" = 0 ] || die "install needs root"
+    work=$(mktemp -d "${TMPDIR:-/var/tmp}/cubie-a7a-wifi-firmware.XXXXXX")
+    src=$(source_dir "$1")
+    mkdir -p -- "$(dirname -- "$FWDIR")"
+    # Staged next to the target (same filesystem), checked there, then renamed:
+    # the bytes installed are the bytes checked.
+    stage=$(mktemp -d "$(dirname -- "$FWDIR")/.aic8800D80.XXXXXX")
+    work_stage=$stage
+    trap 'cleanup; rm -rf -- "$work_stage"' EXIT
+    while read -r name size sha role; do
+        if ! f=$(locate "$src" "$name"); then
+            if [ "$role" = required ]; then
+                echo "  missing   required $name" >&2
+                bad=1
+            fi
+            continue
+        fi
+        content "$f" >"$stage/$name" || {
+            echo "  unreadable $f" >&2
+            bad=1
+            continue
+        }
+        got=$(sha256sum <"$stage/$name" | cut -d' ' -f1)
+        if [ "$got" != "$sha" ] || [ "$(stat -c %s "$stage/$name")" != "$size" ]; then
+            echo "  MISMATCH  $name: sha256 $got, manifest $sha" >&2
+            bad=1
+            continue
+        fi
+        echo "  ok        $role $name"
+    done < <(entries)
+    [ "$bad" = 0 ] || die "refused: nothing installed (every file must match $MANIFEST)"
+    mkdir -p -- "$FWDIR"
+    for f in "$stage"/*; do
+        [ -f "$f" ] || continue
+        chmod 0644 -- "$f"
+        name=${f##*/}
+        rm -f -- "$FWDIR/$name.xz" "$FWDIR/$name.zst"
+        mv -f -- "$f" "$FWDIR/$name"
+        n=$((n + 1))
+    done
+    if command -v restorecon >/dev/null && [ -z "${CUBIE_A7A_WIFI_FWDIR:-}" ]; then
+        restorecon -R -- "$(dirname -- "$(dirname -- "$FWDIR")")" 2>/dev/null || :
+    fi
+    echo "installed $n files into $FWDIR (they take precedence over linux-firmware's)"
+    echo "These are AICSemi binaries you supplied; their licence is unclear ($DOC)."
+    [ -n "${CUBIE_A7A_SYSFS:-}" ] || reprobe
+}
+
+cmd_remove() {
+    local name size sha role f n=0 d
+    [ $# = 0 ] || {
+        usage >&2
+        exit 2
+    }
+    [ -n "${CUBIE_A7A_WIFI_FWDIR:-}" ] || [ "$(id -u)" = 0 ] || die "remove needs root"
+    while read -r name size sha role; do
+        for f in "$FWDIR/$name" "$FWDIR/$name.xz" "$FWDIR/$name.zst"; do
+            if [ -e "$f" ] || [ -L "$f" ]; then
+                rm -f -- "$f"
+                n=$((n + 1))
+            fi
+        done
+    done < <(entries)
+    # Empty directories only; files this tool did not install stay.
+    d=$FWDIR
+    for _ in 1 2 3; do
+        rmdir -- "$d" 2>/dev/null || break
+        d=$(dirname -- "$d")
+    done
+    echo "removed $n files from $FWDIR (the driver falls back to linux-firmware's)"
+    echo "A chip already running the firmware keeps it until it loses power: reboot."
+}
+
+[ $# -ge 1 ] || {
+    usage >&2
+    exit 2
+}
+cmd=$1
+shift
+case $cmd in
+-h | --help | help)
+    usage
+    exit 0
+    ;;
+esac
+[ -r "$MANIFEST" ] && [ -n "$(entries)" ] || die "manifest $MANIFEST missing or empty"
+case $cmd in
+status) [ $# = 0 ] || { usage >&2; exit 2; }; cmd_status ;;
+install) cmd_install "$@" ;;
+remove) cmd_remove "$@" ;;
+*)
+    usage >&2
+    exit 2
+    ;;
+esac

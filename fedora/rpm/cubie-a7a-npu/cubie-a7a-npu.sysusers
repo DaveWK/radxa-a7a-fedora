@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Users allowed to open /dev/vipcore (A733 NPU); see 60-cubie-a7a-npu.rules
+g vipcore -

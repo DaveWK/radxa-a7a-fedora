@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Cubie A7A: OPT-IN microSD UHS-I (1.8 V signalling). NOT included from the
+ * board DTS and not run on hardware. The card is the boot and root device:
+ * read kmods/a733-sd-uhs/DESIGN.md and follow TESTING.md before using it.
+ *
+ * Build a test DTB from a wrapper that includes the board DTS and then this
+ * file (TESTING.md, "Building the test DTB"). Stages are chosen with cpp
+ * macros, nothing here needs editing:
+ *
+ *   (none)                         SDR50 capability, card clock <= 50 MHz
+ *   -DSD_UHS_MAX_HZ=100000000      SDR50 at 100 MHz
+ *   -DSD_UHS_SDR104 -DSD_UHS_MAX_HZ=150000000 (then 200000000)   SDR104
+ *
+ * Electrical (public schematic radxa_cubie_a7a_v1.10_schematic.pdf, sheets
+ * 4, 7 and 15): the SoC's PF bank has two supply balls, VCC-IO (SWOUT2,
+ * 3.3 V) and VCC18-PF (CLDO5, 1.8 V), and the SoC selects between them with
+ * PIO register 0x70 (vendor pinctrl-sunxi.c, sunxi_power_auto_switch_pf()).
+ * There is no external switch and no GPIO. reg_pf_io models that selector;
+ * its driver is kmods/a733-sd-uhs/a733-pf-vsel.c. The compatible is local to
+ * this repository (no upstream binding exists).
+ *
+ * REQUIRES a733-pf-vsel.ko in the initramfs. With this include and without
+ * the module, mmc0 waits for vqmmc forever and the root device never appears.
+ *
+ * The card's VDD is SWOUT2 through a 1 ohm resistor (sheet 15) and SWOUT2
+ * also feeds VCC-IO, VCC-PH and VCC-3V3, so Linux cannot power-cycle the
+ * card: a card switched to 1.8 V stays there until the board loses power.
+ *
+ * Deliberately absent:
+ *   sd-uhs-ddr50   stock sunxi-mmc doubles the module clock only for eMMC
+ *                  DDR52, not for UHS DDR50 (sunxi_mmc_clk_set_rate()).
+ *   pinctrl change the vendor's 1.8 V pin state differs from its 3.3 V one
+ *                  only in power-source, which is this regulator.
+ *   vendor phase/delay properties: stock sunxi-mmc has no such inputs.
+ */
+
+#ifndef SD_UHS_MAX_HZ
+#define SD_UHS_MAX_HZ 50000000
+#endif
+
+/ {
+	reg_pf_io: regulator-pf-io {
+		compatible = "allwinner,sun60i-a733-pf-io-regulator";
+		allwinner,pio = <&gpio>;
+		regulator-name = "vcc-pf-io";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <3300000>;
+		vin33-supply = <&reg_swout2>;	/* VCC-IO ball */
+		vin18-supply = <&reg_cldo5>;	/* VCC18-PF ball */
+	};
+};
+
+&mmc0 {
+	vqmmc-supply = <&reg_pf_io>;
+	max-frequency = <SD_UHS_MAX_HZ>;
+	sd-uhs-sdr50;
+#ifdef SD_UHS_SDR104
+	sd-uhs-sdr104;
+#endif
+};

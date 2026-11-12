@@ -1,0 +1,195 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Keep every Fedora kernel on the Cubie A7A bootable with the A733 kmods.
+#
+# The A733 clock, pin, PMIC, DMA and Ethernet drivers are DKMS modules
+# (cubie-a7a-kmods). A Fedora kernel update must not leave the board on a
+# kernel whose initramfs lacks them (no SD root, no console, no Ethernet).
+#
+#   ensure KVER   build the kmods for KVER with DKMS when they are missing
+#                 or another DKMS version than this package's is installed
+#                 (needs kernel-devel for KVER; the old modules stay if the
+#                 build fails), then rebuild KVER's initramfs if it lacks
+#                 them or holds older ones than the module tree
+#   check KVER    exit 0 when KVER has every boot kmod in its module tree
+#                 and its initramfs; print what is missing
+#   guard KVER    on the board: if KVER fails the check, keep the running
+#                 kernel as the GRUB default and log why; if it passes and
+#                 is the newest installed kernel, make it the default
+#
+# Called by the package's RPM transaction file trigger (after every package
+# of a dnf transaction is installed, kernel-devel included) and by the
+# kernel-install plugin 95-cubie-a7a.install.
+
+set -u
+
+VERSION=@VERSION@
+MODULES_DIR=/usr/lib/modules
+# DKMS life cycle of cubie-a7a-kmods (this package's cubie-a7a-dkms copy).
+DKMS=${CUBIE_A7A_DKMS:-/usr/libexec/cubie-a7a/dkms-cubie-a7a-kmods}
+TAG=cubie-a7a-kernel
+# The running kernel. CUBIE_A7A_RUNNING_KERNEL overrides it for tests of the
+# on-board path in an image root (uname -r there is the build host's).
+RUNNING=${CUBIE_A7A_RUNNING_KERNEL:-$(uname -r)}
+
+log() {
+	echo "$TAG: $*" >&2
+	command -v logger >/dev/null 2>&1 && logger -t "$TAG" -- "$*" 2>/dev/null
+	return 0
+}
+
+# Boot kmods for a kernel. The sun6i-dma and dwmac-sun55i overrides carry
+# kernel-internal headers per kernel major.minor (dkms.conf); a kernel series
+# without them gets no override and therefore fails the check.
+boot_modules() {
+	echo "sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma dwmac-sun55i"
+}
+# Of those, the ones the initramfs must carry (dracut-cubie-a7a.conf).
+initramfs_modules() {
+	echo "sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma"
+}
+
+module_path() {
+	# The file depmod selected for KVER (modules.dep), not merely any copy.
+	modinfo -k "$1" -n "$2" 2>/dev/null
+}
+
+check() (
+	k=$1
+	missing=
+	for m in $(boot_modules); do
+		p=$(module_path "$k" "$m")
+		case $p in
+		*/extra/*) ;;
+		*) missing="$missing $m" ;;
+		esac
+	done
+	img=/boot/initramfs-$k.img
+	if [ -f "$img" ]; then
+		list=$(lsinitrd "$img" 2>/dev/null)
+		for m in $(initramfs_modules); do
+			case $list in
+			*"/extra/$m.ko"*) ;;
+			*) missing="$missing initramfs:$m" ;;
+			esac
+		done
+	else
+		missing="$missing initramfs"
+	fi
+	if [ -n "$missing" ]; then
+		echo "$k: missing$missing"
+		return 1
+	fi
+	return 0
+)
+
+# The initramfs holds older boot kmods than the module tree: a DKMS install
+# since it was built (dracut copies the files, so their mtimes are older).
+initramfs_stale() (
+	img=/boot/initramfs-$1.img
+	[ -f "$img" ] || return 0
+	for m in $(initramfs_modules); do
+		p=$(module_path "$1" "$m")
+		case $p in
+		*/extra/*) [ "$p" -nt "$img" ] && return 0 ;;
+		esac
+	done
+	return 1
+)
+
+ensure() {
+	k=$1
+	need_build=no
+	for m in $(boot_modules); do
+		case $(module_path "$k" "$m") in
+		*/extra/*) ;;
+		*) need_build=yes ;;
+		esac
+	done
+	installed=$("$DKMS" installed "$k" 2>/dev/null)
+	if [ "$installed" != "$VERSION" ]; then
+		need_build=yes
+		[ -z "$installed" ] ||
+			log "$k: cubie-a7a-kmods $installed installed, package has $VERSION; rebuilding"
+	fi
+	if [ $need_build = yes ]; then
+		if [ -e "$MODULES_DIR/$k/build/Makefile" ] || [ -e "/usr/src/kernels/$k/Makefile" ]; then
+			"$DKMS" sync "$k" ||
+				log "DKMS build of cubie-a7a-kmods $VERSION for $k failed${installed:+; $installed stays installed}"
+			depmod -a "$k"
+		else
+			log "no kernel-devel for $k yet; the kmods are built when it is installed"
+		fi
+	fi
+	if [ -f "$MODULES_DIR/$k/vmlinuz" ] && { ! check "$k" >/dev/null || initramfs_stale "$k"; }; then
+		dracut -f --kver "$k" >&2 || log "dracut for $k failed"
+	fi
+}
+
+on_board() {
+	# In an image build chroot uname -r names the build host's kernel.
+	[ -d "$MODULES_DIR/$RUNNING" ] && [ -d /boot/loader/entries ] &&
+		command -v grubby >/dev/null 2>&1
+}
+
+newest() {
+	for v in "$MODULES_DIR"/*/vmlinuz; do
+		[ -f "$v" ] || continue
+		v=${v%/vmlinuz}
+		echo "${v##*/}"
+	done | sort -V | tail -n 1
+}
+
+guard() {
+	k=$1
+	if ! on_board; then
+		# Image build chroot: report, never touch the boot loader default.
+		if why=$(check "$k"); then
+			log "$k: board modules and initramfs complete (image build)"
+			return 0
+		fi
+		log "WARNING: $why (image build)"
+		return 1
+	fi
+	running=$RUNNING
+	if why=$(check "$k"); then
+		if [ "$k" = "$(newest)" ]; then
+			grubby --set-default "/boot/vmlinuz-$k" >/dev/null 2>&1 || :
+			log "$k: board modules and initramfs complete; default boot kernel"
+		else
+			log "$k: board modules and initramfs complete"
+		fi
+		return 0
+	fi
+	log "WARNING: kernel $k lacks the Cubie A7A board modules ($why); without them it cannot mount the SD root or bring up Ethernet"
+	if [ "$k" != "$running" ] && check "$running" >/dev/null; then
+		if grubby --set-default "/boot/vmlinuz-$running" >/dev/null 2>&1; then
+			log "kept $running as the default boot kernel; $k stays in the boot menu but is not booted by default"
+		else
+			log "could not set $running as the default boot kernel; check grubby --default-kernel before rebooting"
+		fi
+	fi
+	if [ -e "$MODULES_DIR/$k/build/Makefile" ]; then
+		log "the DKMS build for $k failed or built no override for its kernel series (dkms.conf): see /var/lib/dkms/cubie-a7a-kmods/$VERSION/build/make.log; a newer cubie-a7a-board-support is needed for that series"
+	else
+		log "kernel-devel-$k is not installed; after 'dnf install kernel-devel-$k' run: /usr/libexec/cubie-a7a/kernel ensure $k && /usr/libexec/cubie-a7a/kernel guard $k"
+	fi
+	return 1
+}
+
+cmd=${1:-}
+kver=${2:-}
+case $cmd in
+ensure | check | guard)
+	[ -n "$kver" ] || {
+		echo "usage: $0 ensure|check|guard KERNEL_VERSION" >&2
+		exit 2
+	}
+	"$cmd" "$kver"
+	;;
+*)
+	echo "usage: $0 ensure|check|guard KERNEL_VERSION" >&2
+	exit 2
+	;;
+esac

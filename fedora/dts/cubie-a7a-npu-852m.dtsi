@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Opt-in: Allwinner A733 NPU module clock at 852 MHz instead of 492 MHz.
+ * Not included by the board DTS. Include it after cubie-a7a-thermal.dtsi
+ * (the SID node) and cubie-a7a-npu.dtsi, and read
+ * kmods/a733-vipcore/SPEED.md first: nothing here has run on a board.
+ *
+ * The rate is a request. vipcore (platform_a733.c) uses it only when the
+ * efuse speed bin lists 852 MHz at the voltage the rail is at, and stays at
+ * 492 MHz otherwise. With DCDC2 fixed at 800 mV that is the bins vf0000,
+ * vf0200, vf0201, vf0400, vf0500 and vf0501; vf0401 needs 820 mV and gets
+ * 492 MHz.
+ *
+ * soc-dvfs: the efuse word at SID 0x4c. Bits 23:16, or bits 15:8 when those
+ * are zero, are the SoC speed bin code (the vendor's dvfs_bak and dvfs_ori);
+ * bits 7:0 belong to the thermal calibration cell, which overlaps this one.
+ *
+ * npu-supply: read for its voltage only. The rail is always on and shared
+ * with HDMI; nothing scales it.
+ */
+
+&sid {
+	soc_dvfs: soc-dvfs@4c {
+		reg = <0x4c 0x4>;
+	};
+};
+
+&npu {
+	clock-frequency = <852000000>;
+	nvmem-cells = <&soc_dvfs>;
+	nvmem-cell-names = "dvfs";
+	npu-supply = <&reg_dcdc2>;
+};

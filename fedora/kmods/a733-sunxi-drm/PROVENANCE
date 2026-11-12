@@ -1,0 +1,87 @@
+Allwinner "sunxi-drm" display driver (module sunxidrm), HDMI path only, for
+the Allwinner A733 (sun60iw2): DRM core glue, CRTC/planes, display engine
+v352, TCON-TV behind tcon-top, Synopsys DesignWare HDMI 2.0 TX with the
+Synopsys PHY and the Allwinner top PHY, DMA GEM.
+
+Source: https://github.com/alexcaoys/allwinner-bsp (branch linux-6.18.y)
+Commit: 656a550c826787e7e72fae58ca793df9e0988ac8
+Paths:  drivers/drm/...   -> this directory, same relative paths
+        include/video/... -> bsp-include/video/...
+        (sha256 of the unmodified files in UPSTREAM.sha256, paths relative
+        to the upstream repository root)
+License: GPL-2.0 per file (MODULE_LICENSE "GPL").
+
+Status: builds against 7.3.3-300.fc45.aarch64 (modpost clean). Packaged
+as cubie-a7a-display (DKMS); loaded by cubie-a7a-hat.service after
+sun55i-pck600. First run on hardware 2026-11-11 (pass-2b boot): binds
+tcon-top, DE, HDMI and tcon-tv and modesets HDMI-A-1 at 1366x768.
+
+Imported (174 files): sunxi_drm_{drv,crtc,intf,notify,gem,debug,trace,hdmi},
+sunxi_device/sunxi_{hdmi,tcon,tcon_top}, sunxi_device/hardware/include.h,
+all of lowlevel_de and lowlevel_tcon, lowlevel_hdmi20 without dw_hdcp22.c
+and esm_lib, from lowlevel_lcd tcon_lcd.[ch] with the headers it pulls in
+(tcon_lcd_type.h, dsc_type.h, dsi_v1.h, dsi_v1_type.h), and the four
+include/video headers the code includes.
+
+Left out:
+  - DSI, LVDS, RGB, eDP/DP, panel/, phy/ (DSI combo PHY), lib/ (SHA for DP
+    HDCP), kernel_panic_printf.c, error_img.h, fonts.h
+  - the vendor fbdev (sunxi_drmfb_core.c, sunxi_fbdev_platform.c,
+    sunxi_fbdev_core.c, sunxi_fbdev.h): replaced by the kernel's generic
+    fbdev client
+  - HDCP 2.x (dw_hdcp22.c, esm_lib/): needs the vendor ESM firmware image
+  - the vendor Makefiles and Kconfig: replaced by Makefile and a733-config.h
+
+Kept although not on the A733 path, because shared files reference them:
+  - lowlevel_lcd/tcon_lcd.c (sunxi_tcon.c serves tcon-lcd and tcon-tv)
+  - lowlevel_hdmi20/phy_aw.c, phy_inno.c (sunxi_hdmi.c's platform table)
+  - lowlevel_hdmi20/dw_hdcp.c (HDCP 1.x; also pins the controller's data
+    path, so it is built; enabling HDCP is a DT property and is off)
+
+New files (GPL-2.0-only):
+  - Makefile, dkms.conf
+  - a733-config.h: the Kconfig-style defines of this build; undefines
+    CONFIG_EXTCON for this module so the HDMI code's extcon hot-plug
+    reporting, which needs the private drivers/extcon/extcon.h, is not built
+  - compat/mainline-compat.h: drm_atomic_state -> drm_atomic_commit renames
+  - compat/sunxi-sid.h, compat/sunxi-iommu.h, compat/sunxi-gpio.h: stand-ins
+    for vendor-kernel headers
+  - compat/bsp_stubs.c: sunxi_get_soc_ver()/sunxi_get_soc_markid() returning
+    0, the dw_hdcp2x_* entry points (path override/readback are the vendor's
+    two register accesses, the rest report "not available"), and a module
+    soft dependency on sun55i-pck600
+
+Changes to imported files:
+  - sunxi_drm_drv.c: sunxi_fbdev_init() declaration and call removed;
+    DRM_FBDEV_DMA_DRIVER_OPS added to the drm_driver and drm_client_setup()
+    called after drm_dev_register()
+  - sunxi_drm_drv.c: sunxi_drm_bind() calls
+    aperture_remove_all_conflicting_devices() after component_bind_all(),
+    so the EFI GOP simple-framebuffer (simpledrm fb0) is removed before
+    drm_dev_register()/drm_client_setup() and fbcon takes over the
+    sunxi-drm fbdev
+  - sunxi_drm_drv.c: sunxi_drm_offline_mode_pre_init() (DE write-back
+    "offline" composition, not boot-logo code) is built only with
+    CONFIG_AW_DRM_DE_OFFLINE_MODE, which a733-config.h leaves off; without
+    it the DE call is an -EPERM stub and the function only logged
+    "*ERROR* offline mode: init connecting not found" when no display was
+    connected at bind
+  - sunxi_drm_notify.c: __sunxi_disp_notify.disp_work is initialised
+    statically (sunxi_disp_notify_init() is never called), so the exported
+    async sunxi_disp_notify_call_chain() cannot queue an uninitialised work
+  - sunxi_drm_trace.h: __assign_str() takes one argument
+  - sunxi_device/hardware/lowlevel_de/sunxi_de.c: devfreq governor header is
+    <linux/devfreq-governor.h>
+  - sunxi_device/sunxi_hdmi.c: platform table also matches the root
+    compatible "allwinner,sun60i-a733"
+  - sunxi_device/hardware/lowlevel_hdmi20/phy_snps.c: snps_phy_init()
+    counts the optional "snps_phy" DT table in a signed int (a missing
+    property is -EINVAL, which as u32 sized a 16 GiB kmalloc and a bogus
+    drive_size), checks the cell count, allocates count u32s with kcalloc,
+    frees the buffer on a read error and sets drive_size only on success
+
+Device tree: fedora/dts/cubie-a7a-display.dtsi (included from binding stamp
+15, cubie-a7a-dtb 0.10) describes the nodes
+with this tree's CCU, reset and PPU references; the driver takes clocks,
+resets, regulators and power domains through the generic kernel interfaces
+by name, so no code change was needed for that.

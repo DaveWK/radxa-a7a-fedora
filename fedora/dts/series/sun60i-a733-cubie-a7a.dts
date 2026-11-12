@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+// Copyright (C) 2026 Jerome Brunet <jbrunet@baylibre.com>
+
+/dts-v1/;
+
+#include "sun60i-a733.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Radxa Cubie A7A";
+	compatible = "radxa,cubie-a7a", "allwinner,sun60i-a733";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	reg_vcc5v: regulator-vcc-5v {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC5V0_SYS";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-always-on;
+	};
+
+	reg_ldo2v5: regulator-ldo2v5 {
+		compatible = "regulator-fixed";
+		regulator-name = "LDO2V5_INPUT";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&reg_vcc5v>;
+		regulator-always-on;
+	};
+};
+
+&uart0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart0_pb_pins>;
+	status = "okay";
+};
+
+&s_twi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&s_i2c0_pl01_pins>;
+	status = "okay";
+
+	axp318: pmic@36 {
+		compatible = "x-powers,axp318w";
+		reg = <0x36>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-parent = <&nmi_intc>;
+		interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
+
+		vin19-supply = <&reg_vcc5v>;
+		vin23-supply = <&reg_vcc5v>;
+		vin45-supply = <&reg_vcc5v>;
+		vin678-supply = <&reg_vcc5v>;
+		aldo156in-supply = <&reg_vcc5v>;
+		bldoin-supply = <&reg_ldo2v5>;
+		cldoin-supply = <&reg_ldo2v5>;
+		dldoin-supply = <&reg_vcc5v>;
+		eldoin-supply = <&reg_dcdc9>;
+		ips-supply = <&reg_vcc5v>;
+
+		regulators {
+			reg_dcdc1: dcdc1 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			reg_dcdc2: dcdc2 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <800000>;
+			};
+
+			/* Supplies the "Big" cluster */
+			reg_dcdc3: dcdc3 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <1000000>;
+			};
+
+			reg_dcdc4: dcdc4 {
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <960000>;
+			};
+
+			/* Supplies the "little" cluster */
+			reg_dcdc5: dcdc5 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <1000000>;
+			};
+
+			reg_dcdc6: dcdc6 {
+				regulator-always-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <800000>;
+			};
+
+			reg_dcdc7: dcdc7 {
+				regulator-always-on;
+				regulator-min-microvolt = <1050000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			reg_dcdc8: dcdc8 {
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_dcdc9: dcdc9 {
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1250000>;
+			};
+
+			reg_aldo1: aldo1 {
+				/* Supplies PL - Required for the PMIC */
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			reg_bldo1: bldo1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_bldo2: bldo2 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_bldo4: bldo4 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_bldo5: bldo5 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_cldo1: cldo1 {
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_cldo2: cldo2 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_cldo3: cldo3 {
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_cldo5: cldo5 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_dldo1: dldo1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			reg_dldo6: dldo6 {
+				regulator-min-microvolt = <2500000>;
+				regulator-max-microvolt = <2500000>;
+			};
+
+			reg_eldo1: eldo1 {
+				regulator-always-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <1075000>;
+			};
+
+			reg_eldo6: eldo6 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <800000>;
+			};
+
+			reg_swout1: swout1 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			reg_swout2: swout2 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			reg_rtc_ldo: rtc-ldo {
+				regulator-always-on;
+				/* Fixed at 1.8V */
+			};
+		};
+	};
+};
+
+/*
+ * The schematics are a bit misleading as all signals name are starting
+ * with "GMAC1_" but they are actually connected on pins providing
+ * the GMAC0 function
+ */
+&gmac0 {
+	phy-mode = "rgmii-id";
+	phy-handle = <&ext_rgmii0_phy>;
+	phy-supply = <&reg_swout1>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&gmac0_pins>;
+
+	tx-internal-delay-ps = <1620>;
+	rx-internal-delay-ps = <1800>;
+
+	status = "okay";
+};
+
+&gpio {
+	vcc-pb-supply = <&reg_swout2>; /* VCC-IO */
+	vcc-pc-supply = <&reg_cldo5>;
+	vcc-pd-supply = <&reg_bldo2>;
+	vcc-pe-supply = <&reg_bldo1>;
+	vcc-pf-supply = <&reg_cldo5>;
+	vcc-pg-supply = <&reg_bldo5>;
+	vcc-ph-supply = <&reg_swout2>;
+	vcc-pj-supply = <&reg_bldo2>;
+	vcc-pk-supply = <&reg_bldo1>;
+};
+
+&mdio0 {
+	ext_rgmii0_phy: ethernet-phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <1>;
+
+		// LPI currently unstable
+		eee-broken-100tx;
+		eee-broken-1000t;
+		
+		reset-gpios = <&gpio 7 16 GPIO_ACTIVE_LOW>; /* PH16 */
+		reset-assert-us = <10000>;
+		reset-deassert-us = <150000>;
+	};
+};
+
+&mmc0 {
+	vmmc-supply = <&reg_swout2>;
+	cd-gpios = <&gpio 5 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>; /* PF6 */
+	bus-width = <4>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&mmc0_pins>;
+	status = "okay";
+};
+
+&s_gpio {
+	/*
+	 * Specifying the PL supply would create a circular dependency:
+	 * vcc-pl-supply = <&reg_aldo1>;
+	 */
+	vcc-pm-supply = <&reg_cldo1>;
+};
+
+&spi0  {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_pins>, <&spi0_cs0_pins>;
+
+	flash@0 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+		vcc-supply = <&reg_cldo5>;
+	};
+};

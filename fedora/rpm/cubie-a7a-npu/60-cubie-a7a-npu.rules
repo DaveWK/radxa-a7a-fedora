@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# /dev/vipcore (A733 NPU, vipcore module): root and group vipcore, mode 0660
+# (the module itself creates it 0660 root:root). Whoever can open it can
+# program the NPU's registers and command buffers, which reach any memory:
+# add only trusted users to the group.
+KERNEL=="vipcore", GROUP="vipcore", MODE="0660"

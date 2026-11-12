@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/* Cubie A7A V1.10 sheets7/19: PL12/PL13 S_TWI1, PL3 RTC_INT_L.
+ * A733 PL_CFG1 PL12/13_SELECT=3. Existing HYM8563 Linux consumer.
+ * Linux HYM8563 enables device wakeup when an IRQ exists, even without
+ * wakeup-source. Parent IRQ wake and system suspend acceptance remain open.
+ */
+/ {
+	aliases {
+		/* Exact Fedora HCTOSYS uses rtc0; reserve battery RTC ID0. */
+		rtc0 = &board_rtc;
+		rtc1 = &rtc;
+	};
+};
+
+&s_gpio {
+	s_i2c1_pl1213_pins: s-i2c1-pl1213-pins {
+		pins = "PL12", "PL13";
+		allwinner,pinmux = <3>;
+		function = "s_i2c1";
+	};
+};
+
+&s_twi1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&s_i2c1_pl1213_pins>;
+	status = "okay";
+
+	board_rtc: rtc@51 {
+		compatible = "haoyu,hym8563";
+		reg = <0x51>;
+		interrupt-parent = <&s_gpio>;
+		interrupts = <0 3 IRQ_TYPE_LEVEL_LOW>;
+		#clock-cells = <0>;
+	};
+};
+
+/* Sheet19: PJ27 directly sources blue LED; PJ26 high shunts green via Q11. */
+/ {
+	leds {
+		compatible = "gpio-leds";
+
+		led-blue {
+			label = "radxa:blue:user";
+			gpios = <&gpio 9 27 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+		};
+
+		led-green {
+			label = "radxa:green:power";
+			gpios = <&gpio 9 26 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+	};
+};
+
+&gpio {
+	/* V1.10 sheet7 R251/R107 connect actual bank rails to SWOUT1. */
+	vcc-pd-supply = <&reg_swout1>;
+	vcc-pj-supply = <&reg_swout1>;
+	/*
+	 * Sheet7 draws the VCC-PG ball (1R5) to VCC-PL (ALDO1, 3.3 V) through
+	 * RA19 0R, with the TWI0 pull-ups R76/R77 (2.2K) on PG8/PG9 to VCC-PL
+	 * as well. Sheet4's BLDO5 "VCC-PG" is a net label, not that ball
+	 * (as with PD/PJ). With BLDO5 (1.8 V) here the pin controller would
+	 * set PG to 1.8 V mode while its pads and the bus run at 3.3 V.
+	 */
+	vcc-pg-supply = <&reg_aldo1>;
+
+	twi0_pg89_pins: twi0-pg89-pins {
+		pins = "PG8", "PG9";
+		allwinner,pinmux = <6>; /* A733 PG_CFG1: TWI0 SCK/SDA */
+		function = "i2c0";
+	};
+};
+
+&twi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&twi0_pg89_pins>;
+	clock-frequency = <100000>;
+	status = "okay";
+
+	eeprom@50 {
+		compatible = "atmel,24c16";
+		reg = <0x50>;
+		vcc-supply = <&reg_aldo1>;
+		/* BL24C16F identity layout is unknown; expose raw read-only NVMEM. */
+		read-only;
+		/*
+		 * Q10 inverts PC7: low keeps the transistor off and R207 pulls
+		 * WP high; PC7 high enables writes, so WP is asserted when PC7
+		 * is low. The nvmem core requests wp-gpios asserted at
+		 * registration and AT24 does not opt out. Not a gpio-hog: the
+		 * 7.3 core hog parser takes the first "gpios" cell (bank) as the
+		 * line offset and fails the whole controller with 3 cells.
+		 * Never copy the vendor always-on PC7 regulator.
+		 */
+		wp-gpios = <&gpio 2 7 GPIO_ACTIVE_LOW>; /* PC7 */
+	};
+};
+
+/*
+ * Wi-Fi/BT module (FCU760K, AIC8800D80 on USB behind the FE1.1S hub, port 4).
+ * PM0 switches the module's power, PM1 is its WL_REG_ON chip enable; both
+ * active-high, PM0 first (the vendor DT uses two always-on fixed regulators
+ * with a 1 ms ramp). Without them the module never appears on USB; driving
+ * both high by hand made it enumerate as a69c:8d80 (2026-11-11).
+ */
+/ {
+	reg_wifi_pwr: regulator-wifi-pwr {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi-pwr";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&s_gpio 1 0 GPIO_ACTIVE_HIGH>; /* PM0 */
+		enable-active-high;
+		regulator-enable-ramp-delay = <1000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	reg_wifi_en: regulator-wifi-en {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi-chip-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&s_gpio 1 1 GPIO_ACTIVE_HIGH>; /* PM1, WL_REG_ON */
+		enable-active-high;
+		vin-supply = <&reg_wifi_pwr>;
+		regulator-enable-ramp-delay = <1000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+};

@@ -1,0 +1,18 @@
+{
+  "source": {
+    "sunxi_sid.c": {
+      "path": "drivers/nvmem/sunxi_sid.c",
+      "sha256": "4908521cbd3b40815c2c9746fde381d482dd9a83e7e1f3d862e67199a66534a7"
+    }
+  },
+  "base": "linux-7.2.10 + patch-7.2-redhat.patch from kernel-7.2.10-200.fc44.src.rpm (signed Fedora SRPM)",
+  "license": "GPL-2.0 (upstream notices retained)",
+  "changes": [
+    "sun60i_a733_cfg: value_offset 0x200, size 0x80 (non-secure window only)",
+    "of_match allwinner,sun60i-a733-sid"
+  ],
+  "facts": "register map, SID calibration layout and temperature curve from freebsd-src OpiK1 sys/arm/allwinner/a733/a733_ths.c and aw_sid.c (BSD-2-Clause, our own); no vendor code",
+  "production_sha256": {
+    "sunxi_sid.c": "f66eb7bd6212edffb05e5c66615427f7e8dc5387cebefe3b46cb133d1bfffe3f"
+  }
+}

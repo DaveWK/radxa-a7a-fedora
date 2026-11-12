@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# kernel-install plugin (cubie-a7a-board-support): after dracut, the boot
+# entry and Fedora's default switch (20-grub.install stages the new entry,
+# 95-set-boot-entry.install commits it as saved_entry, 99-grub-mkconfig runs
+# last of Fedora's), make sure the new kernel has the A733 kmods in its module
+# tree and initramfs; otherwise put the default back on the running kernel
+# (/usr/libexec/cubie-a7a/kernel guard). The name sorts after every Fedora
+# plugin so nothing resets the default after this. Never fails the kernel
+# installation: when kernel-devel arrives later in the same dnf transaction,
+# the package's transaction file trigger finishes the job.
+
+COMMAND=${1:-}
+KERNEL_VERSION=${2:-}
+
+[ "$COMMAND" = add ] || exit 0
+[ -n "$KERNEL_VERSION" ] || exit 0
+/usr/libexec/cubie-a7a/kernel ensure "$KERNEL_VERSION" || :
+/usr/libexec/cubie-a7a/kernel guard "$KERNEL_VERSION" || :
+exit 0

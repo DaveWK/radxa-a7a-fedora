@@ -1,0 +1,28 @@
+{
+  "primary": {
+    "repository": "https://github.com/alexcaoys/allwinner-bsp",
+    "commit": "656a550c826787e7e72fae58ca793df9e0988ac8",
+    "path": "drivers/usb/dwc3/phy-sunxi-plat.c",
+    "sha256": "43a73f407470681ebad0f68700fdfe37b854f34d25e754c70bfb409e9ccad467",
+    "git_blob": "31a00dd215b408d3dc1bc8f0784aef94f41b6c7b"
+  },
+  "captured_dt": {
+    "path": "captures/cubie-a7a-vendor-6.6.98/sys/live.dts",
+    "sha256": "553573a7cbf5300117e08e1918354edcbc22072ae252b013d31d5e55f6f2f9d5",
+    "node": "/soc/phy@6b00000",
+    "compatible": "allwinner,sunxi-plat-phy",
+    "rext_mode": 2,
+    "tune": "0x143338d6"
+  },
+  "integration": "Same paired resource owner and mutex; mandatory RES_DCAP24M clock; checked USB2 and calibration-only mappings; init follows DWC3 bus/clock setup. Shared calibration retained across exits, lane-local SIDDQ only. No analog MMIO in probe. No EHCI/OHCI tuning imported.",
+  "linux_consumer": {
+    "version": "7.2.9",
+    "path": "drivers/usb/dwc3/core.c",
+    "sha256": "c84fdfae7bae2f5ee4b78d9a1fe578edd63267311310ecb38a79d96c565eb2f0",
+    "contract": "probe deasserts reset/enables clocks before core ID and core_init; core_init gets PHYs then initializes USB2 beforeUSB3"
+  },
+  "production_files": {
+    "phy-core.h": "89ba56e919993f5188b31f4128259466bcbfb5469962172f0c38e78ed795b907",
+    "phy-sun60i-a733.c": "7150bd906c0c416a61ced34449a312fc2bf9ba64c6334d83fad5b971471e33a8"
+  }
+}

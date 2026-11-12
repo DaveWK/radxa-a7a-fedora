@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Test variant of the Cubie A7A DTB: the board tree with the vendor
+ * sunxidrm display nodes (cubie-a7a-display.dtsi) replaced by the
+ * mainline-style nodes of cubie-a7a-display-open.dtsi for the open driver
+ * a733-display-open. Built with "make open-display"; not shipped and not
+ * the firmware's DTB. See fedora/kmods/a733-display-open/TEST-PLAN.md.
+ */
+#include "sun60i-a733-cubie-a7a.dts"
+
+/ {
+	/delete-node/ display-subsystem;
+};
+
+/delete-node/ &de;
+/delete-node/ &vo1;
+/delete-node/ &tv0;
+/delete-node/ &hdmi0;
+
+#include "cubie-a7a-display-open.dtsi"

@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# kernel-install plugin: re-check the ESP devicetree override whenever a
+# kernel is added. The DTB is not per kernel, so "remove" does nothing.
+[ "${1:-}" = add ] || exit 0
+exec /usr/libexec/cubie-a7a/install-dtb

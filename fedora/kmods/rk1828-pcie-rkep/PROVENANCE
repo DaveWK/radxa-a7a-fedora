@@ -1,0 +1,25 @@
+Rockchip pcie-rkep, DRV_VERSION 0x00030301: the host-side function driver of
+an RK1820/RK1828 coprocessor attached over PCIe (PCI 1d87:182a, 1d87:356a).
+
+Source: https://github.com/youyeetoo/yy3588_linux
+Commit: c27d44f862d0083901724135a83f4ea61c4d0dd9
+Files (sha256 of the unmodified files in UPSTREAM.sha256):
+  drivers/misc/rockchip/pcie-rkep.c
+  drivers/pci/controller/dwc/pcie-dw-dmatest.c
+  drivers/pci/controller/dwc/pcie-dw-dmatest.h
+  drivers/pci/controller/rockchip-pcie-dma.h
+  include/uapi/linux/rk-pcie-ep.h
+License: GPL-2.0 (pcie-rkep.c), GPL-2.0+ OR MIT (dmatest), as marked per file.
+
+Changes for a current mainline kernel and a non-Rockchip host:
+  - includes point at this directory; the DMA test helper is always compiled in
+  - PCI_IRQ_LEGACY -> PCI_IRQ_INTX
+  - MODULE_DEVICE_TABLE(pci, ...) so the module autoloads by PCI id
+  - MODULE_IMPORT_NS of the VFS namespace dropped (built without CONFIG_NO_GKI,
+    so the /data/*.img loader attribute is not built)
+  - strncpy -> strscpy in the DMA test helper
+  - the RK3568/RK3588 root-complex DBI mmap resources return -ENODEV unless the
+    machine is that SoC: the windows are fixed Rockchip addresses (0xf5000000
+    is DRAM on an A733)
+  - PCIE_EP_RESET_CTRL returns -EINVAL (needs a vendor-kernel-only API), as in
+    any build without CONFIG_PCIEASPM_EXT

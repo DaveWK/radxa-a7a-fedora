@@ -1,0 +1,257 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Load the Cubie A7A drivers behind the router HAT, the NPU, the GPU, the
+# HDMI display and the video decoder, one at a time, after the base system
+# (SD root, on-board Ethernet, sshd) is up.
+# These modules are staged (cubie-a7a-board-support blacklists them from
+# automatic loading); a module that hangs the board here must not hang the
+# next boot too, so the name of the module being loaded is written to disk
+# first and a marker left behind by a boot that did not finish skips the run.
+#
+#   cubie_a7a.hat=0 on the kernel command line: do nothing.
+#   rm /var/lib/cubie-a7a/hat-enable.trying: try again after a failed run.
+# The display driver (cubie-a7a-display) runs last, under its own marker, so
+# a hang in its cold HDMI bring-up disables only the display next time:
+#   cubie_a7a.display=0 on the kernel command line: skip the display.
+#   rm /var/lib/cubie-a7a/display-enable.trying: try the display again.
+# The video decoder (cubie-a7a-vdec) comes after it, under a marker of its
+# own as well:
+#   cubie_a7a.vdec=0 on the kernel command line: skip the decoder.
+#   cubie_a7a.vdec_selftest=1: also decode a short clip per codec
+#   (cubie-a7a-vdec-selftest), under the same marker.
+#   rm /var/lib/cubie-a7a/vdec-enable.trying: try the decoder again.
+# Per driver:
+#   cubie_a7a.npu=0 / cubie_a7a.gpu=0: skip vipcore / powervr.
+#   A module that modprobe.d blocks (install <module> /bin/false or
+#   /bin/true, from any modprobe.d directory), that an administrator
+#   blacklisted in /etc/modprobe.d or /run/modprobe.d, or that is in
+#   modprobe.blacklist= on the kernel command line is skipped, not loaded
+#   by name past that decision. (The packages' own blacklist lines in
+#   /usr/lib/modprobe.d only keep the alias loading off and do not count.)
+# Skipped modules are not failures: the exit status is 1 only when a
+# modprobe that was attempted failed.
+set -u
+# Test hooks: state directory, kernel command line file, settle time and
+# administrator modprobe.d directories.
+state=${CUBIE_A7A_HAT_STATE:-/var/lib/cubie-a7a}
+cmdline_file=${CUBIE_A7A_CMDLINE:-/proc/cmdline}
+settle=${CUBIE_A7A_HAT_SETTLE:-2}
+admin_dirs=${CUBIE_A7A_MODPROBE_ADMIN_DIRS:-/etc/modprobe.d /run/modprobe.d}
+marker=$state/hat-enable.trying
+dmarker=$state/display-enable.trying
+vmarker=$state/vdec-enable.trying
+modules="sun55i_pck600 sun60i_a733_serdes sun60i_a733_pcie vipcore powervr"
+
+read -r cmdline <"$cmdline_file"
+case " $cmdline " in
+*" cubie_a7a.hat=0 "*)
+    echo "disabled by cubie_a7a.hat=0"
+    exit 0
+    ;;
+esac
+
+# Module names compare with '-' and '_' alike, as modprobe does.
+norm() { printf '%s\n' "$1" | tr - _; }
+cmdline_blacklist=
+for w in $cmdline; do
+    case $w in
+    modprobe.blacklist=*) cmdline_blacklist="$cmdline_blacklist $(norm "${w#*=}" | tr , ' ')" ;;
+    esac
+done
+mpconf=$(modprobe -c 2>/dev/null | grep -E '^install[[:space:]]')
+
+# Prints why module $1 must not be loaded, if it must not.
+blocked() {
+    n=$(norm "$1")
+    case " $cmdline_blacklist " in
+    *" $n "*)
+        echo "modprobe.blacklist=$n on the kernel command line"
+        return 0
+        ;;
+    esac
+    cmd=$(printf '%s\n' "$mpconf" | awk -v m="$n" '$1 == "install" { x = $2; gsub("-", "_", x); if (x == m) { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit } }')
+    case ${cmd%% *} in
+    false | true | */false | */true)
+        echo "blocked in modprobe.d: install $n $cmd"
+        return 0
+        ;;
+    esac
+    for d in $admin_dirs; do
+        for f in "$d"/*.conf; do
+            [ -f "$f" ] || continue
+            if awk -v m="$n" '$1 == "blacklist" { x = $2; gsub("-", "_", x); if (x == m) b = 1 } END { exit !b }' "$f"; then
+                echo "blocked in modprobe.d: blacklist $n in $f"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# cubie_a7a.<switch>=0 for a module, if it has a switch.
+switch_off() {
+    case $1 in
+    vipcore) sw=npu ;;
+    powervr) sw=gpu ;;
+    *) return 1 ;;
+    esac
+    case " $cmdline " in
+    *" cubie_a7a.$sw=0 "*) echo "disabled by cubie_a7a.$sw=0" ;;
+    *) return 1 ;;
+    esac
+}
+mkdir -p "$state"
+if [ -e "$marker" ]; then
+    echo "skipped: an earlier boot stopped while loading '$(cat "$marker")' (remove $marker to retry)"
+    exit 0
+fi
+rc=0
+for m in $modules; do
+    if why=$(switch_off "$m"); then
+        echo "$m: skipped ($why)"
+        continue
+    fi
+    modinfo "$m" >/dev/null 2>&1 || { echo "$m: not built for $(uname -r), skipped"; continue; }
+    if why=$(blocked "$m"); then
+        echo "$m: skipped ($why)"
+        continue
+    fi
+    echo "$m" >"$marker"
+    sync -f "$marker"
+    if modprobe "$m"; then
+        echo "$m: loaded"
+    else
+        echo "$m: modprobe failed"
+        rc=1
+    fi
+    sleep "$settle"
+done
+# One short inference on the NPU, under the same guard: a stall here must not
+# repeat on the next boot either. Skipped without the unpackaged runtime.
+if [ -c /dev/vipcore ] && [ -x /opt/viplite/vpm_run/vpm_run ]; then
+    echo "npu-selftest" >"$marker"
+    sync -f "$marker"
+    /usr/bin/cubie-a7a-npu-selftest 3 || echo "npu-selftest: failed"
+    dmesg | grep -i -E 'vipcore|viplite|npu' | tail -15
+fi
+rm -f "$marker"
+sync -f "$state"
+
+# HDMI display (sunxidrm). Its DE and HDMI nodes need the PCK-600 domains:
+# without a bound provider they only defer, so the module is not loaded.
+# Binding (and the first modeset with a monitor attached) can complete after
+# modprobe returns, through deferred probe; the marker stays until the HDMI
+# connector exists or 20 s have passed.
+display_enable() {
+    case " $cmdline " in
+    *" cubie_a7a.display=0 "*)
+        echo "display: disabled by cubie_a7a.display=0"
+        return 0
+        ;;
+    esac
+    modinfo sunxidrm >/dev/null 2>&1 || { echo "sunxidrm: not built for $(uname -r), skipped"; return 0; }
+    if why=$(blocked sunxidrm); then
+        echo "sunxidrm: skipped ($why)"
+        return 0
+    fi
+    if [ -e "$dmarker" ]; then
+        echo "display skipped: an earlier boot stopped while loading sunxidrm (remove $dmarker to retry)"
+        return 0
+    fi
+    if ! ls -d /sys/bus/platform/drivers/sunxi-pck-600/*.power-controller >/dev/null 2>&1; then
+        echo "display skipped: the PCK-600 power-domain driver is not bound"
+        return 0
+    fi
+    echo sunxidrm >"$dmarker"
+    sync -f "$dmarker"
+    if ! modprobe sunxidrm; then
+        echo "sunxidrm: modprobe failed"
+        rm -f "$dmarker"
+        sync -f "$state"
+        return 1
+    fi
+    echo "sunxidrm: loaded"
+    i=0
+    while [ $i -lt 20 ] && ! ls -d /sys/class/drm/card*-HDMI-A-* >/dev/null 2>&1; do
+        sleep 1
+        i=$((i + 1))
+    done
+    for c in /sys/class/drm/card*-HDMI-A-*; do
+        [ -e "$c" ] || { echo "sunxidrm: no HDMI connector after 20 s (not bound)"; continue; }
+        echo "${c##*/}: $(cat "$c/status") $(head -1 "$c/modes" 2>/dev/null)"
+    done
+    dmesg | grep -i -E 'sunxi-drm|sunxidrm|\[drm\]|hdmi|tcon|display-engine' | tail -20
+    rm -f "$dmarker"
+    sync -f "$state"
+}
+display_enable || rc=1
+
+# Video decoder (a733-cedrus). Its node needs the PCK-600 VE_DEC domain:
+# without a bound provider it only defers, so the module is not loaded.
+# The marker stays until the video device exists or 10 s have passed, and
+# through the optional selftest: a decode that hangs the board disables
+# only the decoder on the next boot.
+vdec_enable() {
+    case " $cmdline " in
+    *" cubie_a7a.vdec=0 "*)
+        echo "vdec: disabled by cubie_a7a.vdec=0"
+        return 0
+        ;;
+    esac
+    modinfo a733-cedrus >/dev/null 2>&1 || { echo "a733-cedrus: not built for $(uname -r), skipped"; return 0; }
+    if why=$(blocked a733-cedrus); then
+        echo "a733-cedrus: skipped ($why)"
+        return 0
+    fi
+    if [ -e "$vmarker" ]; then
+        echo "vdec skipped: an earlier boot stopped in '$(cat "$vmarker")' (remove $vmarker to retry)"
+        return 0
+    fi
+    if ! ls -d /sys/bus/platform/drivers/sunxi-pck-600/*.power-controller >/dev/null 2>&1; then
+        echo "vdec skipped: the PCK-600 power-domain driver is not bound"
+        return 0
+    fi
+    echo a733-cedrus >"$vmarker"
+    sync -f "$vmarker"
+    if ! modprobe a733-cedrus; then
+        echo "a733-cedrus: modprobe failed"
+        rm -f "$vmarker"
+        sync -f "$state"
+        return 1
+    fi
+    echo "a733-cedrus: loaded"
+    vdev=
+    i=0
+    while [ $i -lt 10 ] && [ -z "$vdev" ]; do
+        for n in /sys/class/video4linux/video*; do
+            [ "$(cat "$n/name" 2>/dev/null)" = a733-cedrus ] && vdev=/dev/${n##*/}
+        done
+        [ -n "$vdev" ] || { sleep 1; i=$((i + 1)); }
+    done
+    if [ -z "$vdev" ]; then
+        echo "a733-cedrus: no video device after 10 s (not bound)"
+    else
+        echo "a733-cedrus: $vdev, formats: $(v4l2-ctl -d "$vdev" --list-formats-out 2>/dev/null | grep -o "'[A-Z0-9]*'" | tr '\n' ' ')"
+    fi
+    dmesg | grep -E 'a733-cedrus|1c0e000' | tail -10
+    case " $cmdline " in
+    *" cubie_a7a.vdec_selftest=1 "*)
+        if [ -n "$vdev" ] && [ -x /usr/bin/cubie-a7a-vdec-selftest ]; then
+            echo vdec-selftest >"$vmarker"
+            sync -f "$vmarker"
+            timeout 900 /usr/bin/cubie-a7a-vdec-selftest -o "$state/vdec-selftest-boot" ||
+                echo "vdec-selftest: failed or incomplete (exit $?)"
+        fi
+        ;;
+    esac
+    rm -f "$vmarker"
+    sync -f "$state"
+}
+vdec_enable || rc=1
+# What came up, for the journal.
+for d in /sys/bus/pci/devices/*; do
+    [ -e "$d" ] || continue
+    echo "pci ${d##*/} $(cat "$d/vendor"):$(cat "$d/device") driver=$(basename "$(readlink "$d/driver" 2>/dev/null)" 2>/dev/null)"
+done
+ls /dev/pcie-rkep* /dev/vipcore /dev/dri/card* /dev/dri/renderD* /dev/video* /dev/media* 2>/dev/null
+exit $rc

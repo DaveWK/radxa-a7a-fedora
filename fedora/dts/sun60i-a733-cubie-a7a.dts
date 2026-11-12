@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Radxa Cubie A7A device tree for Fedora with the stock kernel: the board
+ * tree from the Cubie A7A Linux series (series/, see PROVENANCE) plus the
+ * interim, firmware-initialised additions. One source builds both the DTB
+ * the firmware embeds (EDK2 -D DTB_FILE=) and the one cubie-a7a-dtb ships.
+ */
+#include "series/sun60i-a733-cubie-a7a.dts"
+#include "cubie-a7a-interim.dtsi"
+
+#include "cubie-a7a-board-io.dtsi"
+
+#include "cubie-a7a-native-io.dtsi"
+
+#include "cubie-a7a-thermal.dtsi"
+
+#include "cubie-a7a-npu.dtsi"
+
+#include "cubie-a7a-gpu.dtsi"
+
+/*
+ * HDMI display path (DE v352 -> tcon-tv0 -> DW HDMI) for the sunxidrm module
+ * of cubie-a7a-display, which cubie-a7a-hat.service loads after the PCK-600
+ * power-domain driver; without that driver the nodes defer and stay idle.
+ */
+#include "cubie-a7a-display.dtsi"
+
+/*
+ * Video decoder (Cedar VE decoder block) for the a733-cedrus module of
+ * cubie-a7a-vdec, which cubie-a7a-hat.service loads after the PCK-600
+ * power-domain driver; without that driver the node defers and stays idle.
+ */
+#include "cubie-a7a-video-codec.dtsi"
+/* Vendor CPU capacities; HDMI 1.8 V, system and Ethernet rails kept on. */
+#include "cubie-a7a-tuning.dtsi"
+
+/*
+ * Board workaround: PF4 (SDC0-D3) leaks to ground, so mmc0 runs 1-bit and
+ * PF4 is held high as a GPIO. Last, so its &mmc0 settings win.
+ */
+#include "cubie-a7a-sd-d3-workaround.dtsi"

@@ -1,0 +1,119 @@
+Cedrus stateless V4L2 video decoder ("sunxi-cedrus") from the Fedora kernel,
+copied under another module name ("a733-cedrus") with one variant: the
+Allwinner A733 decoder block on the Radxa Cubie A7A. Compile-tested only;
+nothing here has run on the board (TESTING.md).
+
+Packaging: cubie-a7a-vdec (DKMS, every codec built in, chosen per module
+parameter), with the patch sets of ../a733-cedrus-hevc-vp8 (0001-0005),
+../a733-cedrus-mpeg-h264 (0001-0004), ../a733-cedrus-vp9 (0001; 0002 as
+rebased onto the per-codec switches) and ../a733-cedrus-jpeg (0001, rebased;
+JPEG capability bit 7) applied here. Builds with W=1 and passes modpost
+against 7.3.3-300.fc45.aarch64 with every codec and with none of the
+optional ones. Loaded by cubie-a7a-hat.service after sun55i-pck600; the
+device tree node is in fedora/dts/cubie-a7a-video-codec.dtsi (binding
+stamp 16).
+
+Source:  Fedora kernel-7.3.3-300.fc45.src.rpm
+         sha256 7f1a1de7f12d1dd9a1560ad6a9b0a59e0d75698c489671ba2297c1d27f7ca4e8
+Tarball: linux-7.3.3.tar.xz
+         sha256 dab92554b98f51a00055b96733b9efe35b2011e5a5f64003c48e4c94dd9a1c01
+Path:    linux-7.3.3/drivers/staging/media/sunxi/cedrus (the thirteen .c/.h
+         files; sha256 of the unmodified files in UPSTREAM.sha256). The
+         in-tree Kconfig, Makefile and TODO are not copied.
+License: GPL-2.0 per file (MODULE_LICENSE "GPL v2"); headers unchanged.
+
+Changes (cedrus.c, cedrus.h, cedrus_hw.c, cedrus_regs.h, cedrus_h264.c,
+cedrus_h265.c, cedrus_mpeg2.c and cedrus_vp8.c; the other five files are
+the upstream files byte for byte):
+  - in-tree Makefile replaced by Makefile (same objects, module
+    a733-cedrus.ko; A733_CEDRUS_HEVC=1, A733_CEDRUS_HEVC10=1 and
+    A733_CEDRUS_VP8=1 define A733_CEDRUS_CODEC_H265, _H265_10 and _VP8;
+    A733_CEDRUS_EXPERIMENTAL=1 sets all three)
+  - cedrus.h: CEDRUS_NAME "cedrus" -> "a733-cedrus" (platform driver name,
+    video device name, media device model and bus_info, VIDIOC_QUERYCAP
+    driver/card), so the in-tree module can be loaded next to this one
+  - cedrus.h: CEDRUS_QUIRK_A733; struct cedrus_variant gains quirks; struct
+    cedrus_dev gains quirks, ahb_gate_clk, mbus_gate_clk, syscfg
+  - cedrus.c: the eleven in-tree variants and match entries removed; one
+    variant and match entry added, "allwinner,sun60i-a733-video-engine":
+    untiled output, MPEG-2, H.264, module clock 624 MHz; H.265, H.265
+    10-bit and VP8 each only with its A733_CEDRUS_CODEC_* define
+  - cedrus.c: MODULE_DESCRIPTION names the copy
+  - cedrus_hw.c: sunxi_sram_claim()/sunxi_sram_release() and the
+    sunxi_sram.h include removed (Fedora's built-in sunxi_sram has no A733
+    system-control entry, so the claim could only fail). In their place,
+    for CEDRUS_QUIRK_A733: the node's second reg entry (system control,
+    mapped without requesting it) and, on every runtime resume, bit 0 of
+    +0x0 and bit 24 of +0x4 cleared
+  - cedrus_hw.c: for CEDRUS_QUIRK_A733 a 32-bit DMA mask is set, and the
+    optional clocks "ahb-gate" and "mbus-gate" are taken and enabled before
+    / disabled after the three in-tree clocks
+  - cedrus_hw.c: for CEDRUS_QUIRK_A733 bits 0 and 4 of VE register 0x804
+    are set and cleared again after the clocks come up and after the
+    watchdog's reset
+  - cedrus_regs.h, cedrus.h, cedrus_hw.c: for CEDRUS_QUIRK_A733 the version
+    registers 0xf0, 0xe0 and 0xe4 are read once at the first runtime resume
+    and printed; the decoder IP version is kept in struct cedrus_dev
+  - cedrus_h265.c: bit 31 of the control register is set with the interrupt
+    enables when the decoder IP version is 0x31010, 0x33010, 0x33210,
+    0x33310, 0x33321 or 0x30520
+  - cedrus.h, cedrus_vp8.c: deblocking and intra prediction line buffers
+    for coded widths above 2048 and the buffer control register written at
+    every setup; a frame header larger than the coded format is refused;
+    the entropy probability buffer is 0x5400 bytes instead of 0x2400
+  - cedrus_h264.c, cedrus_mpeg2.c: an H.264 SPS or MPEG-2 sequence that
+    needs more macroblocks than the coded format is refused
+  - cedrus_h264.c: deblocking line buffer at least (columns + 31) * 192
+    bytes, motion vector field halves at least the vendor's size, 16 KiB
+    picture-info slots from 2048 pixels wide
+  - cedrus_regs.h, cedrus_h264.c: for CEDRUS_QUIRK_A733 bit 10 of the
+    H.264 control register (0x220) is written at the start of every frame
+    and kept with the interrupt enables
+  - cedrus.h, cedrus_hw.c: the encoder IP version is kept as well; bit 10
+    of the mode register is set for the decoder/encoder IP version pairs
+    0x33310/0x21320, 0x33210/0x12011 and 0x33321/0x21321
+
+Optional JPEG decoder (A733_CEDRUS_JPEG=1 in Makefile adds cedrus_jpeg.o
+and defines A733_CEDRUS_JPEG):
+  - cedrus_jpeg.c, cedrus_jpeg_regs.h: new files, not from the Fedora
+    tarball. A second video node "a733-cedrus-jpeg" (JPEG in, NV12 out)
+    that decodes baseline JPEG with the MPEG engine and shares this
+    module's m2m device, interrupt handler and watchdog. Register
+    programming after the public cedrus JPEG series by Emmanuel Gil Peyrot
+    and Jernej Skrabec (linux-media, 2024-07-31, Message-ID
+    20240731164422.206503-1-linkmauve@linkmauve.fr, GPL-2.0, not merged)
+  - cedrus.h: CEDRUS_CAPABILITY_JPEG_DEC (bit 7 here: the VP9 decoder
+    holds bit 6, which the JPEG series used), struct cedrus_ctx
+    codec.jpeg, struct cedrus_dev vfd_jpeg, and the register/unregister
+    hooks (inline no-ops without A733_CEDRUS_JPEG)
+  - cedrus.c: the hooks called at the end of probe (failure only warns)
+    and at the start of remove; the A733 variant gains
+    CEDRUS_CAPABILITY_JPEG_DEC under A733_CEDRUS_JPEG
+  - cedrus_hw.c: cedrus_engine_enable() selects the MPEG engine for
+    V4L2_PIX_FMT_JPEG
+  - needs v4l2-jpeg.ko (CONFIG_V4L2_JPEG_HELPER=m in Fedora's aarch64
+    configuration, shipped in kernel-modules)
+
+Sources read for the A733 values include:
+  - vendor kernel driver, https://github.com/alexcaoys/allwinner-bsp branch
+    linux-6.18.y, commit 656a550c826787e7e72fae58ca793df9e0988ac8,
+    drivers/ve/cedar-ve/cedar_ve.c: set_sys_cfg_by_self() (the two
+    system-control bits), set_vcu_en_regmode_to1_to0() (register 0x804),
+    enable_cedar_hw_clk_module() (clock set and order), and
+    platforms/ve_plat_common.c: ve_irq_work() (mode select at +0x0; MPEG at
+    0x100, H.264 at 0x200, HEVC at 0x500, as in cedrus_regs.h)
+  - vendor device tree and CCU, the same repository and commit:
+    configs/linux-6.6/sun60iw2p1.dtsi (ve@1c0e000),
+    sun60iw2p1-cpu-vf.dtsi (624 MHz at 800 mV for every speed bin),
+    drivers/clk/sunxi-ng/ccu-sun60iw2.c
+  - sunxi_sram.c of the same Fedora tarball: the H616 "VE" section is reg
+    0x0 bit 0 and the A64 "C" section reg 0x4 bit 24, both 1 = CPU and
+    0 = device, the same two bits the vendor driver clears
+  - libvdpau-sunxi, https://github.com/linux-sunxi/libvdpau-sunxi commit
+    ebdf7844efbb997a1e858600ae76c90985ea865d (LGPL-2.1+), h264.c: the same
+    control bit 10 and line buffer sizes; read for comparison, no code
+    taken
+  - the variant's capability list and rate were first proposed in
+    https://github.com/jonas5/Allwinner-A733-kernel,
+    patch/0003-allwinner-a733-cedrus-vpu-support.patch (a hint; that patch
+    carries no SRAM, clock or reset handling)

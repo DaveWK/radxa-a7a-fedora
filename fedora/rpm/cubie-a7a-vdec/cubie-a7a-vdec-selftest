@@ -1,0 +1,274 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# cubie-a7a-vdec-selftest: decode a short clip per codec on the A733 video
+# decoder (a733-cedrus) through GStreamer and compare the pictures with a
+# software decode of the same clip.
+#
+# usage: cubie-a7a-vdec-selftest [-c CLIPDIR] [-o OUTDIR] [-t SECONDS]
+#                                [-s WxH] [-n FRAMES] [codec...]
+#   codec    mpeg2 h264 hevc vp8 vp9 jpeg; default: every codec the device
+#            offers (hidden codecs are reported as skipped)
+#   -c DIR   clips to use instead of generated ones, named <codec>.<ext>:
+#            mpeg2.{m2v,mpg,ts}, h264.{h264,mp4,mkv}, hevc.{h265,mp4,mkv},
+#            vp8.{webm,ivf}, vp9.{webm,ivf}, jpeg.jpg. A file <clip>.md5
+#            next to a clip holds the md5 of its I420 output (for example
+#            from a conformance suite) and replaces the software decode.
+#   -o DIR   where the clips, decoded pictures and logs go (default
+#            /var/lib/cubie-a7a/vdec-selftest/<time>)
+#   -t SEC   time limit per decode (default 60)
+#   -s WxH   size of generated clips (default 352x288)
+#   -n N     frames of generated clips (default 30)
+#
+# Without a clip, one is encoded here from videotestsrc where Fedora has an
+# encoder: VP8 and VP9 (libvpx), MPEG-2 (libav), JPEG, and H.264 only with
+# the real openh264 (fedora-cisco-openh264 repository; the noopenh264 stub
+# cannot encode). Fedora has no H.265 encoder: give an H.265 clip with -c.
+# Software references: vp8dec, vp9dec, avdec_mpeg2video or mpeg2dec,
+# openh264dec or avdec_h264, avdec_h265 or libde265dec, jpegdec.
+#
+# H.264, H.265, VP8 and VP9 decoding is bit-exact: the I420 output must be
+# identical. MPEG-2 and JPEG allow IDCT differences: identical, or every
+# sample within 4 and PSNR >= 40 dB, passes as "close".
+#
+# Exit status: 0 every codec run passed (skips are not failures), 1 a codec
+# failed, 2 the decoder device or GStreamer is missing.
+set -u
+
+CLIPDIR=
+OUT=/var/lib/cubie-a7a/vdec-selftest/$(date +%Y%m%dT%H%M%S)
+LIMIT=60
+SIZE=352x288
+FRAMES=30
+while getopts c:o:t:s:n:h opt; do
+    case $opt in
+    c) CLIPDIR=$OPTARG ;;
+    o) OUT=$OPTARG ;;
+    t) LIMIT=$OPTARG ;;
+    s) SIZE=$OPTARG ;;
+    n) FRAMES=$OPTARG ;;
+    *) sed -n '4,36s/^# \{0,1\}//p' "$0"; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+W=${SIZE%x*}
+H=${SIZE#*x}
+
+mkdir -p "$OUT" || exit 2
+SUMMARY=$OUT/summary.txt
+: >"$SUMMARY"
+say() { echo "$*" | tee -a "$SUMMARY"; }
+
+if ! command -v gst-launch-1.0 >/dev/null || ! command -v gst-inspect-1.0 >/dev/null; then
+    say "gst-launch-1.0/gst-inspect-1.0 missing (gstreamer1, gstreamer1-plugins-base-tools)"
+    exit 2
+fi
+
+# The decoder nodes, by name.
+dev=""
+jdev=""
+for n in /sys/class/video4linux/video*; do
+    [ -e "$n/name" ] || continue
+    case $(cat "$n/name") in
+    a733-cedrus) dev=/dev/${n##*/} ;;
+    a733-cedrus-jpeg) jdev=/dev/${n##*/} ;;
+    esac
+done
+[ -n "$dev" ] || { say "no a733-cedrus video device (is the module loaded? modprobe a733-cedrus)"; exit 2; }
+
+say "cubie-a7a-vdec-selftest $(date -Is) kernel $(uname -r)"
+say "device $dev${jdev:+, JPEG $jdev}; module $(modinfo -F version a733-cedrus 2>/dev/null) srcversion $(cat /sys/module/a733_cedrus/srcversion 2>/dev/null)"
+for p in /sys/module/a733_cedrus/parameters/*; do
+    [ -e "$p" ] && printf '%s=%s ' "${p##*/}" "$(cat "$p")"
+done | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"
+dmesg 2>/dev/null | grep -E 'a733-cedrus|1c0e000' | grep -E 'codecs offered|VE version|decoder IP' | tail -3 | tee -a "$SUMMARY"
+
+fmts=$(v4l2-ctl -d "$dev" --list-formats-out 2>/dev/null)
+offered() {
+    case $1 in
+    mpeg2) echo "$fmts" | grep -q "'MG2S'" ;;
+    h264) echo "$fmts" | grep -q "'S264'" ;;
+    hevc) echo "$fmts" | grep -q "'S265'" ;;
+    vp8) echo "$fmts" | grep -q "'VP8F'" ;;
+    vp9) echo "$fmts" | grep -q "'VP9F'" ;;
+    jpeg) [ -n "$jdev" ] ;;
+    *) return 1 ;;
+    esac
+}
+
+# A registry of our own, so the elements of a device that appeared after
+# the user's registry cache was written are there.
+export GST_REGISTRY=$OUT/gst-registry.bin
+have() { gst-inspect-1.0 --exists "$1" 2>/dev/null; }
+features=$( { gst-inspect-1.0 v4l2codecs; gst-inspect-1.0 video4linux2; } 2>/dev/null)
+hwdec() {
+    local pat
+    case $1 in
+    mpeg2) pat='v4l2sl[a-z0-9]*mpeg2dec' ;;
+    jpeg) pat='v4l2[a-z0-9]*jpegdec' ;;
+    *) pat="v4l2sl[a-z0-9]*$1dec" ;;
+    esac
+    echo "$features" | grep -o -E "^ *$pat" | tr -d ' ' | head -1
+}
+first() { for e in "$@"; do have "$e" && { echo "$e"; return; }; done; }
+swdec() {
+    case $1 in
+    mpeg2) first avdec_mpeg2video mpeg2dec ;;
+    h264) first openh264dec avdec_h264 ;;
+    hevc) first avdec_h265 libde265dec ;;
+    vp8) first vp8dec avdec_vp8 ;;
+    vp9) first vp9dec avdec_vp9 ;;
+    jpeg) first jpegdec avdec_mjpeg ;;
+    esac
+}
+parser() {
+    case $1 in
+    mpeg2) echo mpegvideoparse ;;
+    h264) echo h264parse ;;
+    hevc) echo h265parse ;;
+    vp8) echo identity ;;
+    vp9) echo vp9parse ;;
+    jpeg) echo jpegparse ;;
+    esac
+}
+demuxer() {
+    case $1 in
+    *.webm | *.mkv) echo matroskademux ;;
+    *.ivf) echo ivfparse ;;
+    *.mp4 | *.mov) echo qtdemux ;;
+    *.ts | *.m2ts) echo tsdemux ;;
+    *.mpg | *.ps | *.vob) echo mpegpsdemux ;;
+    *) echo identity ;;
+    esac
+}
+
+# Encode a test clip; prints its path, or nothing.
+generate() {
+    local c=$1 f
+    # gst-launch quotes an argument that contains spaces: one word each.
+    local src=(videotestsrc "num-buffers=$FRAMES" pattern=ball !
+        "video/x-raw,format=I420,width=$W,height=$H,framerate=30/1")
+    case $c in
+    vp8) have vp8enc && f=$OUT/vp8.webm && gst-launch-1.0 -q "${src[@]}" ! vp8enc deadline=1 ! webmmux ! filesink location="$f" ;;
+    vp9) have vp9enc && f=$OUT/vp9.webm && gst-launch-1.0 -q "${src[@]}" ! vp9enc deadline=1 ! webmmux ! filesink location="$f" ;;
+    mpeg2) have avenc_mpeg2video && f=$OUT/mpeg2.m2v &&
+        gst-launch-1.0 -q "${src[@]}" ! avenc_mpeg2video bitrate=2000000 ! mpegvideoparse ! filesink location="$f" ;;
+    h264) have openh264enc && f=$OUT/h264.h264 &&
+        gst-launch-1.0 -q "${src[@]}" ! openh264enc ! h264parse ! video/x-h264,stream-format=byte-stream ! filesink location="$f" ;;
+    jpeg) have jpegenc && f=$OUT/jpeg.jpg &&
+        gst-launch-1.0 -q videotestsrc num-buffers=1 pattern=smpte ! "video/x-raw,format=I420,width=$W,height=$H" ! jpegenc ! filesink location="$f" ;;
+    esac >>"$OUT/$c.log" 2>&1
+    [ -n "${f:-}" ] && [ -s "$f" ] && echo "$f"
+}
+
+clipfor() {
+    local c=$1 f
+    if [ -n "$CLIPDIR" ]; then
+        for f in "$CLIPDIR/$c".*; do
+            case $f in *.md5) continue ;; esac
+            [ -f "$f" ] && { echo "$f"; return; }
+        done
+    fi
+    generate "$c"
+}
+
+decode() { # clip codec decoder output
+    timeout "$LIMIT" gst-launch-1.0 -q filesrc location="$1" ! "$(demuxer "$1")" ! \
+        "$(parser "$2")" ! "$3" ! videoconvert dither=none ! video/x-raw,format=I420 ! \
+        filesink location="$4" >>"$OUT/$2.log" 2>&1
+}
+
+dims() { # clip -> "W H" of the first video stream
+    gst-discoverer-1.0 "$1" 2>/dev/null |
+        awk '/Width:/ {w=$2} /Height:/ {h=$2} END {if (w && h) print w, h}'
+}
+
+irqs() { awk '/a733-cedrus|1c0e000/ {for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) s += $i} END {print s + 0}' /proc/interrupts; }
+
+compare() { # sw hw w h mode
+    python3 -I - "$@" <<'PY'
+import math, sys
+sw, hw, w, h, mode = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+a, b = open(sw, 'rb').read(), open(hw, 'rb').read()
+fs = w * h + 2 * ((w + 1) // 2) * ((h + 1) // 2)
+na, nb = len(a) // fs, len(b) // fs
+if not a:
+    print('FAIL reference decode is empty'); sys.exit(1)
+if len(a) != len(b):
+    print(f'FAIL {nb} frames from the hardware, {na} from the reference'); sys.exit(1)
+if a == b:
+    print(f'PASS exact, {na} frames {w}x{h}'); sys.exit(0)
+first = next(i for i in range(len(a)) if a[i] != b[i]) // fs
+peak = sq = 0
+for x, y in zip(a, b):
+    d = x - y if x > y else y - x
+    sq += d * d
+    if d > peak:
+        peak = d
+psnr = 99.0 if sq == 0 else 10 * math.log10(255 * 255 * len(a) / sq)
+if mode == 'close' and peak <= 4 and psnr >= 40:
+    print(f'PASS close (max diff {peak}, PSNR {psnr:.1f} dB), {na} frames {w}x{h}'); sys.exit(0)
+print(f'FAIL first differing frame {first}, max diff {peak}, PSNR {psnr:.1f} dB, {na} frames {w}x{h}')
+sys.exit(1)
+PY
+}
+
+[ $# -gt 0 ] || set -- mpeg2 h264 hevc vp8 vp9 jpeg
+rc=0
+for c in "$@"; do
+    if ! offered "$c"; then
+        say "$c: SKIP not offered by the device (module parameter, modinfo a733-cedrus)"
+        continue
+    fi
+    hw=$(hwdec "$c")
+    [ -n "$hw" ] || { say "$c: SKIP no GStreamer element for the device (gst-inspect-1.0 v4l2codecs)"; continue; }
+    clip=$(clipfor "$c")
+    [ -n "$clip" ] || { say "$c: SKIP no clip and no encoder here (give one with -c)"; continue; }
+    ref=
+    [ -f "$clip.md5" ] && ref=$(awk '{print $1; exit}' "$clip.md5")
+    sw=
+    [ -n "$ref" ] || sw=$(swdec "$c")
+    [ -n "$ref$sw" ] || { say "$c: SKIP no software decoder and no $clip.md5"; continue; }
+    read -r cw ch <<<"$(dims "$clip")"
+    [ -n "${cw:-}" ] || { cw=$W; ch=$H; }
+    mode=exact
+    case $c in mpeg2 | jpeg) mode=close ;; esac
+
+    d0=$(dmesg 2>/dev/null | wc -l)
+    i0=$(irqs)
+    t0=$(date +%s.%N)
+    decode "$clip" "$c" "$hw" "$OUT/$c-hw.yuv"
+    hrc=$?
+    t1=$(date +%s.%N)
+    i1=$(irqs)
+    dmesg 2>/dev/null | tail -n +"$((d0 + 1))" >"$OUT/$c-dmesg.txt"
+    info="$hw, $(basename "$clip"), $((i1 - i0)) interrupts, $(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.2f s", b - a}')"
+    if [ $hrc -ne 0 ]; then
+        say "$c: FAIL hardware decode exited $hrc ($info; $OUT/$c.log, $OUT/$c-dmesg.txt)"
+        rc=1
+        continue
+    fi
+    if [ -n "$ref" ]; then
+        got=$(md5sum <"$OUT/$c-hw.yuv" | cut -d' ' -f1)
+        if [ "$got" = "$ref" ]; then
+            say "$c: PASS md5 $got matches $(basename "$clip").md5 ($info)"
+        else
+            say "$c: FAIL md5 $got, expected $ref ($info)"
+            rc=1
+        fi
+        continue
+    fi
+    if ! decode "$clip" "$c" "$sw" "$OUT/$c-sw.yuv"; then
+        say "$c: SKIP reference decode with $sw failed ($OUT/$c.log); hardware output kept"
+        continue
+    fi
+    if res=$(compare "$OUT/$c-sw.yuv" "$OUT/$c-hw.yuv" "$cw" "$ch" "$mode"); then
+        say "$c: $res against $sw ($info; crc $(cksum <"$OUT/$c-hw.yuv" | cut -d' ' -f1))"
+    else
+        say "$c: $res against $sw ($info)"
+        rc=1
+    fi
+done
+grep -h -i -E 'timed out|failed|error' "$OUT"/*-dmesg.txt 2>/dev/null | sort -u | head -20 | sed 's/^/dmesg: /' | tee -a "$SUMMARY"
+say "results in $OUT"
+exit $rc

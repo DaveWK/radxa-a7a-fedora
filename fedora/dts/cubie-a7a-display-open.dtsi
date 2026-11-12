@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Allwinner A733 HDMI display path in mainline binding style, for the
+ * open driver a733-display-open (fedora/kmods/a733-display-open: the
+ * mainline sun4i DRM drivers with the A733 patches, and the kernel's own
+ * dw-hdmi):
+ *
+ *   mixer0 (DE 3.5) -> tcon-top (VO1) -> tcon-tv0 -> tcon-top -> DW HDMI
+ *                                                     ^ HDMI PHY PLL clock
+ *
+ * The graph and the property names follow the H6 display nodes of
+ * sun50i-h6.dtsi; the compatibles are new (sun60i-a733-*). Not included by
+ * sun60i-a733-cubie-a7a.dts: sun60i-a733-cubie-a7a-open-display.dts swaps
+ * it in for cubie-a7a-display.dtsi (the vendor sunxidrm nodes), so exactly
+ * one of the two drivers finds nodes to bind.
+ *
+ * Register frames: the vendor sun60iw2p1.dtsi's, split per block as the
+ * mainline drivers expect (the vendor DE node spans 0x05000000-0x053fffff,
+ * its HDMI node the controller and the top PHY at +0xe0000). Clocks,
+ * resets and power domains are this tree's CCU and PPU, as in
+ * cubie-a7a-display.dtsi.
+ *
+ * GUESS marks what is inferred and not checked on hardware.
+ */
+
+#include <dt-bindings/clock/sun8i-tcon-top.h>
+
+/ {
+	de_open: display-engine {
+		compatible = "allwinner,sun60i-a733-display-engine";
+		allwinner,pipelines = <&mixer0>;
+	};
+
+	hdmi_connector: connector {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi_con_in: endpoint {
+				remote-endpoint = <&hdmi_out_con>;
+			};
+		};
+	};
+};
+
+&{/soc} {
+	mixer0: mixer@5100000 {
+		compatible = "allwinner,sun60i-a733-de35-mixer-0";
+		/*
+		 * layers: channels 0x20000 apart (VI 0-2, UI 6-9); top: the
+		 * RTMX block of display 0; display: blender (+0x1000) and
+		 * formatter (+0x5000) of display 0; de-top: gates, resets and
+		 * muxes of the whole DE.
+		 */
+		reg = <0x05100000 0x180000>,
+		      <0x05008100 0x40>,
+		      <0x05280000 0x20000>,
+		      <0x05008000 0x100>;
+		reg-names = "layers", "top", "display", "de-top";
+		clocks = <&ccu CLK_BUS_DE0>, <&ccu CLK_DE0>,
+			 <&ccu CLK_AHB_DE>, <&ccu CLK_MBUS_DESYS>;
+		clock-names = "bus", "mod", "ahb", "mbus";
+		resets = <&ccu RST_BUS_DE0>, <&ccu RST_BUS_DE_SYS>;
+		/* the driver sets 600 MHz; the vendor runs DE0 from pll-de-3x */
+		assigned-clocks = <&ccu CLK_DE0>;
+		assigned-clock-parents = <&ccu CLK_PLL_DE_3X>;
+		power-domains = <&ppu 1>;	/* DE_SYS */
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mixer0_out: port@1 {
+				reg = <1>;
+
+				mixer0_out_tcon_top_mixer0: endpoint {
+					remote-endpoint = <&tcon_top_mixer0_in_mixer0>;
+				};
+			};
+		};
+	};
+
+	tcon_top: tcon-top@5510000 {
+		compatible = "allwinner,sun60i-a733-tcon-top";
+		reg = <0x05510000 0x1000>;
+		clocks = <&ccu CLK_BUS_DPSS_TOP1>, <&hdmi_phy>,
+			 <&ccu CLK_AHB_VID_COUT1>;
+		clock-names = "bus", "tcon-tv0", "ahb";
+		clock-output-names = "tcon-top-tv0";
+		resets = <&ccu RST_BUS_DPSS_TOP1>, <&ccu RST_BUS_VIDEO_OUT1>;
+		#clock-cells = <1>;
+		power-domains = <&ppu 10>;	/* VO1 */
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			tcon_top_mixer0_in: port@0 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				reg = <0>;
+
+				tcon_top_mixer0_in_mixer0: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&mixer0_out_tcon_top_mixer0>;
+				};
+			};
+
+			tcon_top_mixer0_out: port@1 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				reg = <1>;
+
+				/* 2 = TV TCON 0 in TCON TOP numbering */
+				tcon_top_mixer0_out_tcon_tv: endpoint@2 {
+					reg = <2>;
+					remote-endpoint = <&tcon_tv0_in_tcon_top_mixer0>;
+				};
+			};
+
+			tcon_top_hdmi_in: port@4 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				reg = <4>;
+
+				tcon_top_hdmi_in_tcon_tv: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&tcon_tv0_out_tcon_top>;
+				};
+			};
+
+			tcon_top_hdmi_out: port@5 {
+				reg = <5>;
+
+				tcon_top_hdmi_out_hdmi: endpoint {
+					remote-endpoint = <&hdmi_in_tcon_top>;
+				};
+			};
+		};
+	};
+
+	tcon_tv0: lcd-controller@5730000 {
+		compatible = "allwinner,sun60i-a733-tcon-tv";
+		reg = <0x05730000 0x1000>;
+		interrupts = <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_TCON_TV0>,
+			 <&tcon_top CLK_TCON_TOP_TV0>;
+		clock-names = "ahb", "tcon-ch1";
+		resets = <&ccu RST_BUS_TCON_TV0>;
+		reset-names = "lcd";
+		/*
+		 * GUESS: VO1, as tcon-top; the vendor tree gives the TCON no
+		 * domain and keeps VO1 up through tcon-top.
+		 */
+		power-domains = <&ppu 10>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			tcon_tv0_in: port@0 {
+				reg = <0>;
+
+				tcon_tv0_in_tcon_top_mixer0: endpoint {
+					remote-endpoint = <&tcon_top_mixer0_out_tcon_tv>;
+				};
+			};
+
+			tcon_tv0_out: port@1 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				reg = <1>;
+
+				tcon_tv0_out_tcon_top: endpoint@1 {
+					reg = <1>;
+					remote-endpoint = <&tcon_top_hdmi_in_tcon_tv>;
+				};
+			};
+		};
+	};
+
+	hdmi: hdmi@5520000 {
+		compatible = "allwinner,sun60i-a733-dw-hdmi";
+		reg = <0x05520000 0x10000>;
+		reg-io-width = <1>;
+		interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_HDMI_TV>, <&ccu CLK_HDMI_SFR>;
+		clock-names = "iahb", "isfr";
+		/*
+		 * Main and sub; the HDCP 2.x reset (RST_BUS_HDMI_HDCP) stays
+		 * asserted and its ESM clock off, the state of the vendor
+		 * U-Boot and of the EDK2 default.
+		 */
+		resets = <&ccu RST_BUS_HDMI_MAIN>, <&ccu RST_BUS_HDMI_SUB>;
+		reset-names = "main", "sub";
+		phys = <&hdmi_phy>;
+		phy-names = "phy";
+		/* GUESS: the two rails of the vendor board file, cldo2 1.8 V */
+		hvcc-supply = <&reg_cldo2>;
+		vdd-supply = <&reg_dcdc2>;
+		power-domains = <&ppu 10>;	/* VO1 */
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			hdmi_in: port@0 {
+				reg = <0>;
+
+				hdmi_in_tcon_top: endpoint {
+					remote-endpoint = <&tcon_top_hdmi_out_hdmi>;
+				};
+			};
+
+			hdmi_out: port@1 {
+				reg = <1>;
+
+				hdmi_out_con: endpoint {
+					remote-endpoint = <&hdmi_con_in>;
+				};
+			};
+		};
+	};
+
+	hdmi_phy: hdmi-phy@5600000 {
+		compatible = "allwinner,sun60i-a733-hdmi-phy";
+		/* the top PHY at HDMI + 0xe0000; HDMI resistor calibration in SYSCFG */
+		reg = <0x05600000 0x100>, <0x03000160 0x8>;
+		reg-names = "phy", "rescal";
+		clocks = <&ccu CLK_BUS_HDMI_TV>, <&hosc>;
+		clock-names = "bus", "ref";
+		#clock-cells = <0>;
+		clock-output-names = "hdmi-phy-pll";
+		#phy-cells = <0>;
+		/* Cubie A7A: on-board calibration resistor (hdmi_resistor_select = <1>) */
+		allwinner,external-resistor;
+		power-domains = <&ppu 10>;	/* VO1 */
+	};
+};

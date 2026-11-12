@@ -1,0 +1,118 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# Decide whether the Cubie A7A needs cubie-a7a-dtb's devicetree on the ESP.
+#
+# The firmware (oreboot + EDK2) carries its own DTB. EDK2's FdtPlatformDxe
+# prefers \dtb\allwinner\sun60i-a733-cubie-a7a.dtb on the ESP, so this
+# package puts its copy there only when its binding is newer than the
+# firmware's, and takes it away again once the firmware has caught up:
+#
+#   package version  /usr/lib/cubie-a7a/dtb/VERSION (= cubie-a7a,dtb-version)
+#   firmware version cubie-a7a,dtb-version of the running tree, when
+#                    cubie-a7a,dtb-origin says "firmware"; remembered in
+#                    /var/lib/cubie-a7a/firmware-dtb-version, because while
+#                    the ESP copy is in use the running tree is the package's.
+#                    A tree without the stamp counts as version 0.
+#   force            /usr/lib/cubie-a7a/dtb/esp-override (built --with
+#                    esp_override) always installs the copy.
+#
+# Only a file this script installed is ever removed (its sha256 is kept in
+# a marker next to it). Changes take effect at the next boot.
+#
+# usage: install-dtb [--remove | --forget] [ROOT]
+#   --remove  take the ESP copy away (package removal)
+#   --forget  also forget the remembered firmware version, e.g. after a
+#             firmware update, so the next boot re-learns it
+
+set -eu
+
+mode=check
+case "${1:-}" in
+--remove)
+	mode=remove
+	shift
+	;;
+--forget)
+	mode=forget
+	shift
+	;;
+esac
+root=${1:-/}
+root=${root%/}
+
+lib=$root/usr/lib/cubie-a7a/dtb
+pkg=$lib/allwinner/sun60i-a733-cubie-a7a.dtb
+esp=${CUBIE_A7A_ESP:-$root/boot/efi}
+dst=$esp/dtb/allwinner/sun60i-a733-cubie-a7a.dtb
+mark=$esp/dtb/allwinner/sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb
+state=$root/var/lib/cubie-a7a/firmware-dtb-version
+live=/sys/firmware/devicetree/base
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+remove_ours() {
+	if [ -f "$mark" ]; then
+		if [ -f "$dst" ] && [ "$(sha "$dst")" = "$(cat "$mark")" ]; then
+			rm -f "$dst"
+			echo "cubie-a7a-dtb: removed the ESP devicetree; the firmware's is used from the next boot"
+		fi
+		rm -f "$mark"
+	fi
+}
+
+case $mode in
+remove)
+	remove_ours
+	exit 0
+	;;
+forget)
+	rm -f "$state"
+	remove_ours
+	exit 0
+	;;
+esac
+
+[ -f "$pkg" ] || {
+	echo "cubie-a7a-dtb: missing $pkg" >&2
+	exit 1
+}
+pkg_ver=$(cat "$lib/VERSION")
+
+fw_ver=
+if [ -z "$root" ] && [ -d "$live" ]; then
+	origin=
+	[ -r "$live/cubie-a7a,dtb-origin" ] && origin=$(tr -d '\000' <"$live/cubie-a7a,dtb-origin")
+	case $origin in
+	firmware)
+		fw_ver=$(od -An -tu4 --endian=big -N4 "$live/cubie-a7a,dtb-version" | tr -d ' ')
+		mkdir -p "${state%/*}"
+		echo "$fw_ver" >"$state"
+		;;
+	rpm) ;;        # our ESP copy is running; use what we remembered
+	*) fw_ver=0 ;; # a tree from before the stamp
+	esac
+fi
+[ -n "$fw_ver" ] || { [ -r "$state" ] && fw_ver=$(cat "$state"); } || :
+[ -n "$fw_ver" ] || fw_ver=0
+
+if [ -e "$lib/esp-override" ] || [ "$pkg_ver" -gt "$fw_ver" ]; then
+	if [ ! -d "$esp" ]; then
+		echo "cubie-a7a-dtb: no ESP at $esp; not installing the override" >&2
+		exit 0
+	fi
+	if [ -f "$dst" ] && [ ! -f "$mark" ] && ! cmp -s "$pkg" "$dst"; then
+		echo "cubie-a7a-dtb: $dst was not installed by this package; leaving it" >&2
+		exit 0
+	fi
+	mkdir -p "${dst%/*}"
+	if ! cmp -s "$pkg" "$dst" 2>/dev/null; then
+		cp "$pkg" "$dst.new"
+		mv -f "$dst.new" "$dst"
+		echo "cubie-a7a-dtb: binding $pkg_ver > firmware $fw_ver: installed $dst for the next boot"
+	fi
+	sha "$dst" >"$mark"
+	sync -f "$dst" 2>/dev/null || sync
+else
+	remove_ours
+fi

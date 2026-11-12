@@ -1,0 +1,38 @@
+Cubie A7A device tree sources
+
+series/        from Linux a74306e2 + the 49-patch Cubie A7A series (see
+               fedora/kmods/cubie-a7a-kmods/PROVENANCE for the patch list)
+include/dt-bindings/clock,reset/allwinner,sun60i-a733-*.h  same series (clock headers: the A733 CCU v6 posting of 2026-10-09, see fedora/kmods/cubie-a7a-kmods/PROVENANCE)
+include/dt-bindings/{gpio,interrupt-controller}/*
+               from linux-7.2.8 (kernel-7.2.8-200.fc44.src.rpm)
+include/dt-bindings/thermal/thermal.h  from linux-7.2.10 (kernel-7.2.10-200.fc44.src.rpm)
+cubie-a7a-thermal.dtsi  this project (THS, SID, thermal zones, gpio-fan)
+cubie-a7a-interim.dtsi, sun60i-a733-cubie-a7a.dts, Makefile  this project
+
+sha256 of each imported file:
+  4ea3596d387d4c1872929de6063542692cc5430798a230948f8d748a5f0bfaf4  series/sun60i-a733-cubie-a7a.dts
+  dd718a15a8c59ebb78178033f314badbabd67dbea2cbbb15903a23e4e06b2d2d  series/sun60i-a733.dtsi
+  74324aea9a73a87c18fa1ff96d15b60d3c4b8d49ed83ce0cce99e7dbb98edf39  include/dt-bindings/clock/allwinner,sun60i-a733-ccu.h
+  fdf3a37fd981749f43b69b847162abfa6dd10b5f638646fb002e2499742ce1b1  include/dt-bindings/clock/allwinner,sun60i-a733-r-ccu.h
+  ce1d8cf01362a4cc81a96b0f9faff317a97364d6f6cc47254ab2147e5800960f  include/dt-bindings/clock/sun6i-rtc.h
+  5423b3866877ead0920ec978b5b072f06087443033a72445b39faed8f288ddc1  include/dt-bindings/gpio/gpio.h
+  80dc56e8aa61b3681ee42fb0bfd34bf35ea2578ac6d82f1fa972b963667e8ff7  include/dt-bindings/interrupt-controller/arm-gic.h
+  392400a309a54ea5b1a2ac2e52773d3ab68e07323109b9aed88a69fedc74e082  include/dt-bindings/interrupt-controller/irq.h
+  d74d498871c3bf3d6aa985ad01c15dfa916614369dbcd832bdcb9d2d45b15e08  include/dt-bindings/thermal/thermal.h
+  44a2a01b4c0e722e2b2ed216db4dacae94506585b005ea4576146f807aadc7c1  include/dt-bindings/reset/allwinner,sun60i-a733-ccu.h
+  4c0ec950e5d0eeedbee1601198393ffb9f3b0591155436c7c96e1b9b0437cd09  include/dt-bindings/reset/allwinner,sun60i-a733-r-ccu.h
+
+Native DT6 additions:
+  clock/sun6i-rtc.h: exact signed7.2.9+sixRTCpatch source header.
+  phy/phy.h: exact signed7.2.9 source header.
+  1bd66286362f02487d3b5eeefb4be3221b949b1eecbfc4ca717fbbbe5e8a61be  include/dt-bindings/phy/phy.h
+  cubie-a7a-native-io.dtsi/bindings: project native consumer contracts.
+  See SERDES-NATIVE-CONTROLS.md, PCIE-NATIVE-CONTROLS.md and
+  PPU-NATIVE-CONTROLS.md for source pins, clocks, lane/IRQ and power gates.
+
+Open display (a733-display-open, not in the default DTB):
+  include/dt-bindings/clock/sun8i-tcon-top.h  from linux-7.3.3
+    (kernel-7.3.3-300.fc45.src.rpm), unmodified, (GPL-2.0+ OR MIT)
+  166252ca35bb5ac8c06b309bd50f282718f4097fba56e38bcfb8cfd31f1a4b11  include/dt-bindings/clock/sun8i-tcon-top.h
+  cubie-a7a-display-open.dtsi, sun60i-a733-cubie-a7a-open-display.dts
+    this project (mainline-style A733 display nodes; "make open-display")

@@ -1,0 +1,37 @@
+# Firmware files reviewed as open (source and licence known) for a Cubie A7A
+# image (fedora/image-firmware.py).
+#
+# One shell-style glob per line, relative to the firmware directory
+# (/usr/lib/firmware), matched with and without a .xz/.zst suffix; text after
+# '#' is a comment. "image-firmware.py audit" (run by mkdevcard.sh, and
+# "make audit-firmware IMG=...") reports every other file under the kernel's
+# firmware paths as closed or unreviewed, Realtek firmware (rtl_nic, rtl_bt,
+# rtlwifi, rtw88, rtw89, realtek, any rtl*/rtw*/rtk* name) separately and
+# even when a line here would match: the script refuses such a line. The
+# audit is a report: the image keeps linux-firmware and realtek-firmware, and
+# a closed file is replaced only once an open one reaches parity.
+#
+# Add a line only with the driver that requests the file and the file's
+# licence and source. Closed firmware does not go here.
+#
+# Closed pieces the board uses today (open replacement in progress):
+# - rtl_nic/rtl8125b-2.fw (linux-firmware): Realtek's PHY patch for the Dual
+#   2.5G Router HAT's RTL8125B ports. r8169 also runs without it (it warns and
+#   continues; 1G links may be less stable).
+# - powervr/*: Imagination's GPU firmware.
+# - esm.fex: the HDMI HDCP 2.x engine firmware sunxidrm asks for; HDCP 2.x
+#   stays off.
+# - aic/aic8800d80/* (linux-firmware, LICENSE.aic): AICSemi's AIC8800D80
+#   Wi-Fi/Bluetooth firmware, which cubie-a7a-aic8800-usb uses (Fedora's
+#   firmware, replacing the user opt-in;
+#   fedora/WIFI-FIRMWARE.md). Its Wi-Fi image is the SDIO build, which the
+#   driver refuses for the A7A's USB chip until a USB build is there. No open
+#   replacement exists.
+# Not on the card: aic8800_fw/* (the optional user-installed USB override,
+# cubie-a7a-wifi-firmware; never in an image).
+
+# cfg80211 regulatory database (wireless-regdb, ISC licence, data rather than
+# code; signed by the wireless-regdb maintainers). Installed only with the
+# Wi-Fi driver package (cubie-a7a-aic8800-usb).
+regulatory.db
+regulatory.db.p7s

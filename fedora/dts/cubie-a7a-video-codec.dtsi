@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Allwinner A733 video decoder (Cedar VE, decoder block), for the
+ * "a733-cedrus" module: Fedora's cedrus stateless V4L2 decoder under
+ * another name with an A733 variant (fedora/kmods/a733-cedrus).
+ *
+ * Included by sun60i-a733-cubie-a7a.dts from binding stamp 16 and enabled;
+ * not yet run on hardware. Only the a733-cedrus module (cubie-a7a-vdec)
+ * binds this node, and cubie-a7a-hat.service loads it after sun55i-pck600:
+ * the node names a PCK-600 domain, so without that driver it stays
+ * deferred. Register frame, interrupt, clocks, reset and power domain as
+ * the vendor sun60iw2p1.dtsi describes its ve@1c0e000 node.
+ *
+ * reg: the second entry is the first 16 bytes of system control. The vendor
+ * driver clears bit 0 of +0x0 and bit 24 of +0x4 there to hand the VE SRAMs
+ * to the decoder; a733-cedrus does the same in place of the in-tree
+ * driver's allwinner,sram claim, which Fedora's sunxi_sram cannot serve for
+ * this SoC. Replace it by allwinner,sram once a system-control node exists.
+ *
+ * Clocks, by CCU register (the vendor CCU and ours agree on every offset):
+ *   ahb        bus-ve-dec0        0xa8c bit 2    vendor "bus_ve"
+ *   mod        ve-dec0            0xa88          vendor "ve", 624 MHz from
+ *                                                pll-ve0 (800 mV, every bin)
+ *   ram        mbus-ve-dec0       0x5e4 bit 18   vendor "mbus_ve"
+ *   ahb-gate   ahb-ve-dec         0x5c0 bit 0    vendor "ahb_gate"
+ *   mbus-gate  mbus-ve-dec0-gate  0x5e0 bit 14   vendor "mbus_gate"
+ * The last two are the AHB and MBUS master gates. The vendor kernel marks
+ * them critical and still enables them from its driver; they are listed so
+ * that the stock kernel's unused-clock sweep cannot leave them off.
+ * Reset: 0xa8c bit 18. Power domain: PCK-600 index 2, "VE_DEC".
+ *
+ * No IOMMU: the vendor node sits behind the SoC IOMMU (master 6), for which
+ * this kernel has no driver. The decoder is given physical addresses, which
+ * needs the IOMMU to pass that master through; that is its untouched state
+ * only as far as the vendor driver's defaults suggest, not verified.
+ */
+
+&{/soc} {
+	video_codec: video-codec@1c0e000 {
+		compatible = "allwinner,sun60i-a733-video-engine";
+		reg = <0x01c0e000 0x3000>, <0x03000000 0x10>;
+		reg-names = "ve", "syscfg";
+		interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_VE_DEC0>, <&ccu CLK_VE_DEC0>,
+			 <&ccu CLK_MBUS_VE_DEC0>, <&ccu CLK_AHB_VE_DEC>,
+			 <&ccu CLK_MBUS_VE_DEC0_GATE>;
+		clock-names = "ahb", "mod", "ram", "ahb-gate", "mbus-gate";
+		assigned-clocks = <&ccu CLK_VE_DEC0>;
+		assigned-clock-parents = <&ccu CLK_PLL_VE0>;
+		resets = <&ccu RST_BUS_VE_DEC0>;
+		power-domains = <&ppu 2>;
+		/*
+		 * No iommus here: the decoder runs with the IOMMU off. If it is
+		 * ever put behind a733-iommu, list BOTH of its bus ports,
+		 * iommus = <&iommu1 0>, <&iommu1 1>; (vendor masters 6 and 7; the
+		 * vendor tree attaches the second through its empty "ve1" node).
+		 * With only one listed, the other port stays bypassed and treats
+		 * I/O virtual addresses as physical ones.
+		 * See fedora/kmods/a733-ve-extras/EXTRAS.md.
+		 */
+		status = "okay";
+	};
+};

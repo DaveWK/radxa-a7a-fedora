@@ -1,0 +1,70 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# udev helper for the Cubie A7A AIC8800D80 (60-cubie-a7a-aic8800.rules).
+#
+#   bt-rebind <usb-interface>  hand the D80's Bluetooth interface from btusb to
+#                              aic_btusb, the driver the vendor image binds
+#   mac <ifname>               stable MAC for a chip without an eFuse MAC
+set -uo pipefail
+SYSFS=${CUBIE_A7A_SYSFS:-/sys}
+MACHINE_ID=${CUBIE_A7A_MACHINE_ID:-/etc/machine-id}
+
+log() { logger -t cubie-a7a-aic -- "$*" 2>/dev/null || echo "cubie-a7a-aic: $*" >&2; }
+
+bt_rebind() {
+    local intf=$1 drv
+    [ -L "$SYSFS/bus/usb/devices/$intf/driver" ] || return 0
+    drv=$(basename "$(readlink "$SYSFS/bus/usb/devices/$intf/driver")")
+    [ "$drv" = btusb ] || return 0
+    modprobe aic_btusb 2>/dev/null || {
+        log "$intf: aic_btusb not available, Bluetooth stays on btusb"
+        return 0
+    }
+    # aic_btusb may have taken the interface while loading.
+    [ "$(basename "$(readlink "$SYSFS/bus/usb/devices/$intf/driver")")" = btusb ] || return 0
+    echo "$intf" >"$SYSFS/bus/usb/drivers/btusb/unbind" || return 0
+    if echo "$intf" >"$SYSFS/bus/usb/drivers/aic_btusb/bind"; then
+        log "$intf: Bluetooth moved from btusb to aic_btusb"
+    else
+        log "$intf: aic_btusb did not bind; giving the interface back to btusb"
+        echo "$intf" >"$SYSFS/bus/usb/drivers/btusb/bind" || :
+    fi
+}
+
+# Unicast, locally administered address from a hash of the machine ID:
+# stable for one installation, different between installations.
+stable_mac() {
+    local id h
+    id=$(cat "$MACHINE_ID" 2>/dev/null) || return 1
+    [[ $id =~ ^[0-9a-f]{32}$ ]] || return 1
+    h=$(printf 'cubie-a7a-aic8800-wlan:%s' "$id" | sha256sum | cut -c1-12)
+    printf '%02x:%s:%s:%s:%s:%s\n' $(((16#${h:0:2} & 0xfc) | 0x02)) \
+        "${h:2:2}" "${h:4:2}" "${h:6:2}" "${h:8:2}" "${h:10:2}"
+}
+
+mac() {
+    local ifname=$1 cur new
+    cur=$(cat "$SYSFS/class/net/$ifname/address" 2>/dev/null) || return 0
+    # 88:00:33:77:xx:xx is the driver's default, with two random bytes per
+    # load, when the chip's eFuse holds no MAC address.
+    [[ $cur == 88:00:33:77:* ]] || return 0
+    new=$(stable_mac) || {
+        log "$ifname: no machine ID yet, keeping $cur"
+        return 0
+    }
+    if [ -n "${CUBIE_A7A_SYSFS:-}" ]; then
+        echo "$new"
+    elif ip link set dev "$ifname" address "$new"; then
+        log "$ifname: no eFuse MAC, using stable $new"
+    fi
+}
+
+case ${1:-} in
+bt-rebind) [ $# = 2 ] && bt_rebind "$2" ;;
+mac) [ $# = 2 ] && mac "$2" ;;
+*)
+    echo "usage: $0 bt-rebind <usb-interface> | mac <ifname>" >&2
+    exit 2
+    ;;
+esac

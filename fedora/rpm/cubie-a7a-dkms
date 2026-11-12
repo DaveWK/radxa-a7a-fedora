@@ -1,0 +1,272 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# DKMS life cycle of one Cubie A7A kmod package: @MODULE@ @VERSION@.
+# Every DKMS package installs its own copy as
+# /usr/libexec/cubie-a7a/dkms-@MODULE@ and calls it from its scriptlets;
+# cubie-a7a-board-support's kernel helper calls it for the boot kmods.
+#
+# The DKMS version is the package's version-release (dkms.conf
+# PACKAGE_VERSION, set when the package is built), so every package build is
+# a new DKMS version: dkms never keeps an old build for new sources
+# ("already installed, skip").
+#
+#   add            %post: register this version with DKMS
+#   preun N VER    %preun with rpm's $1 and the package's own DKMS version
+#                  (on an update this file is already the new package's, so
+#                  the old package's scriptlet names its version). N = 0
+#                  (erase): remove that version
+#                  from every kernel. N > 0 (upgrade): remove it now if it
+#                  is not the installed version; where it is, its modules stay
+#                  in place until the new package has built its own (sync), so
+#                  a failed build never leaves a kernel without them, and its
+#                  dkms.conf is kept in the DKMS tree for that later uninstall
+#   sync [KVER..]  %posttrans and the kernel file trigger: make this version
+#                  the installed one for every KVER (default: each installed
+#                  kernel). Builds first, then dkms install, which uninstalls
+#                  the previous version; old versions are removed from DKMS
+#                  once no kernel uses them, also when the upgrade already
+#                  removed their source (packages before this helper, or
+#                  dkms.conf kept by preun). A failed build keeps the previous
+#                  modules for that kernel. Exit 1 when a kernel with
+#                  kernel-devel is left without this version.
+#   prune          remove older versions that no kernel uses any more
+#   status [KVER]  the DKMS version installed per kernel
+#   installed KVER print the DKMS version installed for KVER (empty: none)
+
+set -u
+
+M=@MODULE@
+V=@VERSION@
+TREE=/var/lib/dkms
+SRC=/usr/src/$M-$V
+MODULES_DIR=/usr/lib/modules
+TAG=cubie-a7a-dkms
+# Inside $TREE/$M/<version>/: the dkms.conf an upgrade keeps (preun), and the
+# source directory standing in for a version whose source is gone.
+KEPT=cubie-a7a-dkms.conf
+STANDIN=cubie-a7a-source
+
+log() {
+	echo "$TAG: $M: $*" >&2
+	command -v logger >/dev/null 2>&1 && logger -t "$TAG" -- "$M: $*" 2>/dev/null
+	return 0
+}
+
+kernels() {
+	for v in "$MODULES_DIR"/*/vmlinuz; do
+		[ -f "$v" ] || continue
+		v=${v%/vmlinuz}
+		echo "${v##*/}"
+	done
+}
+
+# kernel-devel for KVER: dkms uses /usr/lib/modules/KVER/build, which may
+# be missing in an image root; /usr/src/kernels/KVER is kernel-devel's tree.
+ksrc_args() {
+	if [ -f "$MODULES_DIR/$1/build/Makefile" ]; then
+		return 0
+	elif [ -f "/usr/src/kernels/$1/Makefile" ]; then
+		echo "--kernelsourcedir=/usr/src/kernels/$1"
+	else
+		return 1
+	fi
+}
+
+# The version dkms has installed for KVER (its kernel-KVER-ARCH link).
+installed() {
+	for l in "$TREE/$M/kernel-$1-"*; do
+		[ -L "$l" ] || continue
+		t=$(readlink "$l")
+		echo "${t%%/*}"
+		return 0
+	done
+	return 0
+}
+
+# Versions in the DKMS tree other than this one.
+others() {
+	for d in "$TREE/$M"/*/; do
+		[ -d "$d" ] || continue
+		d=${d%/}
+		d=${d##*/}
+		case $d in
+		original_module | kernel-* | "$V") ;;
+		*) echo "$d" ;;
+		esac
+	done
+}
+
+# Installed for a kernel that is still there (kernel-KVER-ARCH links of
+# removed kernels do not count).
+active_anywhere() {
+	for l in "$TREE/$M/kernel-"*; do
+		[ -L "$l" ] || continue
+		t=$(readlink "$l")
+		[ "${t%%/*}" = "$1" ] || continue
+		k=${l##*/kernel-}
+		[ -d "$MODULES_DIR/${k%-*}" ] && return 0
+	done
+	return 1
+}
+
+# A version whose source is gone (the upgrade removed it) is "broken" to dkms,
+# which then refuses every action on it, including the uninstall that a newer
+# version's install needs. Give it a source directory holding a dkms.conf:
+# the one preun kept, else this version's with the old PACKAGE_VERSION (the
+# module names and locations are what uninstall needs).
+standin() {
+	o=$1
+	d=$TREE/$M/$o
+	[ -d "$d/source" ] && return 0
+	s=$d/$STANDIN
+	mkdir -p "$s" || return 1
+	if [ -f "$d/$KEPT" ]; then
+		cp -f "$d/$KEPT" "$s/dkms.conf"
+	else
+		sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$o\"/" "$SRC/dkms.conf" >"$s/dkms.conf"
+	fi || return 1
+	ln -sfn "$s" "$d/source"
+	log "$o: source removed by the upgrade; dkms gets $([ -f "$d/$KEPT" ] && echo its kept || echo the $V) dkms.conf for it"
+}
+
+add() {
+	[ -d "$SRC" ] || {
+		log "$SRC missing"
+		return 1
+	}
+	if [ -L "$TREE/$M/$V/source" ] && [ -d "$TREE/$M/$V/source" ]; then
+		return 0
+	fi
+	# A same-version leftover whose source link is gone: re-link it.
+	if [ -d "$TREE/$M/$V" ]; then
+		ln -sfn "$SRC" "$TREE/$M/$V/source"
+		return 0
+	fi
+	dkms add -m "$M" -v "$V" --rpm_safe_upgrade >/dev/null 2>&1 ||
+		dkms add -m "$M" -v "$V" >/dev/null
+}
+
+remove_version() {
+	o=$1
+	[ -d "$TREE/$M/$o" ] || return 0
+	standin "$o" || :
+	if ! dkms remove -m "$M" -v "$o" --all >/dev/null 2>&1; then
+		# Nothing of it is installed (active_anywhere was false): only
+		# the DKMS bookkeeping is left.
+		rm -rf "${TREE:?}/$M/$o"
+	fi
+	log "$o removed from DKMS"
+}
+
+preun() {
+	n=${1:-0}
+	V=${2:-$V}
+	SRC=/usr/src/$M-$V
+	if [ "$n" -eq 0 ]; then
+		dkms remove -m "$M" -v "$V" --all --rpm_safe_upgrade >/dev/null 2>&1 || :
+		return 0
+	fi
+	[ -d "$TREE/$M/$V" ] || return 0
+	if active_anywhere "$V"; then
+		cp -f "$SRC/dkms.conf" "$TREE/$M/$V/$KEPT" 2>/dev/null || :
+	else
+		dkms remove -m "$M" -v "$V" --all --rpm_safe_upgrade >/dev/null 2>&1 || :
+	fi
+	return 0
+}
+
+sync_kernel() {
+	k=$1
+	[ -d "$MODULES_DIR/$k" ] || return 0
+	if ! ka=$(ksrc_args "$k"); then
+		log "$k: no kernel-devel; built when kernel-devel-$k is installed"
+		return 0
+	fi
+	cur=$(installed "$k")
+	if [ "$cur" = "$V" ] && [ -d "$TREE/$M/$V/$k" ]; then
+		return 0
+	fi
+	# Build first: the installed version stays until this succeeds.
+	if ! ls -d "$TREE/$M/$V/$k"/*/module >/dev/null 2>&1; then
+		# shellcheck disable=SC2086 # empty or one --kernelsourcedir
+		dkms build -m "$M" -v "$V" -k "$k" $ka >&2
+		rc=$?
+		if [ $rc -eq 77 ]; then
+			# BUILD_EXCLUSIVE: not for this kernel/arch; an older
+			# version's modules do not stay either.
+			if [ -n "$cur" ]; then
+				dkms uninstall -m "$M" -v "$cur" -k "$k" >&2 || :
+			fi
+			return 0
+		elif [ $rc -ne 0 ]; then
+			log "$k: DKMS build of $V failed (see $TREE/$M/$V/build/make.log)${cur:+; $cur stays installed}"
+			return 1
+		fi
+	fi
+	# shellcheck disable=SC2086
+	if dkms install -m "$M" -v "$V" -k "$k" $ka --force >&2; then
+		log "$k: $V installed${cur:+ (was $cur)}"
+		return 0
+	fi
+	log "$k: dkms install of $V failed${cur:+; check dkms status (was $cur)}"
+	return 1
+}
+
+sync_all() {
+	add || return 1
+	olds=$(others)
+	for o in $olds; do
+		standin "$o" || :
+	done
+	# shellcheck disable=SC2046 # kernel versions have no blanks
+	[ $# -gt 0 ] || set -- $(kernels)
+	rc=0
+	for k in "$@"; do
+		sync_kernel "$k" || rc=1
+	done
+	prune
+	return $rc
+}
+
+# Drop older versions that no kernel uses any more.
+prune() {
+	for o in $(others); do
+		if active_anywhere "$o"; then
+			log "$o still installed for a kernel (see above); it is removed after a successful build"
+		else
+			remove_version "$o"
+		fi
+	done
+	return 0
+}
+
+status() {
+	# shellcheck disable=SC2046
+	[ $# -gt 0 ] || set -- $(kernels)
+	for k in "$@"; do
+		i=$(installed "$k")
+		echo "$M $k: ${i:-none}$([ -n "$i" ] && [ "$i" != "$V" ] && echo " (package: $V)")"
+	done
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+add) add ;;
+preun) preun "$@" ;;
+sync) sync_all "$@" ;;
+prune) prune ;;
+status) status "$@" ;;
+installed)
+	[ $# -eq 1 ] || {
+		echo "usage: $0 installed KERNEL_VERSION" >&2
+		exit 2
+	}
+	installed "$1"
+	;;
+*)
+	echo "usage: $0 add|preun N VERSION|sync [KVER...]|prune|status [KVER...]|installed KVER" >&2
+	exit 2
+	;;
+esac

@@ -1,0 +1,20 @@
+{
+  "license": "GPL-2.0-only; Allwinner notices retained; original Linux header notices retained",
+  "bsp": {
+    "repository": "https://github.com/alexcaoys/allwinner-bsp",
+    "commit": "656a550c826787e7e72fae58ca793df9e0988ac8",
+    "sources": {
+      "pcie-sunxi-plat.c": "fe4ddbee310c4a2886d49f5ec432165cfb380e9b3bf05e42cdba54191a4d765f",
+      "pcie-sunxi-rc.c": "0a12e53b555c48876ab31f9ee040aef79fa44299a8dfa37fd873843d7d38ea5b",
+      "pcie-sunxi.h": "f4d7f54d0f1de07dcbb4c557bdc6cb7c5380649c5b534c830f6dee110d57a670"
+    }
+  },
+  "board": {
+    "captured_dts_sha256": "553573a7cbf5300117e08e1918354edcbc22072ae252b013d31d5e55f6f2f9d5",
+    "schematic_sheet7_text_sha256": "b8f99928ddfa68e3270c31f0683949157cd6f247784018d6a3382ba744ea04ca",
+    "pins": "PE11 PCIE_PWR_EN; PE12 PCIE-WAKEn input; PE13 PCIE-PERSTn active-low"
+  },
+  "implementation": "native exact stock7.2.9 DesignWare glue, own resources and paired PHY, four SII INTx assertion latches only; generic core owns enumeration/MSI/iATU",
+  "scope": "DT6/package-selected source; stock-ABI nine-module Kbuild; final new ABI/initramfs/image and physical INTx/PM still pending",
+  "production_sha256": "8f3da8d62d68e88d56494564a2833fd2cf019b4a958498dd48f0be0f8912a20e"
+}

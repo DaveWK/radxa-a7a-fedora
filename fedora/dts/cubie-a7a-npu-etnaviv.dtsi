@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Opt-in: the A733 NPU on the mainline etnaviv driver instead of vipcore.
+ * Not in the default DTB; "make NPU=etnaviv" in this directory includes it
+ * after cubie-a7a-npu.dtsi. Needs cubie-a7a-npu-etnaviv (DKMS a733-etnaviv:
+ * etnaviv with the A733 hardware database entry and multi-reset support,
+ * plus a733_npu_sram for the SYS_CFG+0x8 bit 1 SRAM routing). Nothing here
+ * has run on a board; see fedora/kmods/a733-etnaviv/PROVENANCE.
+ *
+ * Only "vivante,gc": vipcore ("allwinner,sun60i-a733-npu") must not bind
+ * the same node. Clocks in the binding's terms, as the mainline A523 NPU
+ * node does it:
+ *   bus     AXI/master interface   mbus-npu  (CCU 0x5e0 bit 18)
+ *   core    module clock           npu       (0xb00, from pll-npu)
+ *   reg     AHB/slave interface    bus-npu   (0xb04 bit 0)
+ *   shader  enabled with the rest  ahb-npu   (0x5c0 bit 6, AHB master gate)
+ * etnaviv only sets a rate on "shader" for thermal frequency scaling, which
+ * needs #cooling-cells; there is none here, so the gate is only gated.
+ * All three resets (core, AXI, AHB) go through etnaviv's reset array.
+ *
+ * 492 MHz from pll-npu (N=82, M=4), the rate every speed bin runs at the
+ * rail's fixed 800 mV, as vipcore runs it (SPEED.md).
+ */
+
+&npu {
+	compatible = "vivante,gc";
+	clocks = <&ccu CLK_MBUS_NPU>, <&ccu CLK_NPU>,
+		 <&ccu CLK_BUS_NPU>, <&ccu CLK_AHB_NPU>;
+	clock-names = "bus", "core", "reg", "shader";
+	assigned-clocks = <&ccu CLK_PLL_NPU>, <&ccu CLK_NPU>;
+	assigned-clock-parents = <0>, <&ccu CLK_PLL_NPU>;
+	assigned-clock-rates = <492000000>, <492000000>;
+	/delete-property/ reset-names;
+	/delete-property/ clock-frequency;
+};
