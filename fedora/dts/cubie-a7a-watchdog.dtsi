@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * WDT0 at 0x02050000 for the mainline sunxi_wdt driver, so that a hang in
+ * Linux resets the SoC (binding stamp 22). The boot ROM then falls back to
+ * USB FEL (or boots the next medium), so the board recovers without a
+ * power cycle. cubie-a7a-board-support's systemd drop-in
+ * (60-cubie-a7a-watchdog.conf) has PID 1 open and pet /dev/watchdog0.
+ *
+ * Register layout: mainline's sun55i-a523 entry (CTRL 0x0c, CFG 0x10,
+ * MODE 0x14, key 0x16aa0000, restart 0x14af) is the layout our bt0, main
+ * and the FEL reset tool already drive on this WDT0. Tested on the board
+ * with a one-shot test DTB carrying this node:
+ * "sunxi-wdt 2050000.watchdog: Watchdog enabled (timeout=16 sec)", and with
+ * a 10 s timeout a sysrq crash reset the board into FEL 14 s later.
+ *
+ * The mainline driver uses neither the interrupt nor the clocks; the A733
+ * interrupt number is not in our public sources, so the node has no
+ * "interrupts" (a binding check would flag that). The driver's maximum
+ * timeout is 16 s. oreboot main disables WDT0 when EDK2 confirms the boot,
+ * so nothing runs it between the firmware and the first open in Linux, and
+ * PSCI (restart priority 129) stays the reboot path over the watchdog's
+ * restart handler (128).
+ */
+
+&{/soc} {
+	wdt: watchdog@2050000 {
+		compatible = "allwinner,sun60i-a733-wdt", "allwinner,sun55i-a523-wdt";
+		reg = <0x02050000 0x20>;
+		clocks = <&hosc>, <&rtc CLK_OSC32K>;
+		clock-names = "hosc", "losc";
+		status = "okay";
+	};
+};

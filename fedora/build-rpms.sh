@@ -53,7 +53,7 @@ trap 'rm -rf "$stage"' EXIT
 cp -a "$TOP/fedora/kmods/cubie-a7a-kmods" "$stage/cubie-a7a-kmods-$v"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
     -C "$stage" -czf "$OUT/SOURCES/cubie-a7a-kmods-$v.tar.gz" "cubie-a7a-kmods-$v"
-cp "$TOP"/fedora/rpm/cubie-a7a-board-support/{dracut-cubie-a7a.conf,cubie-a7a-cmdline,cubie-a7a-depmod.conf,cubie-a7a-staged.conf,cubie-a7a-kernel,99-zz-cubie-a7a.install} "$OUT/SOURCES/"
+cp "$TOP"/fedora/rpm/cubie-a7a-board-support/{dracut-cubie-a7a.conf,cubie-a7a-cmdline,cubie-a7a-depmod.conf,cubie-a7a-staged.conf,cubie-a7a-kernel,99-zz-cubie-a7a.install,cubie-a7a-watchdog.conf} "$OUT/SOURCES/"
 # DKMS life cycle helper, one copy per DKMS package.
 cp "$TOP/fedora/rpm/cubie-a7a-dkms" "$OUT/SOURCES/"
 cp "$spec" "$OUT/SPECS/"

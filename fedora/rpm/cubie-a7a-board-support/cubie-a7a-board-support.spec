@@ -1,5 +1,5 @@
 Name:           cubie-a7a-board-support
-Version:        0.14
+Version:        0.15
 Release:        1%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
@@ -17,6 +17,7 @@ Source4:        cubie-a7a-staged.conf
 Source5:        cubie-a7a-kernel
 Source6:        99-zz-cubie-a7a.install
 Source7:        cubie-a7a-dkms
+Source8:        cubie-a7a-watchdog.conf
 
 # DKMS builds the kmods on the board for every Fedora kernel, inside the
 # same dnf transaction (file trigger below), so kernel-devel must follow
@@ -25,7 +26,9 @@ Requires:       dkms gcc make kmod
 Requires:       kernel-devel
 Requires:       kernel-core
 Requires:       dracut grubby
-Recommends:     cubie-a7a-dtb >= 0.5
+# 0.17 (binding stamp 22) has the WDT0 node the systemd watchdog drop-in
+# pets; with an older DTB there is no /dev/watchdog0 and the drop-in idles.
+Recommends:     cubie-a7a-dtb >= 0.17
 # 0.15 (binding stamp 20) names the GPU master gates on the PCK-600 node;
 # with an older DTB nothing would enable them for the GPU.
 Conflicts:      cubie-a7a-dtb < 0.15
@@ -63,6 +66,11 @@ initialises the Ethernet PHY, and PCIe/USB for the interim device tree).
   regulator_ignore_unused until the always-on PMIC rails in the board DTB
   are proven on hardware; cma=512M (unless a cma= is set already) for the
   video decoder and display buffers.
+- Hardware watchdog: systemd (PID 1) opens /dev/watchdog0 (WDT0, binding
+  stamp 22 of cubie-a7a-dtb) with a 16 s timeout, the driver's maximum, at
+  run time and during reboot, so a hung kernel or PID 1 resets the SoC and
+  the board recovers on its own (into FEL while the SD slot is dead).
+  RuntimeWatchdogSec=off in /etc/systemd/system.conf.d/ turns it off.
 Retire each piece as soon as Fedora's kernel carries the driver.
 
 %prep
@@ -78,6 +86,7 @@ install -Dpm0644 %{SOURCE4} %{buildroot}%{_prefix}/lib/modprobe.d/cubie-a7a-stag
 install -Dpm0755 %{SOURCE5} %{buildroot}%{_libexecdir}/cubie-a7a/kernel
 sed -i 's/@VERSION@/%{dkms_ver}/' %{buildroot}%{_libexecdir}/cubie-a7a/kernel
 install -Dpm0755 %{SOURCE6} %{buildroot}%{_prefix}/lib/kernel/install.d/99-zz-cubie-a7a.install
+install -Dpm0644 %{SOURCE8} %{buildroot}%{_prefix}/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf
 mkdir -p %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}
 cp -a cubie-a7a-kmods-%{version}/* %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 sed -i 's/@VERSION@/%{dkms_ver}/' %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/dkms.conf
@@ -133,6 +142,7 @@ fi
 %{_prefix}/lib/depmod.d/cubie-a7a.conf
 %{_prefix}/lib/modprobe.d/cubie-a7a-staged.conf
 %{_prefix}/lib/kernel/install.d/99-zz-cubie-a7a.install
+%{_prefix}/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf
 %dir %{_libexecdir}/cubie-a7a
 %{_libexecdir}/cubie-a7a/cmdline
 %{_libexecdir}/cubie-a7a/kernel
@@ -140,6 +150,21 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.15-1
+- systemd drop-in /usr/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf:
+  RuntimeWatchdogSec=16s and RebootWatchdogSec=16s, so PID 1 pets WDT0
+  (/dev/watchdog0, cubie-a7a-dtb 0.17, binding stamp 22) and a hang in
+  Linux, or in the final stage of a reboot, resets the SoC (into FEL while
+  the SD slot is dead) instead of needing a USB-C replug
+- 16 s is the sunxi_wdt maximum (WDT_MAX_TIMEOUT); the watchdog core
+  rejects a longer timeout with EINVAL, so a 30 s runtime value, or
+  systemd's default RebootWatchdogSec=10min, cannot be programmed on this
+  board. systemd pets at half the timeout (8 s)
+- Recommends cubie-a7a-dtb >= 0.17 (without the WDT0 node there is no
+  watchdog device and the drop-in has no effect)
+- The DKMS sources are unchanged from 0.14-1 (new DKMS version 0.15-1 by
+  the version-release rule)
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.14-1
 - sun55i-pck600: a GPU domain found on at probe is switched off before it is
   published, GPU_CORE (clock/reset handshake, GPU_TOP's master gates held)

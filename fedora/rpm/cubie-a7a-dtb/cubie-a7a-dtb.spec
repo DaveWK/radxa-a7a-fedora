@@ -1,5 +1,5 @@
 Name:           cubie-a7a-dtb
-Version:        0.15
+Version:        0.17
 Release:        1%{?dist}
 Summary:        Radxa Cubie A7A device tree, used when newer than the firmware's
 License:        (GPL-2.0-only OR MIT) AND BSD-2-Clause AND MIT
@@ -28,9 +28,10 @@ kernel with cubie-a7a-board-support: the board tree from the Cubie A7A
 Linux series, native paired SERDES/PCIe and remaining firmware-initialised
 EHCI/OHCI nodes, the SPI NOR as one read-only partition, the A733 thermal
 sensors with five thermal zones, the PL9 gpio-fan, the HDMI display path
-(display engine, tcon-tv0, DW HDMI) for cubie-a7a-display and the video
-decoder for cubie-a7a-vdec. It works with Fedora's own kernel and the
-cubie-a7a-board-support modules.
+(display engine, tcon-tv0, DW HDMI) for cubie-a7a-display, the video
+decoder for cubie-a7a-vdec and the WDT0 watchdog (mainline sunxi_wdt), which
+cubie-a7a-board-support has systemd pet. It works with Fedora's own kernel
+and the cubie-a7a-board-support modules.
 
 The oreboot + EDK2 firmware embeds a DTB built from the same source. This
 package installs its copy on the ESP (\dtb\allwinner\, which the firmware
@@ -84,6 +85,18 @@ fi
 %dir %{_sharedstatedir}/cubie-a7a
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.17-1
+- Binding stamp 22: WDT0 (0x02050000) for the mainline sunxi_wdt driver,
+  compatible "allwinner,sun60i-a733-wdt", "allwinner,sun55i-a523-wdt"
+  (cubie-a7a-watchdog.dtsi). The node was tested on the board with a
+  one-shot test DTB (the same device tree as this one): /dev/watchdog0,
+  16 s, settable; a forced hang with the watchdog running reset the SoC
+  into FEL. cubie-a7a-board-support 0.15 has systemd pet it
+- Stamp 21 and version 0.16 are skipped: an eMMC draft (mmc2 node) that was
+  never shipped used them. The eMMC node takes the next stamp (23) and
+  version on top of this release, because install-dtb only installs a
+  stamp newer than the firmware's
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.15-1
 - Binding stamp 20: GPU power on demand. The PCK-600 node also names the
   GPU's AHB and MBUS master gates (gpu-ahb, gpu-mbus), which the provider
