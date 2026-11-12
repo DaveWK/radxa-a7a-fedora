@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Split a vipcore command-stream capture into files (see ../CAPTURE.md).
 
-    npu-capture-split.py CAPTURE.bin OUT_DIR [--label TEXT]
+    python3 npu-capture-split.py CAPTURE.bin OUT_DIR [--label TEXT]
 
 CAPTURE.bin is /sys/kernel/debug/vipcore_capture/data from a vipcore built
 with VIPCORE_CAPTURE=1. OUT_DIR gets:

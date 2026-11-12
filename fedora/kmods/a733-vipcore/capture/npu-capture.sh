@@ -4,7 +4,7 @@
 # (built with VIPCORE_CAPTURE=1; see ../CAPTURE.md). Run as root on the
 # board:
 #
-#   npu-capture.sh [-m MODE] [-n TASKS] [-o OUT_ROOT] [-l LABEL] -- COMMAND...
+#   sh npu-capture.sh [-m MODE] [-n TASKS] [-o OUT_ROOT] [-l LABEL] -- COMMAND...
 #
 #   -m MODE   1 = video memory before the trigger, 2 = NPU-writable memory
 #             after completion, 4 = the "before" snapshot on every task
@@ -14,12 +14,12 @@
 #   -l LABEL  default the command's basename
 #
 # Example, the VIPLite ShuffleNetV2 sample, one inference:
-#   cd /opt/viplite/vpm_run && npu-capture.sh -l shufflenetv2-l1 -- \
+#   cd /opt/viplite/vpm_run && sh npu-capture.sh -l shufflenetv2-l1 -- \
 #       ./vpm_run -s sample.txt -l 1 -b 0 --show_top5 1
 #
 # Writes OUT_ROOT/<UTC time>-<label>/: capture.bin, control-before.txt,
 # control-after.txt, command.txt, run.log, dmesg.txt, vip_info.txt,
-# SHA256SUMS, and CAPTURE-DERIVED. Split it with npu-capture-split.py.
+# SHA256SUMS, and CAPTURE-DERIVED. Split it with python3 npu-capture-split.py.
 set -eu
 
 mode=3

@@ -77,7 +77,7 @@ builds and contains no capture symbols.
 3. Capture the ShuffleNetV2 self-test, one inference:
 
        cd /opt/viplite/vpm_run
-       capture/npu-capture.sh -l shufflenetv2-l1 -- \
+       sh capture/npu-capture.sh -l shufflenetv2-l1 -- \
            ./vpm_run -s sample.txt -l 1 -b 0 --show_top5 1
 
    then a second run with `-m 7 -n 8 -l shufflenetv2-l3` and `-l 3` loops,
@@ -85,7 +85,11 @@ builds and contains no capture symbols.
 4. Restore: `rmmod vipcore; modprobe vipcore` (or reboot).
 5. Copy the run directory to the PC and split it:
 
-       capture/npu-capture-split.py capture.bin split/ --label shufflenetv2-l1
+       python3 capture/npu-capture-split.py capture.bin split/ --label shufflenetv2-l1
+
+The two tools are not executable in the tree on purpose: the directory is
+shipped as the DKMS source of `cubie-a7a-npu`, and an executable script
+there would add an interpreter dependency to that package.
 
 ## Where it goes
 
