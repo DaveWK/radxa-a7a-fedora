@@ -1,6 +1,6 @@
 Name:           cubie-a7a-aic8800-usb
 Version:        0.3
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        AIC8800D80 USB Wi-Fi and Bluetooth driver for the Cubie A7A (firmware from linux-firmware)
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -29,7 +29,9 @@ Requires:       binutils tar xz zstd coreutils iproute util-linux
 # firmware. A user-installed USB set (cubie-a7a-wifi-firmware) is an optional
 # override that takes precedence (WIFI-FIRMWARE.md).
 Requires:       linux-firmware
-Recommends:     NetworkManager-wifi bluez iw wireless-regdb
+# NetworkManager manages wlan0 only with its Wi-Fi plugin, which needs
+# wpa_supplicant or iwd; wpa_supplicant is named (Fedora Server's default).
+Recommends:     NetworkManager-wifi wpa_supplicant bluez iw wireless-regdb
 
 %description
 The AICSemi AIC8800 USB driver (Radxa's radxa-pkg/aic8800, pinned) for the
@@ -104,6 +106,12 @@ install -Dpm0755 %{SOURCE6} %{buildroot}%{_libexecdir}/cubie-a7a/aic-udev
 %{_libexecdir}/cubie-a7a/aic-udev
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.3-2
+- Recommends wpa_supplicant next to NetworkManager-wifi (it needs
+  wpa_supplicant or iwd; without the Wi-Fi plugin wlan0 is unmanaged)
+- WIFI-FIRMWARE.md: every image carries the Wi-Fi/Bluetooth userspace and
+  enables bluetooth.service; how to add it on an older card
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.3-1
 - Fedora's firmware, replacing the user opt-in: Requires
   linux-firmware; aic_load_fw falls back file by file from the user override

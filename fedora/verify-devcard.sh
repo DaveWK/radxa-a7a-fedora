@@ -127,7 +127,7 @@ check "sshd: PermitRootLogin yes" grep -q '^PermitRootLogin yes' "$ROOT/etc/ssh/
 check "no SSH host keys" bash -c "! ls '$ROOT'/etc/ssh/ssh_host_* >/dev/null 2>&1"
 check "no authorized_keys" bash -c "! ls '$ROOT'/root/.ssh/authorized_keys* >/dev/null 2>&1"
 # cubie-a7a-fwlog is optional (built only where the boot-chain checkout is).
-units="sshd NetworkManager firewalld chronyd cubie-a7a-dtb dkms"
+units="sshd NetworkManager firewalld chronyd cubie-a7a-dtb dkms bluetooth"
 if grep -q '^cubie-a7a-fwlog-' "$W/packages.txt"; then
     units="$units a7a-fwlog"
     check "a7a-fwlog installed (aarch64)" bash -c "file '$ROOT/usr/bin/a7a-fwlog' | grep -q 'ARM aarch64'"
@@ -155,8 +155,18 @@ if grep -q '^cubie-a7a-aic8800-usb-' "$W/packages.txt"; then
     done
     check "cubie-a7a-wifi-firmware (optional override) and its manifest installed" bash -c "test -x '$ROOT/usr/bin/cubie-a7a-wifi-firmware' && test -s '$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest' && test -s '$ROOT/usr/share/cubie-a7a/WIFI-FIRMWARE.md'"
     check "aic_btusb before btusb (softdep)" grep -q '^softdep btusb pre: aic_btusb' "$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf"
-    check "NetworkManager-wifi and bluez installed" bash -c "grep -q '^NetworkManager-wifi-' '$W/packages.txt' && grep -q '^bluez-' '$W/packages.txt'"
 fi
+# Wi-Fi out of the box: NetworkManager manages wlan0 only
+# with its Wi-Fi plugin and a supplicant; nothing marks Wi-Fi unmanaged and
+# nothing connects anywhere on its own.
+for pkg in NetworkManager-wifi wpa_supplicant iw bluez wireless-regdb; do
+    check "$pkg installed" grep -q "^$pkg-[0-9]" "$W/packages.txt"
+done
+check "no iwd (NetworkManager's Wi-Fi backend is wpa_supplicant)" bash -c "! grep -q '^iwd-[0-9]' '$W/packages.txt'"
+check "NetworkManager Wi-Fi device plugin present" bash -c "ls '$ROOT'/usr/lib64/NetworkManager/*/libnm-device-plugin-wifi.so >/dev/null 2>&1"
+check "NetworkManager config leaves devices managed (no unmanaged-devices, no managed=false)" bash -c "! grep -rqsiE '^[[:space:]]*(unmanaged-devices|managed[[:space:]]*=[[:space:]]*(0|false|no))' '$ROOT/etc/NetworkManager' '$ROOT/usr/lib/NetworkManager/conf.d'"
+check "no udev rule marks Wi-Fi unmanaged (only NetworkManager's own 85-nm-unmanaged.rules, which names no Wi-Fi)" bash -c "! grep -rlsE 'NM_UNMANAGED' '$ROOT/etc/udev/rules.d' '$ROOT/usr/lib/udev/rules.d' | grep -qv '/85-nm-unmanaged.rules\$' && ! grep -qiE 'wlan|wifi|wlp|aic' '$ROOT/usr/lib/udev/rules.d/85-nm-unmanaged.rules'"
+check "no Wi-Fi connection profile in the image (nothing auto-connects)" bash -c "! grep -rlsq 'type=wifi\|type=802-11-wireless' '$ROOT/etc/NetworkManager/system-connections' '$ROOT/usr/lib/NetworkManager/system-connections'"
 # check-sshd.sh runs the target sshd (qemu-user) in the private namespace.
 if [ "${A7A_PRIVATE_BUILD:-}" = 1 ] || [ "$(id -u)" = 0 ]; then
     check "actual target sshd policy and sole human account" "$TOP/fedora/check-sshd.sh" "$ROOT" "$W/effective-sshd.txt"

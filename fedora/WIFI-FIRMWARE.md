@@ -152,8 +152,16 @@ appears without a reboot. The driver also accepts `<name>.xz` or
 
 - NetworkManager manages `wlan0` (`nmcli device wifi list`,
   `nmcli device wifi connect <SSID> --ask`); Bluetooth is BlueZ
-  (`bluetoothctl`). The image installs `NetworkManager-wifi`, `bluez` and
-  `iw`.
+  (`bluetoothctl`). Every image installs `NetworkManager-wifi`,
+  `wpa_supplicant`, `iw`, `bluez` and `wireless-regdb` and enables
+  `bluetooth.service` (`mkdevcard.sh`, checked by `verify-devcard.sh`).
+  Without the Wi-Fi plugin NetworkManager lists `wlan0` as unmanaged even
+  with the driver and firmware working; `NetworkManager-wifi` needs
+  `wpa_supplicant` or `iwd`, and the image names `wpa_supplicant` (Fedora
+  Server's default too). No connection or credential is preconfigured. On a
+  card built before this: `dnf install NetworkManager-wifi wpa_supplicant
+  iw bluez`, `systemctl enable --now bluetooth`, `systemctl restart
+  NetworkManager`.
 - rfkill: nothing is soft-blocked by default; `systemd-rfkill` restores the
   last state (`rfkill list`, `nmcli radio wifi on|off`).
 - Regulatory domain: the driver follows cfg80211 (its permissive

@@ -100,23 +100,30 @@ fi
 # host driver), cubie-a7a-display (HDMI, sunxidrm) and cubie-a7a-vdec (video
 # decoder, a733-cedrus) go in when they were built; cubie-a7a-hat loads them.
 # cubie-a7a-aic8800-usb (AIC8800D80 Wi-Fi/Bluetooth driver) goes in the same
-# way, with the userspace it needs (weak dependencies are off here). Its
-# firmware is Fedora's linux-firmware (aic/aic8800d80;
+# way. Its firmware is Fedora's linux-firmware (aic/aic8800d80;
 # fedora/WIFI-FIRMWARE.md), in PACKAGES below and required by the driver
 # package; verify-devcard.sh checks it is there and that the image carries no
 # user-override firmware.
-RADIO_PACKAGES=()
 for extra in cubie-a7a-npu cubie-a7a-rk1828 cubie-a7a-display cubie-a7a-vdec cubie-a7a-hat \
     cubie-a7a-aic8800-usb; do
     # shellcheck disable=SC2012 # RPM file names are plain
     r=$(ls "$RPMDIR"/noarch/"$extra"-[0-9]*.noarch.rpm 2>/dev/null | sort -V | tail -1 || :)
     [ -z "$r" ] || BOARD_RPMS+=("$r")
     [ -z "$r" ] || [ "$extra" != cubie-a7a-hat ] || BOARD_UNITS+=(cubie-a7a-hat.service)
-    if [ -n "$r" ] && [ "$extra" = cubie-a7a-aic8800-usb ]; then
-        RADIO_PACKAGES=(NetworkManager-wifi wpa_supplicant bluez iw wireless-regdb)
-        BOARD_UNITS+=(bluetooth.service)
-    fi
 done
+# Wi-Fi and Bluetooth userspace, in every image (Wi-Fi out of the box),
+# whether or not the driver package was built: NetworkManager
+# manages wlan0 only with its Wi-Fi plugin (without it the device shows as
+# unmanaged), and the plugin needs a supplicant. Weak dependencies are off
+# here, and NetworkManager-wifi requires "wpa_supplicant or iwd", so the
+# supplicant is named. Fedora Server installs the same two by default (comps
+# group networkmanager-submodules in server-product-environment); bluez and
+# iw, not in Fedora Server's default set, are the basic Bluetooth and Wi-Fi
+# tools, and bluetooth.service is enabled. No Wi-Fi connection, credential or
+# regulatory domain is configured: nmcli device wifi connect <SSID> --ask
+# (fedora/WIFI-FIRMWARE.md).
+RADIO_PACKAGES=(NetworkManager-wifi wpa_supplicant iw bluez wireless-regdb)
+BOARD_UNITS+=(bluetooth.service)
 OVERLAY=${OVERLAY:-}
 [ -z "$OVERLAY" ] || [ -d "$OVERLAY" ] || { echo "OVERLAY $OVERLAY is not a directory" >&2; exit 2; }
 # XZ=no leaves the compression to the caller (the build guest).
