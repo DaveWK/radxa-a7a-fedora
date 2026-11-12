@@ -8,6 +8,7 @@ include/dt-bindings/{gpio,interrupt-controller}/*
 include/dt-bindings/thermal/thermal.h  from linux-7.2.10 (kernel-7.2.10-200.fc44.src.rpm)
 cubie-a7a-thermal.dtsi  this project (THS, SID, thermal zones, gpio-fan)
 cubie-a7a-watchdog.dtsi  this project (WDT0 for the mainline sunxi_wdt; layout as bt0/main drive it)
+cubie-a7a-emmc.dtsi  this project (mmc2 eMMC socket; values from schematic v1.10 sheets 4 and 9)
 cubie-a7a-interim.dtsi, sun60i-a733-cubie-a7a.dts, Makefile  this project
 
 sha256 of each imported file:

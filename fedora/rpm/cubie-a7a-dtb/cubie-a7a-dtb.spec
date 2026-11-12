@@ -1,5 +1,5 @@
 Name:           cubie-a7a-dtb
-Version:        0.17
+Version:        0.18
 Release:        1%{?dist}
 Summary:        Radxa Cubie A7A device tree, used when newer than the firmware's
 License:        (GPL-2.0-only OR MIT) AND BSD-2-Clause AND MIT
@@ -29,9 +29,9 @@ Linux series, native paired SERDES/PCIe and remaining firmware-initialised
 EHCI/OHCI nodes, the SPI NOR as one read-only partition, the A733 thermal
 sensors with five thermal zones, the PL9 gpio-fan, the HDMI display path
 (display engine, tcon-tv0, DW HDMI) for cubie-a7a-display, the video
-decoder for cubie-a7a-vdec and the WDT0 watchdog (mainline sunxi_wdt), which
-cubie-a7a-board-support has systemd pet. It works with Fedora's own kernel
-and the cubie-a7a-board-support modules.
+decoder for cubie-a7a-vdec, the WDT0 watchdog (mainline sunxi_wdt), which
+cubie-a7a-board-support has systemd pet, and the eMMC module socket (mmc2).
+It works with Fedora's own kernel and the cubie-a7a-board-support modules.
 
 The oreboot + EDK2 firmware embeds a DTB built from the same source. This
 package installs its copy on the ESP (\dtb\allwinner\, which the firmware
@@ -85,6 +85,18 @@ fi
 %dir %{_sharedstatedir}/cubie-a7a
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.18-1
+- Binding stamp 23: stamp 22 (WDT0) plus the eMMC module socket on mmc2
+  (cubie-a7a-emmc.dtsi, from the draft that used stamp 21 and 0.16 and
+  was never shipped). SMHC2 on the stock sunxi-mmc D1
+  entry, 8-bit, PC0..PC16 function 3 (PC0 data strobe pulled down), RST on
+  PC1, cap-mmc-hw-reset; vmmc SWOUT2 (VCC-eMMC), vqmmc CLDO5 (VCC-PC);
+  non-removable. Conservative until it has run on the board (SanDisk
+  iNAND SDINBDV4-64G on the 4 GB board, 2026-11-18): High Speed at
+  52 MHz; the driver adds DDR52 itself (new timing mode); HS200 off
+  (-DEMMC_HS200 turns it on, -DEMMC_MAX_HZ raises the clock cap).
+  Aliases mmc0/mmc2 keep the microSD host at mmc0
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.17-1
 - Binding stamp 22: WDT0 (0x02050000) for the mainline sunxi_wdt driver,
   compatible "allwinner,sun60i-a733-wdt", "allwinner,sun55i-a523-wdt"

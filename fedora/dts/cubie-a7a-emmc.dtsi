@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Cubie A7A: eMMC module socket on SMHC2 (mmc2, 0x04022000). NOT run on
+ * hardware yet. The 4 GB board has a module since 2026-11-18 (SanDisk iNAND
+ * SDINBDV4-64G, EXT_CSD rev 8, DEVICE_TYPE 0x57: HS52, DDR52 at 1.8/3 V,
+ * HS200 at 1.8 V, HS400 at 1.8 V; RST_n_FUNCTION 0), read by bt0 and
+ * fastboot only, on a 1-bit bus at 12 MHz.
+ *
+ * Board (public schematic radxa_cubie_a7a_v1.10_schematic.pdf):
+ * - Sheet 9: 34-pin BTB socket. D0..D7 = PC10 PC13 PC15 PC8 PC9 PC11 PC14
+ *   PC16, CLK PC5, CMD PC6, RSTN PC1 (EMMC_RST, R123 0R; the pull-up R122
+ *   is not fitted, so the controller drives it), RCLK/DS PC0 (R124 0R).
+ *   Module VDD1/VDD2 (VCCQ) = VCC-PC, VDDF1/VDDF2 (VCC) = VCC-eMMC.
+ * - Sheet 4: VCC-eMMC is SWOUT2 (3.3 V), not an LDO: ALDO5 feeds
+ *   VCC33-CODEC. VCC-PC is CLDO5 (1.8 V), as vcc-pc-supply already says.
+ *   Both rails are regulator-always-on (cubie-a7a-tuning.dtsi) and shared,
+ *   so Linux can neither power-cycle the module nor change VCCQ: the bus
+ *   signals at 1.8 V from power-on. The core's initial 3.3 V request on
+ *   vqmmc fails against CLDO5's 1.8 V constraint and it falls back to 1.8 V
+ *   (mmc_set_initial_signal_voltage()), which eMMC allows.
+ * - The board ships without a module. Presence is only visible to an ADC
+ *   (eMMC_PLUG = module GND pin 16, through R216 3.9K to BOOT-SEL-ADC),
+ *   so there is no cd-gpios. non-removable is still the right description
+ *   for a socket that is only populated with power off: with no module the
+ *   core tries once at 400 kHz, logs "mmc2: Failed to initialize a
+ *   non-removable card" and stops (no polling, the host stays bound and
+ *   idle). broken-cd would instead poll every second forever.
+ *
+ * Controller: the SoC node (series/sun60i-a733.dtsi) is
+ * "allwinner,sun60i-a733-mmc", "allwinner,sun20i-d1-mmc", as the upstream
+ * binding defines for A733 MMC0/1/2. Stock sunxi-mmc binds the D1 entry
+ * (new timing mode, calibration register, 8 KiB IDMA descriptors with the
+ * address >> 2); mmc0 runs on the same entry, and mainline A523 boards run
+ * their SMHC2 (the same controller generation in the vendor tree) with it
+ * and HS200. Stock sunxi-mmc has no tuning (fixed sample delay 0) and masks
+ * HS400, so there is no mmc-hs400-1_8v and no data-strobe tuning here.
+ * PC0 (DS) is still muxed, pulled down as the vendor does, so the module's
+ * RCLK output never sees a floating input.
+ *
+ * Speed (conservative until the module has run, 2026-11-18): High Speed
+ * SDR at 52 MHz on 8 bits. sunxi-mmc adds MMC_CAP_1_8V_DDR itself on the
+ * new timing mode (sunxi_mmc_probe), so the core selects DDR52 on this
+ * module whatever this node says; there is no DT property to drop it.
+ * HS200 is off: stock sunxi-mmc has no execute_tuning, so HS200 would run
+ * untuned, and an HS200 switch or bus-test failure fails the whole card
+ * init, which on an eMMC root means no root. Bring-up macros (cpp):
+ *   -DEMMC_HS200             add mmc-hs200-1_8v (raise EMMC_MAX_HZ with it)
+ *   -DEMMC_MAX_HZ=150000000  cap the card clock (default 52 MHz; 150 MHz is
+ *                            the mainline A523 value, 600 MHz / 2 / 2)
+ *
+ * The SoC dtsi has no mmc2 pin group; the one below belongs there (as in
+ * sun55i-a523.dtsi) once the Linux series carries it.
+ */
+
+#ifndef EMMC_MAX_HZ
+#define EMMC_MAX_HZ 52000000
+#endif
+
+/ {
+	aliases {
+		/* sunxi-mmc probes asynchronously: pin the host numbers. */
+		mmc0 = &mmc0;
+		mmc2 = &mmc2;
+	};
+};
+
+&gpio {
+	mmc2_pins: mmc2-pins {
+		/* CLK PC5, CMD PC6, RST PC1, D0..D7 */
+		pins = "PC1", "PC5", "PC6", "PC8", "PC9", "PC10",
+		       "PC11", "PC13", "PC14", "PC15", "PC16";
+		allwinner,pinmux = <3>;
+		function = "mmc2";
+		drive-strength = <30>;
+		bias-pull-up;
+	};
+
+	mmc2_ds_pin: mmc2-ds-pin {
+		pins = "PC0";
+		allwinner,pinmux = <3>;
+		function = "mmc2";
+		drive-strength = <30>;
+		bias-pull-down;
+	};
+};
+
+&mmc2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mmc2_pins>, <&mmc2_ds_pin>;
+	vmmc-supply = <&reg_swout2>;	/* VCC-eMMC (module VDDF) */
+	vqmmc-supply = <&reg_cldo5>;	/* VCC-PC (module VDD1/VDD2) */
+	bus-width = <8>;
+	non-removable;
+	no-sd;
+	no-sdio;
+	cap-mmc-highspeed;
+	cap-mmc-hw-reset;
+	mmc-ddr-1_8v;
+#ifdef EMMC_HS200
+	mmc-hs200-1_8v;
+#endif
+	max-frequency = <EMMC_MAX_HZ>;
+	status = "okay";
+};
