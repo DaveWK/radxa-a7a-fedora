@@ -91,14 +91,20 @@ MODULE_PARM_DESC(settle_ms, "extra wait for GPU_CORE after 10 ms, at most 5000 m
 /*
  * The GPU domains are switched on on demand: genpd powers GPU_TOP, then
  * GPU_CORE, when the GPU device (powervr) attaches or runtime-resumes, and
- * off again when it suspends or detaches. With gpu_core_always_on=1 the
- * provider instead switches GPU_CORE (and GPU_TOP first) on at probe and
- * keeps it on, as up to cubie-a7a-board-support 0.12; the gpu_core_seq
- * experiments then run at probe, before the GPU driver owns its reset.
+ * off again when it suspends or detaches. A GPU domain found on at probe
+ * (left on by an earlier kernel across a warm reset, or by other boot
+ * firmware) is switched off before it is published, GPU_CORE before
+ * GPU_TOP: genpd would otherwise keep it on (genpd_power_off_unused runs
+ * before this module loads, and an on domain stays on until the provider's
+ * sync_state, which waits for every consumer to probe). With
+ * gpu_core_always_on=1 the provider instead switches GPU_CORE (and GPU_TOP
+ * first) on at probe and keeps it on, as up to cubie-a7a-board-support 0.12;
+ * the gpu_core_seq experiments then run at probe, before the GPU driver owns
+ * its reset.
  */
 static bool gpu_core_always_on;
 module_param(gpu_core_always_on, bool, 0444);
-MODULE_PARM_DESC(gpu_core_always_on, "switch GPU_CORE (and GPU_TOP) on at probe and keep it on, as before 0.13 (default: on demand)");
+MODULE_PARM_DESC(gpu_core_always_on, "switch GPU_CORE (and GPU_TOP) on at probe and keep it on, as before 0.13 (default: on demand; GPU domains found on at probe are switched off)");
 
 struct sunxi_pck600_pd_desc {
 	const char *name;
@@ -121,6 +127,11 @@ struct sunxi_pck600_pd_desc {
 	 * optional in the device tree.
 	 */
 	const char *on_clk[2];
+	/*
+	 * Powered only on demand: a domain found on at probe is switched off
+	 * before it is published (unless gpu_core_always_on).
+	 */
+	bool on_demand;
 };
 
 struct sunxi_pck600_desc {
@@ -474,6 +485,60 @@ static bool sunxi_pck600_hold_on(const struct sunxi_pck600_desc *desc,
 	return false;
 }
 
+static bool sunxi_pck600_is_on(struct sunxi_pck600_pd *pd)
+{
+	return FIELD_GET(PPU_PWR_STATUS, readl(pd->base + PPU_PWSR)) ==
+	       PPU_POWER_MODE_ON;
+}
+
+/*
+ * Switch off the on-demand domains found on at probe, children before their
+ * parent, through the same callback genpd uses: the domain's held clocks
+ * (GPU_TOP: the GPU master gates) are taken to match the on state first,
+ * so the child's transition runs with its parent fully up and the gates end
+ * up off in hardware; GPU_CORE's transition clocks the GPU and releases its
+ * reset for the handshake and hands both back. A domain that does not
+ * switch off, or whose child is still on, stays on and is published on.
+ */
+static void sunxi_pck600_off_unused(struct sunxi_pck600 *pck,
+				    const struct sunxi_pck600_desc *desc)
+{
+	int i, j;
+
+	if (gpu_core_always_on)
+		return;
+	for (i = 0; i < desc->num_domains; i++) {
+		struct sunxi_pck600_pd *pd = &pck->pds[i];
+
+		if (desc->pd_descs[i].on_demand && sunxi_pck600_is_on(pd))
+			sunxi_pck600_on_clk(pd, true);
+	}
+	for (i = desc->num_domains - 1; i >= 0; i--) {
+		struct sunxi_pck600_pd *pd = &pck->pds[i];
+		int ret;
+
+		if (!desc->pd_descs[i].on_demand || !sunxi_pck600_is_on(pd))
+			continue;
+		for (j = i + 1; j < desc->num_domains; j++)
+			if (sunxi_pck600_parent(desc, j) == i &&
+			    sunxi_pck600_is_on(&pck->pds[j]))
+				break;
+		if (j < desc->num_domains) {
+			dev_warn(pck->dev, "domain \"%s\" left on: \"%s\" is on\n",
+				 pd->genpd.name, desc->pd_descs[j].name);
+			continue;
+		}
+		sunxi_pck600_pd_setup(pd, desc);
+		ret = sunxi_pck600_power_off(&pd->genpd);
+		if (ret)
+			dev_warn(pck->dev, "domain \"%s\" on at probe, left on (%d)\n",
+				 pd->genpd.name, ret);
+		else
+			dev_info(pck->dev, "domain \"%s\" on at probe, switched off (on demand)\n",
+				 pd->genpd.name);
+	}
+}
+
 static int sunxi_pck600_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -531,21 +596,17 @@ static int sunxi_pck600_probe(struct platform_device *pdev)
 
 		if (pd_desc->dev_clk) {
 			pd->dev_clk = devm_clk_get_optional(dev, pd_desc->dev_clk);
-			if (IS_ERR(pd->dev_clk)) {
-				ret = dev_err_probe(dev, PTR_ERR(pd->dev_clk),
-						    "failed to get clock %s\n",
-						    pd_desc->dev_clk);
-				goto err_remove_pds;
-			}
+			if (IS_ERR(pd->dev_clk))
+				return dev_err_probe(dev, PTR_ERR(pd->dev_clk),
+						     "failed to get clock %s\n",
+						     pd_desc->dev_clk);
 		}
 		if (pd_desc->dev_bus_clk) {
 			pd->dev_bus_clk = devm_clk_get_optional(dev, pd_desc->dev_bus_clk);
-			if (IS_ERR(pd->dev_bus_clk)) {
-				ret = dev_err_probe(dev, PTR_ERR(pd->dev_bus_clk),
-						    "failed to get clock %s\n",
-						    pd_desc->dev_bus_clk);
-				goto err_remove_pds;
-			}
+			if (IS_ERR(pd->dev_bus_clk))
+				return dev_err_probe(dev, PTR_ERR(pd->dev_bus_clk),
+						     "failed to get clock %s\n",
+						     pd_desc->dev_bus_clk);
 		}
 		if (pd_desc->dev_rst &&
 		    of_property_match_string(dev->of_node, "reset-names",
@@ -555,12 +616,10 @@ static int sunxi_pck600_probe(struct platform_device *pdev)
 			if (!pd_desc->on_clk[c])
 				continue;
 			pd->on_clk[c] = devm_clk_get_optional(dev, pd_desc->on_clk[c]);
-			if (IS_ERR(pd->on_clk[c])) {
-				ret = dev_err_probe(dev, PTR_ERR(pd->on_clk[c]),
-						    "failed to get clock %s\n",
-						    pd_desc->on_clk[c]);
-				goto err_remove_pds;
-			}
+			if (IS_ERR(pd->on_clk[c]))
+				return dev_err_probe(dev, PTR_ERR(pd->on_clk[c]),
+						     "failed to get clock %s\n",
+						     pd_desc->on_clk[c]);
 			if (!pd->on_clk[c])
 				dev_warn(dev, "domain \"%s\": no clock %s in the device tree\n",
 					 pd->genpd.name, pd_desc->on_clk[c]);
@@ -572,6 +631,13 @@ static int sunxi_pck600_probe(struct platform_device *pdev)
 		sunxi_pck600_pd_dump(pd, "at probe", false);
 		dev_info(dev, "domain \"%s\" id: " PPU_ID_FMT "\n", pd->genpd.name,
 			 PPU_ID_ARGS(pd->base));
+	}
+
+	/* Nothing of the hardware is written before this point. */
+	sunxi_pck600_off_unused(pck, desc);
+
+	for (i = 0; i < desc->num_domains; i++) {
+		struct sunxi_pck600_pd *pd = &pck->pds[i];
 
 		/* The provider must describe hardware state, not firmware intent.
 		 * This driver supports only stable OFF and ON. Reject retention,
@@ -617,7 +683,10 @@ static int sunxi_pck600_probe(struct platform_device *pdev)
 			dev_err_probe(dev, ret, "failed to initialize power domain\n");
 			goto err_remove_pds;
 		}
-		/* published on, as firmware left it or switched on above */
+		/*
+		 * published on: as firmware left it (an on-demand domain that
+		 * would not switch off above), or switched on above
+		 */
 		if (state == PPU_POWER_MODE_ON)
 			sunxi_pck600_on_clk(pd, true);
 
@@ -649,10 +718,11 @@ static int sunxi_pck600_probe(struct platform_device *pdev)
 	return 0;
 
 err_remove_pds:
-	for (i--; i >= 0; i--) {
+	for (i--; i >= 0; i--)
 		pm_genpd_remove(genpds->domains[i]);
+	/* also a domain left on above but not initialized yet */
+	for (i = 0; i < desc->num_domains; i++)
 		sunxi_pck600_on_clk(&pck->pds[i], false);
-	}
 
 	return ret;
 }
@@ -684,11 +754,12 @@ static const struct sunxi_pck600_pd_desc sun60i_a733_pck600_pds[] = {
 	 * its reset asserted, so the GPU is clocked and released for the
 	 * transition when the provider node names them.
 	 * Both are on demand (not always-on): off until the GPU device
-	 * attaches, unless gpu_core_always_on=1. GPU_TOP holds the GPU's bus
-	 * master gates while it is on.
+	 * attaches, and switched off at probe if found on, unless
+	 * gpu_core_always_on=1. GPU_TOP holds the GPU's bus master gates while
+	 * it is on.
 	 */
-	{ "GPU_TOP", .on_clk = { "gpu-ahb", "gpu-mbus" }, },
-	{ "GPU_CORE", 0, "GPU_TOP", "gpu", "gpu-bus", "gpu", },
+	{ "GPU_TOP", .on_clk = { "gpu-ahb", "gpu-mbus" }, .on_demand = true, },
+	{ "GPU_CORE", 0, "GPU_TOP", "gpu", "gpu-bus", "gpu", .on_demand = true, },
 	/* Cubie native SERDES holds the shared baseline while bound.
 	 * System/runtime domain power-down needs coordinated lane consumers;
 	 * retain these two domains until that contract is implemented/tested.

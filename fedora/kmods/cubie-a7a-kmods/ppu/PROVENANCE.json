@@ -12,8 +12,9 @@
     "a domain that will not switch on at probe is published off, not fatal to the provider",
     "optional inner-device clocks and reset (GPU_CORE: gpu, gpu-bus, gpu) held for the transition only; PPU state dumped on a stuck transition",
     "full PPU frame and ID logging at probe, around GPU_CORE transitions and in debugfs pck600-regs; static requests clear the dynamic enable; GPU_CORE experiments gpu_core_seq (0 extended settle_ms wait, 1 request left pending, 2 dynamic policy)",
-    "GPU power on demand (2026-11-12): GPU_CORE not always-on by default, so neither GPU domain is switched on at probe; genpd switches them when the GPU device attaches/resumes. Module parameter gpu_core_always_on=1 restores the always-on GPU_CORE. GPU_TOP holds optional clocks (gpu-ahb, gpu-mbus: the GPU bus master gates) while it is on"
+    "GPU power on demand (2026-11-12): GPU_CORE not always-on by default, so neither GPU domain is switched on at probe; genpd switches them when the GPU device attaches/resumes. Module parameter gpu_core_always_on=1 restores the always-on GPU_CORE. GPU_TOP holds optional clocks (gpu-ahb, gpu-mbus: the GPU bus master gates) while it is on",
+    "GPU domains found on at probe (2026-11-12, board-support 0.14): unless gpu_core_always_on, GPU_CORE then GPU_TOP are switched off before they are published (held gates taken to match, then released; GPU_CORE's clock/reset handshake), since genpd keeps a domain published on until sync_state and pd_ignore_unused/genpd_power_off_unused never apply to a module; a domain that will not switch off is published on. Clock lookups precede every register write; a probe failure releases the gates of every domain"
   ],
   "genpd_attach_sha256": "32e2f6b0988eba52a2f662fdc2d7132022fbe980f281b2a82babcf3d7f46e18a",
-  "production_sha256": "da640b61a4951b0121fc989c79323381f133ce18e3362fc692de0694a4a8b0a7"
+  "production_sha256": "ba361692860a3a003b7675b203afdd734be1ab0a7c3e1cd9cde8f2fb29ef9734"
 }

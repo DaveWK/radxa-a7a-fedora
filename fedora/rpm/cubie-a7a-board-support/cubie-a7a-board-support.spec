@@ -1,5 +1,5 @@
 Name:           cubie-a7a-board-support
-Version:        0.13
+Version:        0.14
 Release:        1%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
@@ -140,6 +140,20 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.14-1
+- sun55i-pck600: a GPU domain found on at probe is switched off before it is
+  published, GPU_CORE (clock/reset handshake, GPU_TOP's master gates held)
+  before GPU_TOP (gates released), so genpd and powervr power them on on
+  demand. On the board GPU_TOP stayed on under 0.13 with its master gates
+  enabled: a domain published on stays on until every consumer of the
+  provider has probed (genpd sync_state), and pd_ignore_unused or
+  genpd_power_off_unused never apply to a module. A domain that will not
+  switch off stays published on, as before
+- sun55i_pck600.gpu_core_always_on=1 unchanged: the 0.12 behaviour, nothing
+  is switched off at probe
+- sun55i-pck600: clock lookups precede every PPU write; a probe failure
+  releases the gates of every domain
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.13-1
 - GPU power on demand: GPU_TOP and GPU_CORE are no longer
   switched on at probe; genpd switches them on when the GPU device (powervr)
