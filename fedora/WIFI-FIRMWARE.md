@@ -128,20 +128,22 @@ appears without a reboot. The driver also accepts `<name>.xz` or
   user-space fallback, no timeout), each from the override directory or
   else from linux-firmware's `aic/aic8800d80/`, and starts them; the chip
   re-enumerates as `a69c:8d81`, where `aic8800_fdrv` (Wi-Fi, `wlan0`) and
-  `aic_btusb` (Bluetooth, `hci0`) bind. A file taken from linux-firmware is
-  logged (`... from linux-firmware`).
+  the mainline `btusb` (Bluetooth, `hci0`) bind. A file taken from
+  linux-firmware is logged (`... from linux-firmware`).
 - A file in neither place, or an SDIO Wi-Fi image from linux-firmware: one
   error naming the paths and this document, probe fails with that error,
   the chip stays unbound in ROM mode. No retry loop; installing the files
   (or replugging/rebooting) probes again. `aic_fw_path=` (a directory
   relative to the firmware path) turns the linux-firmware fallback off.
-- Bluetooth: `aic_btusb`, as on the vendor image. The stock `btusb` also
-  matches the D80's standard Bluetooth interface, so
-  `/usr/lib/modprobe.d/cubie-a7a-aic8800.conf` loads `aic_btusb` first and
-  `60-cubie-a7a-aic8800.rules` hands the interface over if `btusb` still
-  bound it. To try the stock `btusb` instead, mask the rule
-  (`ln -s /dev/null /etc/udev/rules.d/60-cubie-a7a-aic8800.rules`) and
-  `blacklist aic_btusb` in `/etc/modprobe.d/`.
+- Bluetooth: the mainline `btusb` (since cubie-a7a-aic8800-usb 0.4). The
+  Bluetooth patch set (ADID, patch, ext patch, patch table) is uploaded by
+  `aic_load_fw` with the Wi-Fi image, before the chip re-enumerates; after
+  that the D80 exposes a standard Bluetooth interface (class e0/01/01),
+  which `btusb` binds (`hci0` came up on the board this way, 2026-11-12).
+  The vendor `aic_btusb` is no longer built or shipped;
+  `/usr/lib/modprobe.d/cubie-a7a-aic8800.conf` blacklists it
+  (`blacklist` plus `install aic_btusb /bin/false`) so a module left by an
+  older package cannot bind.
 - MAC address: the chip's eFuse normally holds it (the vendor image's
   capture shows `wlan0` at `9c:04:b6:84:2e:7b`, not the driver's fallback). If the eFuse is empty the driver would invent
   `88:00:33:77:xx:xx`, different each load; the udev rule replaces that

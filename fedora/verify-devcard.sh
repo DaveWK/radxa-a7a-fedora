@@ -150,11 +150,13 @@ if [ -n "$f" ] && [ "$(xz -dcf -- "$f" 2>/dev/null | grep -ac 'sdio_func1_h2d')"
     echo "  info  linux-firmware's AIC8800D80 Wi-Fi image is the SDIO build: the USB chip stays unbound until a USB build is there (WIFI-FIRMWARE.md)"
 fi
 if grep -q '^cubie-a7a-aic8800-usb-' "$W/packages.txt"; then
-    for m in aic_load_fw aic8800_fdrv aic_btusb; do
+    for m in aic_load_fw aic8800_fdrv; do
         check "DKMS $m built for $kver" bash -c "ls '$ROOT/usr/lib/modules/$kver/extra/$m.ko'* >/dev/null"
     done
+    # Bluetooth on the mainline btusb; the vendor aic_btusb is not built.
+    check "no aic_btusb module for $kver" bash -c "! ls '$ROOT/usr/lib/modules/$kver/extra/aic_btusb.ko'* >/dev/null 2>&1"
     check "cubie-a7a-wifi-firmware (optional override) and its manifest installed" bash -c "test -x '$ROOT/usr/bin/cubie-a7a-wifi-firmware' && test -s '$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest' && test -s '$ROOT/usr/share/cubie-a7a/WIFI-FIRMWARE.md'"
-    check "aic_btusb before btusb (softdep)" grep -q '^softdep btusb pre: aic_btusb' "$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf"
+    check "aic_btusb blacklisted (Bluetooth on the mainline btusb)" bash -c "grep -qx 'blacklist aic_btusb' '$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf' && grep -qx 'install aic_btusb /bin/false' '$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf' && ! grep -q '^softdep' '$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf'"
 fi
 # Wi-Fi out of the box: NetworkManager manages wlan0 only
 # with its Wi-Fi plugin and a supplicant; nothing marks Wi-Fi unmanaged and
