@@ -1,6 +1,6 @@
 Name:           cubie-a7a-npu
 Version:        0.1
-Release:        5%{?dist}
+Release:        6%{?dist}
 Summary:        Allwinner A733 NPU kernel driver (vipcore) for the stock Fedora kernel
 License:        GPL-2.0-only AND (MIT OR GPL-2.0-or-later)
 BuildArch:      noarch
@@ -67,6 +67,14 @@ install -Dpm 0644 %{SOURCE2} %{buildroot}%{_sysusersdir}/cubie-a7a-npu.conf
 %{_sysusersdir}/cubie-a7a-npu.conf
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.1-6
+- DKMS sources follow the vipcore tree: debugfs command-stream capture
+  (os/linux/vip_drv_capture.c, video-memory and task hooks) compiled only
+  in VIPCORE_CAPTURE=1 builds, plus its CAPTURE.md and the capture/ helper
+  scripts (not executable, run with sh and python3). The module DKMS builds
+  from this package is built without VIPCORE_CAPTURE and has no capture
+  code; no driver behaviour change
+
 * Wed Nov 11 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.1-5
 - SPEED.md: the combined-load step names the Vulkan workload again (a CPU
   load until the GPU runs); no driver change
