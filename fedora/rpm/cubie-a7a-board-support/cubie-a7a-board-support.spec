@@ -1,6 +1,6 @@
 Name:           cubie-a7a-board-support
 Version:        0.15
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -18,6 +18,7 @@ Source5:        cubie-a7a-kernel
 Source6:        99-zz-cubie-a7a.install
 Source7:        cubie-a7a-dkms
 Source8:        cubie-a7a-watchdog.conf
+Source9:        cubie-a7a-panic.conf
 
 # DKMS builds the kmods on the board for every Fedora kernel, inside the
 # same dnf transaction (file trigger below), so kernel-devel must follow
@@ -71,6 +72,10 @@ initialises the Ethernet PHY, and PCIe/USB for the interim device tree).
   run time and during reboot, so a hung kernel or PID 1 resets the SoC and
   the board recovers on its own (into FEL while the SD slot is dead).
   RuntimeWatchdogSec=off in /etc/systemd/system.conf.d/ turns it off.
+- sysctl kernel.panic_on_oops=1 and kernel.panic=10
+  (/usr/lib/sysctl.d/60-cubie-a7a-panic.conf): an oops panics and a panic
+  reboots after 10 s, so with the watchdog any oops, panic or hang ends in
+  a reset. Applied at boot by systemd-sysctl, not at install.
 Retire each piece as soon as Fedora's kernel carries the driver.
 
 %prep
@@ -87,6 +92,7 @@ install -Dpm0755 %{SOURCE5} %{buildroot}%{_libexecdir}/cubie-a7a/kernel
 sed -i 's/@VERSION@/%{dkms_ver}/' %{buildroot}%{_libexecdir}/cubie-a7a/kernel
 install -Dpm0755 %{SOURCE6} %{buildroot}%{_prefix}/lib/kernel/install.d/99-zz-cubie-a7a.install
 install -Dpm0644 %{SOURCE8} %{buildroot}%{_prefix}/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf
+install -Dpm0644 %{SOURCE9} %{buildroot}%{_prefix}/lib/sysctl.d/60-cubie-a7a-panic.conf
 mkdir -p %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}
 cp -a cubie-a7a-kmods-%{version}/* %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 sed -i 's/@VERSION@/%{dkms_ver}/' %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/dkms.conf
@@ -143,6 +149,7 @@ fi
 %{_prefix}/lib/modprobe.d/cubie-a7a-staged.conf
 %{_prefix}/lib/kernel/install.d/99-zz-cubie-a7a.install
 %{_prefix}/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf
+%{_prefix}/lib/sysctl.d/60-cubie-a7a-panic.conf
 %dir %{_libexecdir}/cubie-a7a
 %{_libexecdir}/cubie-a7a/cmdline
 %{_libexecdir}/cubie-a7a/kernel
@@ -150,6 +157,19 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.15-2
+- sysctl drop-in /usr/lib/sysctl.d/60-cubie-a7a-panic.conf:
+  kernel.panic_on_oops = 1 and kernel.panic = 10. On 2026-11-12 a
+  non-fatal "list_del corruption" BUG (an oops in process context) left the
+  board limping, sshd resetting connections, instead of rebooting into FEL.
+  Now an oops panics, a panic reboots after 10 s, and the 16 s watchdog
+  covers hangs. Replaces the board's manual
+  /etc/sysctl.d/90-panic-reboot.conf (kernel.panic = 10), which can stay
+- Not applied at install time (sysctls are not namespaced: an image build
+  in a container would change the build host's kernel); systemd-sysctl
+  applies it at the next boot, or sysctl --system at once. An oops before
+  systemd-sysctl runs (initramfs) still uses the kernel defaults
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.15-1
 - systemd drop-in /usr/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf:
   RuntimeWatchdogSec=16s and RebootWatchdogSec=16s, so PID 1 pets WDT0

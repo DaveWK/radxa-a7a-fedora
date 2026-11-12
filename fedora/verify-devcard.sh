@@ -99,6 +99,7 @@ done
 check "SerDes/PCIe/PPU staged (modprobe.d blacklist)" grep -q '^blacklist sun60i_a733_pcie' "$ROOT/usr/lib/modprobe.d/cubie-a7a-staged.conf"
 check "kernel-install guard installed, after Fedora's 95-set-boot-entry" bash -c "test -x '$ROOT/usr/lib/kernel/install.d/99-zz-cubie-a7a.install' && [ \"\$(ls '$ROOT/usr/lib/kernel/install.d' | sort | tail -1)\" = 99-zz-cubie-a7a.install ]"
 check "systemd pets WDT0 (16 s, the sunxi_wdt maximum)" grep -qx 'RuntimeWatchdogSec=16s' "$ROOT/usr/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf"
+check "an oops panics, a panic reboots after 10 s (sysctl.d)" bash -c "grep -qx 'kernel.panic_on_oops = 1' '$ROOT/usr/lib/sysctl.d/60-cubie-a7a-panic.conf' && grep -qx 'kernel.panic = 10' '$ROOT/usr/lib/sysctl.d/60-cubie-a7a-panic.conf'"
 check "RTL8125B firmware present" bash -c "ls '$ROOT'/usr/lib/firmware/rtl_nic/rtl8125b-2.fw* >/dev/null"
 # Closed-firmware audit: a report, not a check (fedora/image-firmware.py).
 if [ -s "$W/firmware-audit.txt" ]; then
