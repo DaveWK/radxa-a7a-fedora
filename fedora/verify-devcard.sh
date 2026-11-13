@@ -6,6 +6,13 @@
 # Not a board test.
 #
 # Usage: fedora/verify-devcard.sh [IMAGE] [WORK_DIR]
+#
+# Set as for the build (mkdevcard.sh), to check what it added:
+#   BOOT_MODES=protective   the three entries per kernel (fedora/bootmodes/)
+#   EXTRA_PACKAGES="a b"    the extra packages are installed
+#   AIC_OVERRIDE=yes        the card carries the user-override AIC8800 USB
+#                           firmware (via OVERLAY), every file matching the
+#                           driver package's manifest; default: none allowed
 set -uo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,6 +27,9 @@ ROOT=$W/root
 # built here unless a specific firmware DTB is given.
 FIRMWARE_DTB=${FIRMWARE_DTB:-}
 ESP=$W/esp.img
+BOOT_MODES=${BOOT_MODES:-}
+EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
+AIC_OVERRIDE=${AIC_OVERRIDE:-no}
 fail=0
 ok() { printf '  ok    %s\n' "$*"; }
 bad() {
@@ -146,7 +156,17 @@ check "CPU rendering: Mesa llvmpipe (libgallium), kms_swrast, EGL and GBM" bash 
 # AIC8800D80 firmware: Fedora's linux-firmware (
 # WIFI-FIRMWARE.md). The image never carries the user override directory.
 check "AIC8800 firmware present from linux-firmware (aic/aic8800d80)" bash -c "grep -q '^linux-firmware-[0-9]*:' '$W/packages.txt' && for f in fw_patch_table_8800d80_u02 fw_adid_8800d80_u02 fw_patch_8800d80_u02 fmacfw_8800d80_u02; do ls '$ROOT'/usr/lib/firmware/aic/aic8800d80/\$f.bin* >/dev/null 2>&1 || exit 1; done"
-check "no user-override AIC8800 firmware in the image (aic8800_fw)" bash -c "! find '$ROOT/usr/lib/firmware' -path '*aic8800_fw*' -print -quit | grep -q ."
+if [ "$AIC_OVERRIDE" = yes ]; then
+    # Card-only files (never in a repository or package): the five the chip
+    # needs at every start, and nothing that is not in the manifest.
+    man=$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest
+    ovr=$ROOT/usr/lib/firmware/aic8800_fw/USB/aic8800D80
+    check "AIC8800 override: the five required USB files, size and SHA256 as the manifest" bash -c "test -s '$man' && awk '\$4==\"required\"{print \$1, \$2, \$3}' '$man' | { n=0; while read -r f b h; do test \"\$(stat -c %s '$ovr'/\$f)\" = \$b && test \"\$(sha256sum <'$ovr'/\$f | cut -d' ' -f1)\" = \$h || exit 1; n=\$((n+1)); done; test \$n = 5; }"
+    check "AIC8800 override: every file in it is a manifest file with the manifest's SHA256" bash -c "for f in '$ovr'/*; do h=\$(awk -v n=\"\$(basename \"\$f\")\" '\$1==n{print \$3}' '$man'); test -n \"\$h\" && test \"\$(sha256sum <\"\$f\" | cut -d' ' -f1)\" = \"\$h\" || exit 1; done"
+    echo "  info  AIC8800 override files: $(ls "$ovr" 2>/dev/null | tr '\n' ' ')"
+else
+    check "no user-override AIC8800 firmware in the image (aic8800_fw)" bash -c "! find '$ROOT/usr/lib/firmware' -path '*aic8800_fw*' -print -quit | grep -q ."
+fi
 f=$(find "$ROOT/usr/lib/firmware/aic/aic8800d80" -name 'fmacfw_8800d80_u02.bin*' -print -quit 2>/dev/null || :)
 if [ -n "$f" ] && [ "$(xz -dcf -- "$f" 2>/dev/null | grep -ac 'sdio_func1_h2d')" != 0 ]; then
     echo "  info  linux-firmware's AIC8800D80 Wi-Fi image is the SDIO build: the USB chip stays unbound until a USB build is there (WIFI-FIRMWARE.md)"
@@ -171,6 +191,12 @@ check "NetworkManager Wi-Fi device plugin present" bash -c "ls '$ROOT'/usr/lib64
 check "NetworkManager config leaves devices managed (no unmanaged-devices, no managed=false)" bash -c "! grep -rqsiE '^[[:space:]]*(unmanaged-devices|managed[[:space:]]*=[[:space:]]*(0|false|no))' '$ROOT/etc/NetworkManager' '$ROOT/usr/lib/NetworkManager/conf.d'"
 check "no udev rule marks Wi-Fi unmanaged (only NetworkManager's own 85-nm-unmanaged.rules, which names no Wi-Fi)" bash -c "! grep -rlsE 'NM_UNMANAGED' '$ROOT/etc/udev/rules.d' '$ROOT/usr/lib/udev/rules.d' | grep -qv '/85-nm-unmanaged.rules\$' && ! grep -qiE 'wlan|wifi|wlp|aic' '$ROOT/usr/lib/udev/rules.d/85-nm-unmanaged.rules'"
 check "no Wi-Fi connection profile in the image (nothing auto-connects)" bash -c "! grep -rlsq 'type=wifi\|type=802-11-wireless' '$ROOT/etc/NetworkManager/system-connections' '$ROOT/usr/lib/NetworkManager/system-connections'"
+for pkg in $EXTRA_PACKAGES; do
+    check "$pkg installed (EXTRA_PACKAGES)" grep -q "^$pkg-[0-9]" "$W/packages.txt"
+done
+if [ -s "$W/overlay.sha256" ]; then
+    check "overlay files in the root as built ($(wc -l <"$W/overlay.sha256") files)" "$TOP/fedora/run-build-ns.sh" user bash -c "cd '$(realpath "$ROOT")' && sha256sum --quiet -c '$(realpath "$W/overlay.sha256")'"
+fi
 # check-sshd.sh runs the target sshd (qemu-user) in the private namespace.
 if [ "${A7A_PRIVATE_BUILD:-}" = 1 ] || [ "$(id -u)" = 0 ]; then
     check "actual target sshd policy and sole human account" "$TOP/fedora/check-sshd.sh" "$ROOT" "$W/effective-sshd.txt"
@@ -190,6 +216,66 @@ check "SELinux labels in ext4 match target policy" "$TOP/fedora/run-build-ns.sh"
 check "no first-boot relabel required (all image labels verified)" test ! -e "$ROOT/.autorelabel"
 check "machine-id empty (first boot)" test ! -s "$ROOT/etc/machine-id"
 check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
+
+if [ "$BOOT_MODES" = protective ]; then
+    echo "== boot modes (protective default, maintenance, full)"
+    bm=$ROOT/usr/local/sbin/cubie-a7a-bootmode
+    check "cubie-a7a-bootmode installed" test -x "$bm"
+    check "kernel-install plugin 96-cubie-a7a-bootmodes installed" test -x "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
+    check "cubie-a7a-bootmode-ro.service enabled" bash -c "ls '$ROOT'/etc/systemd/system/sysinit.target.wants/cubie-a7a-bootmode-ro.service >/dev/null 2>&1"
+    dargs=$(bash "$bm" default-args 2>/dev/null)
+    hat=cubie_a7a.hat=0
+    protect=${dargs#"$hat" }
+    echo "  default entry adds: $dargs"
+    has_all() { # words line
+        local w
+        for w in $1; do case " $2 " in *" $w "*) ;; *) return 1 ;; esac; done
+    }
+    strip() { # line words
+        local o="" w x k
+        for w in $1; do k=1; for x in $2; do [ "$w" = "$x" ] && k=0; done; [ $k = 1 ] && o="$o $w"; done
+        echo "${o# }"
+    }
+    check "/etc/kernel/cmdline carries the protective options (new kernels' default entry)" has_all "$dargs" "$(cat "$ROOT/etc/kernel/cmdline")"
+    check "/etc/default/grub GRUB_CMDLINE_LINUX carries them (grub2-mkconfig fallback stays protective)" has_all "$dargs" "$(sed -n 's/^GRUB_CMDLINE_LINUX=\"\(.*\)\"$/\1/p' "$ROOT/etc/default/grub")"
+    check "/etc/kernel/cmdline newer than /etc/default/grub (no grub2-mkconfig from 20-grub.install)" test "$ROOT/etc/kernel/cmdline" -nt "$ROOT/etc/default/grub"
+    check "masked units exist as named (cubie-a7a-dtb, systemd-repart, systemd-growfs@)" bash -c "test -f '$ROOT/usr/lib/systemd/system/cubie-a7a-dtb.service' && test -f '$ROOT/usr/lib/systemd/system/systemd-repart.service' && test -f '$ROOT/usr/lib/systemd/system/systemd-growfs-root.service'"
+    check "fstab: /boot/efi (boot-efi.mount) and growfs on /" bash -c "grep -q ' /boot/efi ' '$ROOT/etc/fstab' && grep -q 'x-systemd.growfs' '$ROOT/etc/fstab'"
+    nmain=0
+    for e in "$ROOT"/boot/loader/entries/*.conf; do
+        case "$(basename "$e")" in *~*) continue ;; esac
+        nmain=$((nmain + 1))
+        id=$(basename "$e" .conf)
+        o=$(awk '$1=="options"{$1="";sub(/^ /,"");print}' "$e")
+        mt=${e%.conf}~maintenance.conf
+        fu=${e%.conf}~full.conf
+        mo=$(awk '$1=="options"{$1="";sub(/^ /,"");print}' "$mt" 2>/dev/null)
+        fo=$(awk '$1=="options"{$1="";sub(/^ /,"");print}' "$fu" 2>/dev/null)
+        echo "  $id"
+        echo "    default:     $o"
+        echo "    maintenance: $mo"
+        echo "    full:        $fo"
+        check "$id: default entry has $dargs" has_all "$dargs" "$o"
+        check "$id~maintenance: exists, = default minus the protective options (rw, hat=0)" bash -c "test -f '$mt' && [ '$mo' = '$(strip "$o" "$protect")' ] && grep -qw '$hat' <<<'$mo'"
+        check "$id~full: exists, = maintenance minus cubie_a7a.hat=0 (rw, HAT on)" bash -c "test -f '$fu' && [ '$fo' = '$(strip "$mo" "$hat")' ] && ! grep -q 'cubie_a7a.hat' <<<'$fo' && ! grep -q 'systemd.volatile' <<<'$fo'"
+        check "$id: the three entries boot the same kernel and initramfs" bash -c "[ \"\$(grep -E '^(linux|initrd|version) ' '$e')\" = \"\$(grep -E '^(linux|initrd|version) ' '$mt')\" ] && [ \"\$(grep -E '^(linux|initrd|version) ' '$e')\" = \"\$(grep -E '^(linux|initrd|version) ' '$fu')\" ]"
+        check "$id: titles name the modes" bash -c "grep -q '^title .*(protective: ro overlay, hat=0)\$' '$e' && grep -q '^title .* maintenance (rw, hat=0)\$' '$mt' && grep -q '^title .* full (rw, HAT on)\$' '$fu'"
+    done
+    check "one default entry per kernel ($nmain), three entries each" bash -c "[ $nmain = \"\$(ls '$ROOT/usr/lib/modules' | wc -l)\" ] && [ \"\$(ls '$ROOT'/boot/loader/entries/*.conf | wc -l)\" = $((nmain * 3)) ]"
+    genv=$("$TOP/fedora/run-build-ns.sh" user cat "$ROOT/boot/grub2/grubenv")
+    saved=$(sed -n 's/^saved_entry=//p' <<<"$genv")
+    echo "  grubenv: $(grep -v '^#' <<<"$genv" | tr '\n' ' ')"
+    check "grubenv saved_entry is a default (protective) entry" bash -c "[ -n '$saved' ] && [ -f '$ROOT/boot/loader/entries/$saved.conf' ] && [[ '$saved' != *~* ]]"
+    check "grubenv has no next_entry (the first boot is the default entry)" bash -c "! grep -q '^next_entry=' <<<'$genv'"
+    check "grubenv is one 1024-byte block (cubie-a7a-bootmode rewrites it in place on the ro boot)" bash -c "[ \"\$(stat -c %s '$ROOT/boot/grub2/grubenv')\" = 1024 ] && debugfs -R 'blocks /boot/grub2/grubenv' '$W/root.img' 2>/dev/null | grep -qE '^[0-9]+ *\$'"
+    check "without saved_entry, the newest default entry still sorts first (rpm/sort -V order)" bash -c "ls '$ROOT/boot/loader/entries' | sed 's/\.conf\$//' | sort -rV | head -1 | grep -qv '~'"
+    check "grub.cfg: next_entry honoured, and its only save_env clears it (GRUB writes nothing on a default boot)" bash -c "c=\$('$TOP/fedora/run-build-ns.sh' user cat '$ROOT/boot/grub2/grub.cfg'); grep -q 'set default=\"\\\${next_entry}\"' <<<\"\$c\" && [ \"\$(grep -c save_env <<<\"\$c\")\" = 1 ] && grep -q '^ *save_env next_entry\$' <<<\"\$c\""
+    for e in "$ROOT"/boot/loader/entries/*.conf; do
+        case "$(basename "$e")" in *~*) continue ;; esac
+        rd=$ROOT$(awk '$1=="initrd"{print $2}' "$e")
+        check "$(basename "$e" .conf): initramfs has systemd-volatile-root and overlay.ko" bash -c "l=\$('$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null); grep -q 'systemd/systemd-volatile-root\$' <<<\"\$l\" && grep -q 'systemd-volatile-root.service\$' <<<\"\$l\" && grep -q '/overlay.ko' <<<\"\$l\""
+    done
+fi
 unsigned=$(grep -v -E '^gpg-pubkey' "$W/packages.txt" | grep '(none)' | cut -d' ' -f1 | tr '\n' ' ')
 echo "  info  unsigned packages: ${unsigned:-none}"
 check "unsigned packages limited to the cubie-a7a board packages" bash -c "! grep -v -E '^(gpg-pubkey|cubie-a7a-)' '$W/packages.txt' | grep -q '(none)'"
