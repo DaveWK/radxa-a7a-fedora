@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# kernel-install plugin (fedora/mkdevcard.sh BOOT_MODES=protective): after
+# 20-grub.install wrote a kernel's default entry from /etc/kernel/cmdline
+# (protective options included) and 95-set-boot-entry.install made it
+# saved_entry, write that kernel's "~maintenance" and "~full" entries
+# (cubie-a7a-bootmode sync, which also refreshes every other kernel's). On
+# remove, drop the removed kernel's two entries. Runs before the board
+# package's 99-zz-cubie-a7a.install guard. Never fails a kernel install.
+
+COMMAND=${1:-}
+KERNEL_VERSION=${2:-}
+[ -n "$KERNEL_VERSION" ] || exit 0
+case "$COMMAND" in
+add)
+    /usr/local/sbin/cubie-a7a-bootmode sync ||
+        echo "96-cubie-a7a-bootmodes: sync failed; run cubie-a7a-bootmode sync" >&2
+    ;;
+remove)
+    rm -f /boot/loader/entries/*-"$KERNEL_VERSION"~maintenance.conf \
+        /boot/loader/entries/*-"$KERNEL_VERSION"~full.conf
+    ;;
+esac
+exit 0

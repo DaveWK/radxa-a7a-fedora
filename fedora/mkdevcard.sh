@@ -24,6 +24,17 @@
 #
 # Usage: fedora/mkdevcard.sh FIRMWARE_BIN RPMS_DIR   (rpmbuild RPMS/: noarch/ and aarch64/)
 #
+# Optional (unset: the image as before):
+#   EXTRA_PACKAGES="a b"   more Fedora packages (e.g. perf memtester)
+#   BOOT_MODES=protective  three GRUB entries per kernel (fedora/bootmodes/):
+#     default: root read-only under a RAM overlay, HAT stack off, nothing
+#              on the card written (/etc/kernel/cmdline carries it, so
+#              kernel updates keep it); "~maintenance": rw, HAT off;
+#              "~full": rw, HAT on. Root growth (systemd-repart + growfs)
+#              is masked on the default entry and happens on the first
+#              maintenance boot. cubie-a7a-bootmode selects a one-shot entry
+#              from any of them.
+#
 # FIRMWARE_BIN "none" builds the Fedora image alone (make fedora-image): LBA
 # 256-32767 (128 KiB-16 MiB) stay zero for the boot firmware's
 # firmware.bin (radxa-a7a-workspace, make firmware), which is written at
@@ -125,6 +136,10 @@ done
 RADIO_PACKAGES=(NetworkManager-wifi wpa_supplicant iw bluez wireless-regdb)
 BOARD_UNITS+=(bluetooth.service)
 OVERLAY=${OVERLAY:-}
+EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
+read -ra EXTRA_PKGS <<<"$EXTRA_PACKAGES"
+BOOT_MODES=${BOOT_MODES:-}
+case "$BOOT_MODES" in '' | protective) ;; *) echo "invalid BOOT_MODES" >&2; exit 2 ;; esac
 [ -z "$OVERLAY" ] || [ -d "$OVERLAY" ] || { echo "OVERLAY $OVERLAY is not a directory" >&2; exit 2; }
 # XZ=no leaves the compression to the caller (the build guest).
 XZ=${XZ:-yes}
@@ -154,6 +169,7 @@ PACKAGES=(
     libglvnd-gles python3-absl-py python3-flatbuffers python3-certifi
     python3-matplotlib python3-sounddevice
     "${RADIO_PACKAGES[@]}"
+    "${EXTRA_PKGS[@]}"
     "${BOARD_RPMS[@]}"
 )
 EXCLUDES=(cockpit\* initial-setup\* cloud-init dracut-config-rescue)
@@ -175,7 +191,7 @@ echo "mkdevcard: root UUID $ROOT_UUID, ESP $ESP_UUID"
 # Fedora's own repository files: /usr/share/dnf5/repos.d on a Fedora 45 host,
 # /etc/yum.repos.d before that.
 REPOSDIR=${REPOSDIR:-$([ -f /usr/share/dnf5/repos.d/fedora.repo ] && echo /usr/share/dnf5/repos.d || echo /etc/yum.repos.d)}
-export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH RELEASEVER FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY
+export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH RELEASEVER FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES
 "$TOP/fedora/run-build-ns.sh" mount bash -s \
     "${PACKAGES[@]}" -- "${EXCLUDES[@]}" <<'STAGE1'
 set -euo pipefail
@@ -198,6 +214,17 @@ ln -sf /proc/self/fd "$ROOT/dev/fd"
 # /chosen/stdout-path (UART0), so the boot is visible before the A733 CCU
 # kmod lets 8250_dw bind ttyS0.
 echo "root=UUID=$ROOT_UUID ro rootwait earlycon console=tty0 console=ttyS0,115200" >"$ROOT/etc/kernel/cmdline"
+# BOOT_MODES=protective: the default entry's options (the kernel's own entry,
+# from /etc/kernel/cmdline) are the protective ones; the kernel-install
+# plugin derives the maintenance and full entries from it.
+if [ "$BOOT_MODES" = protective ]; then
+    install -Dm0755 "$TOP/fedora/bootmodes/cubie-a7a-bootmode" "$ROOT/usr/local/sbin/cubie-a7a-bootmode"
+    install -Dm0755 "$TOP/fedora/bootmodes/96-cubie-a7a-bootmodes.install" \
+        "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
+    install -Dm0644 "$TOP/fedora/bootmodes/cubie-a7a-bootmode-ro.service" \
+        "$ROOT/etc/systemd/system/cubie-a7a-bootmode-ro.service"
+    sed -i "s|\$| $("$TOP/fedora/bootmodes/cubie-a7a-bootmode" default-args)|" "$ROOT/etc/kernel/cmdline"
+fi
 # A machine id for kernel-install's entry names; emptied at the end so the
 # board makes its own on first boot.
 echo 0123456789abcdef0123456789abcdef >"$ROOT/etc/machine-id"
@@ -225,6 +252,13 @@ HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --force
     --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
     --setopt=keepcache=True --setopt=gpgcheck=True --setopt=localpkg_gpgcheck=False \
     --exclude="$exclude" --repo=fedora --repo=updates "${pkgs[@]}"
+
+# BOOT_MODES=protective: every kernel's maintenance and full entries, with
+# the arguments the board package added to all entries after the kernel's
+# own kernel-install run.
+if [ "$BOOT_MODES" = protective ]; then
+    chroot "$ROOT" /usr/local/sbin/cubie-a7a-bootmode sync
+fi
 
 # --- board modules, initramfs and BLS checks -----------------------------
 # Every kernel needs the A733 kmods (DKMS) in extra/ and the boot-critical
@@ -336,6 +370,16 @@ configfile \$prefix/grub.cfg
 EOF
 chroot "$ROOT" grub2-editenv /boot/grub2/grubenv create
 chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set boot_success=0
+if [ "$BOOT_MODES" = protective ]; then
+    # GRUB boots saved_entry: the newest kernel's protective entry.
+    def=$(cd "$ROOT/boot/loader/entries" && ls -- *.conf | grep -v '~' | sed 's/\.conf$//' | sort -V | tail -1)
+    chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "saved_entry=$def"
+    systemctl --root="$ROOT" enable cubie-a7a-bootmode-ro.service >/dev/null
+    # 20-grub.install runs grub2-mkconfig (replacing this grub.cfg and every
+    # entry's options with GRUB_CMDLINE_LINUX) when /etc/kernel/cmdline is
+    # older than /etc/default/grub.
+    touch -d "@$(($(stat -c %Y "$ROOT/etc/default/grub") + 1))" "$ROOT/etc/kernel/cmdline"
+fi
 
 # First boot: new machine id, fresh host keys (sshd-keygen), random seed.
 # SELinux labels are written into the ext4 image in stage 2, so no relabel
@@ -445,5 +489,7 @@ cubie-a7a    $(for r in "${BOARD_RPMS[@]}"; do basename "$r"; done | tr '\n' ' '
 packages     $W/packages.txt ($(wc -l <"$W/packages.txt") RPMs)
 kernel       $(grep -o '^kernel-core-[^ ]*' "$W/packages.txt" | tr '\n' ' ')
 firmware fs  $(grep '^image-firmware: ' "$W/firmware-audit.txt" | tail -1 | sed 's/^image-firmware: //') (audit, report only: $W/firmware-audit.txt)
+extra pkgs   ${EXTRA_PACKAGES:-none}
+boot modes   ${BOOT_MODES:-single entry per kernel}
 EOF
 cat "$OUT.sha256" "$W/manifest.txt"

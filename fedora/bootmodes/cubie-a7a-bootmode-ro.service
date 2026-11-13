@@ -1,0 +1,15 @@
+[Unit]
+Description=Cubie A7A: protective boot, keep grubenv read-only and say so at login
+Documentation=file:/usr/local/sbin/cubie-a7a-bootmode
+ConditionKernelCommandLine=systemd.volatile=overlay
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cubie-a7a-bootmode ro-setup
+
+[Install]
+WantedBy=sysinit.target

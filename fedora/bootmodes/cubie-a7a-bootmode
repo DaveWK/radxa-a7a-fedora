@@ -1,0 +1,298 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Cubie A7A boot modes (fedora/mkdevcard.sh BOOT_MODES=protective).
+#
+# Every kernel has three GRUB/BLS entries:
+#   <id>               default, protective: root read-only under a RAM
+#                      overlay (systemd.volatile=overlay), HAT/AIC stack off
+#                      (cubie_a7a.hat=0), nothing on the card is written
+#                      (ESP not mounted, no growfs/repart, no fsck, no
+#                      journal replay, volatile journal);
+#   <id>~maintenance   rw root, HAT stack off: package installs, root growth;
+#   <id>~full          rw root, HAT stack on: tests that need it.
+# The default entry gets its options from /etc/kernel/cmdline through
+# kernel-install (20-grub.install), so it keeps them across kernel updates;
+# the two others are derived from it here by removing PROTECT_ARGS (and, for
+# full, cubie_a7a.hat=0). The "~" sorts them after the default entry in GRUB
+# and grubby, as Fedora's own "~debug" entries.
+#
+# usage: cubie-a7a-bootmode status
+#        cubie-a7a-bootmode next maintenance|full|default
+#             one-shot entry for the next boot only (GRUB's next_entry). On
+#             a rw boot this is grub2-reboot. On the protective boot the
+#             lower root is mounted read-only and detached, so grub2-reboot
+#             cannot reach it (it fails there, see ro-setup); this rewrites
+#             the grubenv file's 1024-byte block in place on the device,
+#             which is what GRUB's own save_env does.
+#        cubie-a7a-bootmode sync
+#             (re)write the maintenance and full entries of every kernel,
+#             put PROTECT_ARGS back on any default entry that lost them,
+#             remove entries of removed kernels (kernel-install runs this)
+#        cubie-a7a-bootmode default-args
+#             print PROTECT_ARGS
+#        cubie-a7a-bootmode ro-setup
+#             (cubie-a7a-bootmode-ro.service, protective boot only) make
+#             /boot/grub2/grubenv read-only so that grub2-reboot and
+#             grub2-set-default fail loudly instead of writing the RAM
+#             overlay, and say so in the login message
+#
+# PROTECT_ARGS may be overridden in /etc/cubie-a7a/bootmodes.conf.
+set -euo pipefail
+
+ENTRIES=${CUBIE_A7A_BLS_DIR:-/boot/loader/entries}
+GRUBENV=${CUBIE_A7A_GRUBENV:-/boot/grub2/grubenv}
+# Test hooks: another command line file, another root device (may be a file).
+CMDLINE=${CUBIE_A7A_CMDLINE:-/proc/cmdline}
+RUNDIR=${CUBIE_A7A_RUNDIR:-/run}
+HAT_OFF=cubie_a7a.hat=0
+# The ro set the test board ran on first (set by hand then),
+# plus systemd-repart (the card's /etc/repart.d grows the root partition).
+PROTECT_ARGS="systemd.volatile=overlay fsck.mode=skip systemd.journald.storage=volatile rootflags=noload systemd.mask=boot-efi.mount systemd.mask=cubie-a7a-dtb.service systemd.mask=systemd-growfs-root.service systemd.mask=systemd-repart.service"
+# shellcheck disable=SC1091 # optional local override
+[ -f /etc/cubie-a7a/bootmodes.conf ] && . /etc/cubie-a7a/bootmodes.conf
+
+die() {
+    echo "cubie-a7a-bootmode: $*" >&2
+    exit 1
+}
+
+# Options of a BLS entry file.
+opts_of() { sed -n 's/^options[[:space:]]*//p' "$1"; }
+
+# $1 minus every word of $2 (whole words only).
+strip_words() {
+    local out="" w x keep
+    for w in $1; do
+        keep=1
+        for x in $2; do [ "$w" = "$x" ] && keep=0 && break; done
+        [ $keep = 1 ] && out="$out $w"
+    done
+    echo "${out# }"
+}
+
+# $1 plus every word of $2 it lacks.
+add_words() {
+    local out=$1 w
+    for w in $2; do
+        case " $out " in *" $w "*) ;; *) out="$out $w" ;; esac
+    done
+    echo "$out"
+}
+
+is_protective_boot() {
+    local c
+    c=" $(cat "$CMDLINE") "
+    case "$c" in *" systemd.volatile=overlay "*) return 0 ;; esac
+    return 1
+}
+
+# Default (protective) entries: no "~" in the id.
+main_entries() {
+    local e
+    for e in "$ENTRIES"/*.conf; do
+        [ -f "$e" ] || continue
+        case "$(basename "$e")" in *~*) continue ;; esac
+        echo "$e"
+    done
+}
+
+write_variant() { # main-file suffix title-suffix options
+    local src=$1 suffix=$2 tsuf=$3 opts=$4 dst tmp
+    dst="${src%.conf}~$suffix.conf"
+    tmp="$dst.tmp"
+    awk -v t="$tsuf" -v o="$opts" '
+        /^title[ \t]/ { sub(/[ \t]+\(protective: ro overlay, hat=0\)$/, ""); print $0 " " t; next }
+        /^options[ \t]/ { print "options " o; next }
+        { print }' "$src" >"$tmp"
+    if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
+        rm -f "$tmp"
+    else
+        mv -f "$tmp" "$dst"
+        command -v restorecon >/dev/null 2>&1 && restorecon -F "$dst" 2>/dev/null || :
+    fi
+}
+
+cmd_sync() {
+    local e o m f base
+    if is_protective_boot && [ -z "${CUBIE_A7A_BLS_DIR:-}" ]; then
+        die "this is the protective boot: changes would be lost (boot maintenance first)"
+    fi
+    for e in $(main_entries); do
+        o=$(opts_of "$e")
+        # The default entry stays protective.
+        m=$(add_words "$o" "$HAT_OFF $PROTECT_ARGS")
+        if [ "$m" != "$o" ]; then
+            sed -i "s|^options[[:space:]].*|options $m|" "$e"
+            o=$m
+        fi
+        grep -q '(protective: ro overlay, hat=0)$' "$e" ||
+            sed -i 's/^title[[:space:]].*/& (protective: ro overlay, hat=0)/' "$e"
+        m=$(strip_words "$o" "$PROTECT_ARGS")
+        write_variant "$e" maintenance "maintenance (rw, hat=0)" "$m"
+        f=$(strip_words "$m" "$HAT_OFF")
+        write_variant "$e" full "full (rw, HAT on)" "$f"
+    done
+    # Entries whose default entry is gone (kernel removed).
+    for f in "$ENTRIES"/*~maintenance.conf "$ENTRIES"/*~full.conf; do
+        [ -f "$f" ] || continue
+        base="${f%~*}.conf"
+        [ -f "$base" ] || rm -f "$f"
+    done
+}
+
+# The id GRUB boots by default: saved_entry, else the newest default entry.
+default_id() {
+    local s
+    s=$(grub2-editenv "$1" list 2>/dev/null | sed -n 's/^saved_entry=//p')
+    if [ -n "$s" ] && [ -f "$ENTRIES/$s.conf" ]; then
+        echo "${s%%~*}"
+        return
+    fi
+    main_entries | xargs -r -n1 basename | sed 's/\.conf$//' | sort -V | tail -1
+}
+
+# Root block device (root=UUID=... on the kernel command line).
+root_dev() {
+    local r
+    [ -z "${CUBIE_A7A_ROOT_DEV:-}" ] || { echo "$CUBIE_A7A_ROOT_DEV"; return; }
+    r=$(tr ' ' '\n' <"$CMDLINE" | sed -n 's/^root=//p' | tail -1)
+    case "$r" in
+    UUID=*) blkid -U "${r#UUID=}" ;;
+    PARTUUID=*) blkid -t "PARTUUID=${r#PARTUUID=}" -o device | head -1 ;;
+    /dev/*) echo "$r" ;;
+    *) return 1 ;;
+    esac
+}
+
+# Location of the grubenv block on the device: "<dev> <byte offset>".
+grubenv_block() {
+    local dev bs blk rel
+    dev=$(root_dev) || die "cannot find the root device"
+    [ -b "$dev" ] || [ -n "${CUBIE_A7A_ROOT_DEV:-}" ] || die "root device $dev is not a block device"
+    bs=$(dumpe2fs -h "$dev" 2>/dev/null | sed -n 's/^Block size:[[:space:]]*//p')
+    rel=${GRUBENV#/}
+    blk=$(debugfs -R "blocks /$rel" "$dev" 2>/dev/null | tr -d ' \n')
+    case "$bs" in '' | *[!0-9]*) die "no ext4 block size for $dev" ;; esac
+    case "$blk" in '' | *[!0-9]*) die "$GRUBENV is not one block on $dev: '$blk'" ;; esac
+    echo "$dev $((blk * bs))"
+}
+
+# Scratch directory under /run (tmpfs), removed on exit.
+D=
+scratch() {
+    [ -n "$D" ] || {
+        D=$(mktemp -d "$RUNDIR"/cubie-a7a-bootmode.XXXXXX)
+        trap 'rm -rf "$D"' EXIT
+    }
+}
+
+# The grubenv block as it is on the device (protective boot) -> $D/cur.
+read_env_block() {
+    scratch
+    read -r DEV OFF <<<"$(grubenv_block)"
+    dd if="$DEV" of="$D/cur" bs=1024 skip=$((OFF / 1024)) count=1 iflag=direct status=none
+    head -1 "$D/cur" | grep -qx '# GRUB Environment Block' ||
+        die "no GRUB environment block at $DEV byte $OFF"
+}
+
+# next_entry on the protective boot: rewrite the 1024-byte block in place.
+ro_set_next() { # id-or-empty
+    local id=$1 d dev off
+    read_env_block
+    d=$D dev=$DEV off=$OFF
+    cp "$d/cur" "$d/new"
+    if [ -n "$id" ]; then
+        grub2-editenv "$d/new" set "next_entry=$id"
+    else
+        grub2-editenv "$d/new" unset next_entry
+    fi
+    [ "$(stat -c %s "$d/new")" = 1024 ] || die "new environment block is not 1024 bytes"
+    if cmp -s "$d/cur" "$d/new"; then
+        echo "grubenv on $dev already says so; nothing written"
+        return 0
+    fi
+    dd if="$d/new" of="$dev" bs=1024 seek=$((off / 1024)) count=1 conv=notrunc,fsync status=none
+    sync
+    dd if="$dev" bs=1024 skip=$((off / 1024)) count=1 iflag=direct status=none | cmp -s - "$d/new" ||
+        die "read-back of the grubenv block on $dev differs"
+    echo "grubenv block on $dev (byte $off) rewritten and read back"
+}
+
+cmd_next() {
+    local mode=${1:-} env id
+    case "$mode" in maintenance | full | default) ;; *) die "usage: next maintenance|full|default" ;; esac
+    if is_protective_boot; then
+        read_env_block
+        env=$D/cur
+    else
+        env=$GRUBENV
+    fi
+    id=$(default_id "$env")
+    [ -n "$id" ] || die "no default entry"
+    case "$mode" in
+    default) id= ;;
+    *)
+        id="$id~$mode"
+        [ -f "$ENTRIES/$id.conf" ] || die "no entry $id (cubie-a7a-bootmode sync on a rw boot)"
+        ;;
+    esac
+    if is_protective_boot; then
+        ro_set_next "$id"
+    elif [ -n "$id" ]; then
+        grub2-reboot "$id"
+    else
+        grub2-editenv "$GRUBENV" unset next_entry
+    fi
+    echo "next boot: ${id:-the default entry}"
+}
+
+cmd_status() {
+    local env e
+    if is_protective_boot; then
+        echo "this boot: protective (root read-only under a RAM overlay; changes are lost at reboot)"
+        read_env_block
+        env=$D/cur
+        echo "grubenv (read from $DEV):"
+    else
+        case " $(cat "$CMDLINE") " in
+        *" $HAT_OFF "*) echo "this boot: maintenance (rw, hat=0)" ;;
+        *) echo "this boot: full (rw, HAT on)" ;;
+        esac
+        env=$GRUBENV
+        echo "grubenv:"
+    fi
+    grub2-editenv "$env" list | sed 's/^/  /'
+    echo "entries:"
+    for e in "$ENTRIES"/*.conf; do
+        [ -f "$e" ] && echo "  $(basename "$e" .conf)"
+    done
+}
+
+cmd_ro_setup() {
+    is_protective_boot || exit 0
+    if [ -f "$GRUBENV" ] && ! findmnt -rn "$GRUBENV" >/dev/null; then
+        mount --bind "$GRUBENV" "$GRUBENV"
+        mount -o remount,bind,ro "$GRUBENV"
+    fi
+    mkdir -p /run/motd.d
+    cat >/run/motd.d/50-cubie-a7a-bootmode <<'EOF'
+Protective boot: root is read-only under a RAM overlay, the HAT stack is off,
+and every change (dnf, /etc, logs) is lost at reboot. For package installs:
+    cubie-a7a-bootmode next maintenance && reboot    (rw, HAT off)
+    cubie-a7a-bootmode next full && reboot           (rw, HAT on)
+grub2-reboot cannot write from here; cubie-a7a-bootmode does (status: cubie-a7a-bootmode status).
+EOF
+}
+
+case "${1:-}" in
+status) cmd_status ;;
+next) cmd_next "${2:-}" ;;
+sync) cmd_sync ;;
+default-args) echo "$HAT_OFF $PROTECT_ARGS" ;;
+ro-setup) cmd_ro_setup ;;
+*)
+    sed -n '/^# usage:/,/^# PROTECT_ARGS/p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+    ;;
+esac
