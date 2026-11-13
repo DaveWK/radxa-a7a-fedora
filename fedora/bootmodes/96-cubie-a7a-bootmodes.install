@@ -14,7 +14,7 @@ KERNEL_VERSION=${2:-}
 [ -n "$KERNEL_VERSION" ] || exit 0
 case "$COMMAND" in
 add)
-    /usr/local/sbin/cubie-a7a-bootmode sync ||
+    /usr/local/bin/cubie-a7a-bootmode sync ||
         echo "96-cubie-a7a-bootmodes: sync failed; run cubie-a7a-bootmode sync" >&2
     ;;
 remove)

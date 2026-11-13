@@ -238,7 +238,10 @@ echo "root=UUID=$ROOT_UUID ro rootwait earlycon console=tty0 console=ttyS0,11520
 # from /etc/kernel/cmdline) are the protective ones; the kernel-install
 # plugin derives the maintenance and full entries from it.
 if [ "$BOOT_MODES" = protective ]; then
-    install -Dm0755 "$TOP/fedora/bootmodes/cubie-a7a-bootmode" "$ROOT/usr/local/sbin/cubie-a7a-bootmode"
+    # /usr/local/bin, not sbin: sshd's PATH for a command over ssh is
+    # /usr/local/bin:/usr/bin (Fedora's merged sbin); only login shells add
+    # /usr/local/sbin (/etc/profile).
+    install -Dm0755 "$TOP/fedora/bootmodes/cubie-a7a-bootmode" "$ROOT/usr/local/bin/cubie-a7a-bootmode"
     install -Dm0755 "$TOP/fedora/bootmodes/96-cubie-a7a-bootmodes.install" \
         "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
     install -Dm0644 "$TOP/fedora/bootmodes/cubie-a7a-bootmode-ro.service" \
@@ -279,7 +282,7 @@ HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --force
 # the arguments the board package added to all entries after the kernel's
 # own kernel-install run.
 if [ "$BOOT_MODES" = protective ]; then
-    chroot "$ROOT" /usr/local/sbin/cubie-a7a-bootmode sync
+    chroot "$ROOT" /usr/local/bin/cubie-a7a-bootmode sync
 fi
 
 # --- board modules, initramfs and BLS checks -----------------------------

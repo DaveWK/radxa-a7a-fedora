@@ -237,9 +237,16 @@ echo "  info  root filesystem: $(dumpe2fs -h "$W/root.img" 2>/dev/null | awk -F:
 
 if [ "$BOOT_MODES" = protective ]; then
     echo "== boot modes (protective default, maintenance, full)"
-    bm=$ROOT/usr/local/sbin/cubie-a7a-bootmode
+    bm=$ROOT/usr/local/bin/cubie-a7a-bootmode
     check "cubie-a7a-bootmode installed" test -x "$bm"
+    # Found by name where it is used: a command over ssh gets sshd's compiled
+    # PATH (no sbin directories on Fedora 42+), not a login shell's.
+    sshpath=$(strings "$ROOT/usr/libexec/openssh/sshd-session" "$ROOT/usr/bin/sshd" 2>/dev/null | grep -m1 -E '^/usr/local/bin:/' || :)
+    echo "  info  sshd PATH for commands: ${sshpath:-not found}"
+    check "cubie-a7a-bootmode found by name on that PATH (ssh root@board cubie-a7a-bootmode ...)" bash -c "[ -n '$sshpath' ] && IFS=: && for d in \$(echo '$sshpath'); do [ -x '$ROOT'\$d/cubie-a7a-bootmode ] && exit 0; done; exit 1"
+    check "cubie-a7a-bootmode labelled bin_t in the image" bash -c "debugfs -R 'ea_get usr/local/bin/cubie-a7a-bootmode security.selinux' '$W/root.img' 2>/dev/null | grep -q ':object_r:bin_t:s0'"
     check "kernel-install plugin 96-cubie-a7a-bootmodes installed" test -x "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
+    check "the plugin and cubie-a7a-bootmode-ro.service call the installed helper" bash -c "for f in '$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install' '$ROOT/etc/systemd/system/cubie-a7a-bootmode-ro.service'; do for h in \$(grep -o '/usr/[a-z/]*/cubie-a7a-bootmode\\b' \"\$f\" | sort -u); do [ -x '$ROOT'\$h ] || exit 1; done; grep -q '/usr/local/bin/cubie-a7a-bootmode' \"\$f\" || exit 1; done"
     check "cubie-a7a-bootmode-ro.service enabled" bash -c "ls '$ROOT'/etc/systemd/system/sysinit.target.wants/cubie-a7a-bootmode-ro.service >/dev/null 2>&1"
     dargs=$(bash "$bm" default-args 2>/dev/null)
     hat=cubie_a7a.hat=0
