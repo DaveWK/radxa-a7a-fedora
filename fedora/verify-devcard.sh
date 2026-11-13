@@ -10,6 +10,9 @@
 # Set as for the build (mkdevcard.sh), to check what it added:
 #   BOOT_MODES=protective   the three entries per kernel (fedora/bootmodes/)
 #   EXTRA_PACKAGES="a b"    the extra packages are installed
+#   FIRST_BOOT=maintenance  grubenv next_entry is the default's ~maintenance
+#   GROW_ROOT=no            nothing grows the root: no repart config, no
+#                           x-systemd.growfs, repart/growfs masked and labelled
 #   AIC_OVERRIDE=yes        the card carries the user-override AIC8800 USB
 #                           firmware (via OVERLAY), every file matching the
 #                           driver package's manifest; default: none allowed
@@ -30,6 +33,8 @@ ESP=$W/esp.img
 BOOT_MODES=${BOOT_MODES:-}
 EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
 AIC_OVERRIDE=${AIC_OVERRIDE:-no}
+FIRST_BOOT=${FIRST_BOOT:-}
+GROW_ROOT=${GROW_ROOT:-yes}
 fail=0
 ok() { printf '  ok    %s\n' "$*"; }
 bad() {
@@ -215,7 +220,20 @@ check "file capabilities in ext4 are version 2 (no namespace rootid)" bash -c "d
 check "SELinux labels in ext4 match target policy" "$TOP/fedora/run-build-ns.sh" user python3 -I "$TOP/fedora/selinux-label.py" --verify "$ROOT" "$W/root.img" "$W/selinux-verify"
 check "no first-boot relabel required (all image labels verified)" test ! -e "$ROOT/.autorelabel"
 check "machine-id empty (first boot)" test ! -s "$ROOT/etc/machine-id"
-check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
+if [ "$GROW_ROOT" = yes ]; then
+    check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
+else
+    echo "== root growth: never (GROW_ROOT=no)"
+    check "no repart.d config (etc, usr/lib, usr/local/lib)" bash -c "! find '$ROOT/etc/repart.d' '$ROOT/usr/lib/repart.d' '$ROOT/usr/local/lib/repart.d' -name '*.conf' 2>/dev/null | grep -q ."
+    check "fstab: no x-systemd.growfs (and no x-systemd.makefs)" bash -c "! grep -qE 'x-systemd\.(growfs|makefs)' '$ROOT/etc/fstab'"
+    check "initramfs does not run systemd-repart" bash -c "! grep -q 'systemd-repart' '$W'/initramfs-*.txt"
+    for u in systemd-repart.service systemd-growfs-root.service; do
+        lbl=$(debugfs -R "ea_get -V etc/systemd/system/$u security.selinux" "$W/root.img" 2>/dev/null | tr -d '\0\n')
+        check "$u masked in /etc/systemd/system (-> /dev/null)" bash -c "[ \"\$(readlink '$ROOT/etc/systemd/system/$u')\" = /dev/null ]"
+        check "$u mask labelled in the image ($lbl)" bash -c "[[ '$lbl' == system_u:object_r:*_t:s0 ]]"
+    done
+fi
+echo "  info  root filesystem: $(dumpe2fs -h "$W/root.img" 2>/dev/null | awk -F: '/^Block count/{c=$2}/^Free blocks/{f=$2}/^Block size/{b=$2}END{printf "%.2f GiB, %.2f GiB free", c*b/2^30, f*b/2^30}'); image $(stat -c %s "$IMG") bytes"
 
 if [ "$BOOT_MODES" = protective ]; then
     echo "== boot modes (protective default, maintenance, full)"
@@ -240,7 +258,7 @@ if [ "$BOOT_MODES" = protective ]; then
     check "/etc/default/grub GRUB_CMDLINE_LINUX carries them (grub2-mkconfig fallback stays protective)" has_all "$dargs" "$(sed -n 's/^GRUB_CMDLINE_LINUX=\"\(.*\)\"$/\1/p' "$ROOT/etc/default/grub")"
     check "/etc/kernel/cmdline newer than /etc/default/grub (no grub2-mkconfig from 20-grub.install)" test "$ROOT/etc/kernel/cmdline" -nt "$ROOT/etc/default/grub"
     check "masked units exist as named (cubie-a7a-dtb, systemd-repart, systemd-growfs@)" bash -c "test -f '$ROOT/usr/lib/systemd/system/cubie-a7a-dtb.service' && test -f '$ROOT/usr/lib/systemd/system/systemd-repart.service' && test -f '$ROOT/usr/lib/systemd/system/systemd-growfs-root.service'"
-    check "fstab: /boot/efi (boot-efi.mount) and growfs on /" bash -c "grep -q ' /boot/efi ' '$ROOT/etc/fstab' && grep -q 'x-systemd.growfs' '$ROOT/etc/fstab'"
+    check "fstab: /boot/efi (boot-efi.mount)" grep -q ' /boot/efi ' "$ROOT/etc/fstab"
     nmain=0
     for e in "$ROOT"/boot/loader/entries/*.conf; do
         case "$(basename "$e")" in *~*) continue ;; esac
@@ -266,7 +284,12 @@ if [ "$BOOT_MODES" = protective ]; then
     saved=$(sed -n 's/^saved_entry=//p' <<<"$genv")
     echo "  grubenv: $(grep -v '^#' <<<"$genv" | tr '\n' ' ')"
     check "grubenv saved_entry is a default (protective) entry" bash -c "[ -n '$saved' ] && [ -f '$ROOT/boot/loader/entries/$saved.conf' ] && [[ '$saved' != *~* ]]"
-    check "grubenv has no next_entry (the first boot is the default entry)" bash -c "! grep -q '^next_entry=' <<<'$genv'"
+    if [ "$FIRST_BOOT" = maintenance ]; then
+        nxt=$(sed -n 's/^next_entry=//p' <<<"$genv")
+        check "grubenv next_entry is the default's ~maintenance entry, once (first boot rw, hat=0)" bash -c "[ '$nxt' = '$saved~maintenance' ] && [ -f '$ROOT/boot/loader/entries/$nxt.conf' ] && [ \"\$(grep -c '^next_entry=' <<<'$genv')\" = 1 ]"
+    else
+        check "grubenv has no next_entry (the first boot is the default entry)" bash -c "! grep -q '^next_entry=' <<<'$genv'"
+    fi
     check "grubenv is one 1024-byte block (cubie-a7a-bootmode rewrites it in place on the ro boot)" bash -c "[ \"\$(stat -c %s '$ROOT/boot/grub2/grubenv')\" = 1024 ] && debugfs -R 'blocks /boot/grub2/grubenv' '$W/root.img' 2>/dev/null | grep -qE '^[0-9]+ *\$'"
     check "without saved_entry, the newest default entry still sorts first (rpm/sort -V order)" bash -c "ls '$ROOT/boot/loader/entries' | sed 's/\.conf\$//' | sort -rV | head -1 | grep -qv '~'"
     check "grub.cfg: next_entry honoured, and its only save_env clears it (GRUB writes nothing on a default boot)" bash -c "c=\$('$TOP/fedora/run-build-ns.sh' user cat '$ROOT/boot/grub2/grub.cfg'); grep -q 'set default=\"\\\${next_entry}\"' <<<\"\$c\" && [ \"\$(grep -c save_env <<<\"\$c\")\" = 1 ] && grep -q '^ *save_env next_entry\$' <<<\"\$c\""

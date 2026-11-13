@@ -9,6 +9,7 @@
 #   16 MiB      GPT 1 "EFI"  FAT32 ESP, 512 MiB (shim + grub, Fedora layout)
 #   528 MiB     GPT 2 "root" ext4 "Fedora<release>-root" (type root-arm64), grown to
 #                       the card on first boot by systemd-repart + growfs
+#                       (GROW_ROOT=no: never grown)
 #
 # Root filesystem: stock Fedora packages (signature-checked by dnf) plus
 # cubie-a7a-dtb and cubie-a7a-board-support, installed with dnf5 into an
@@ -34,6 +35,16 @@
 #              is masked on the default entry and happens on the first
 #              maintenance boot. cubie-a7a-bootmode selects a one-shot entry
 #              from any of them.
+#   FIRST_BOOT=maintenance (with BOOT_MODES=protective) the first boot is a
+#              one-shot maintenance boot (grubenv next_entry), so the
+#              machine-id and SSH host keys are written once to the card;
+#              every later boot is the protective default.
+#   GROW_ROOT=no  the root is never grown, on any entry: no
+#              /etc/repart.d config, no x-systemd.growfs, systemd-repart and
+#              systemd-growfs-root masked in /etc/systemd/system (for cards
+#              that must not be written beyond the image).
+#   ROOT_MIN_MIB=N  root filesystem at least N MiB (default: content + 30 %
+#              + 512 MiB), e.g. room for package installs when GROW_ROOT=no.
 #
 # FIRMWARE_BIN "none" builds the Fedora image alone (make fedora-image): LBA
 # 256-32767 (128 KiB-16 MiB) stay zero for the boot firmware's
@@ -140,6 +151,15 @@ EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
 read -ra EXTRA_PKGS <<<"$EXTRA_PACKAGES"
 BOOT_MODES=${BOOT_MODES:-}
 case "$BOOT_MODES" in '' | protective) ;; *) echo "invalid BOOT_MODES" >&2; exit 2 ;; esac
+FIRST_BOOT=${FIRST_BOOT:-}
+case "$FIRST_BOOT" in '') ;; maintenance) [ "$BOOT_MODES" = protective ] || {
+    echo "FIRST_BOOT=maintenance needs BOOT_MODES=protective" >&2
+    exit 2
+} ;; *) echo "invalid FIRST_BOOT" >&2; exit 2 ;; esac
+GROW_ROOT=${GROW_ROOT:-yes}
+case "$GROW_ROOT" in yes | no) ;; *) echo "invalid GROW_ROOT" >&2; exit 2 ;; esac
+ROOT_MIN_MIB=${ROOT_MIN_MIB:-0}
+[[ $ROOT_MIN_MIB =~ ^[0-9]+$ ]] || { echo "invalid ROOT_MIN_MIB" >&2; exit 2; }
 [ -z "$OVERLAY" ] || [ -d "$OVERLAY" ] || { echo "OVERLAY $OVERLAY is not a directory" >&2; exit 2; }
 # XZ=no leaves the compression to the caller (the build guest).
 XZ=${XZ:-yes}
@@ -191,7 +211,7 @@ echo "mkdevcard: root UUID $ROOT_UUID, ESP $ESP_UUID"
 # Fedora's own repository files: /usr/share/dnf5/repos.d on a Fedora 45 host,
 # /etc/yum.repos.d before that.
 REPOSDIR=${REPOSDIR:-$([ -f /usr/share/dnf5/repos.d/fedora.repo ] && echo /usr/share/dnf5/repos.d || echo /etc/yum.repos.d)}
-export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH RELEASEVER FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES
+export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH RELEASEVER FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT
 "$TOP/fedora/run-build-ns.sh" mount bash -s \
     "${PACKAGES[@]}" -- "${EXCLUDES[@]}" <<'STAGE1'
 set -euo pipefail
@@ -231,8 +251,10 @@ echo 0123456789abcdef0123456789abcdef >"$ROOT/etc/machine-id"
 # What the card's firmware embeds (FIRMWARE_DTB_VERSION): cubie-a7a-dtb puts
 # its DTB on the ESP while its stamp is newer.
 echo "$FIRMWARE_DTB_VERSION" >"$ROOT/var/lib/cubie-a7a/firmware-dtb-version"
+growfs=,x-systemd.growfs
+[ "$GROW_ROOT" = yes ] || growfs=
 cat >"$ROOT/etc/fstab" <<EOF
-UUID=$ROOT_UUID  /          ext4  defaults,x-systemd.growfs  1 1
+UUID=$ROOT_UUID  /          ext4  defaults$growfs  1 1
 UUID=$ESP_UUID   /boot/efi  vfat  umask=0077,shortname=winnt  0 2
 EOF
 
@@ -309,12 +331,18 @@ systemctl --root="$ROOT" enable sshd.service NetworkManager.service firewalld.se
     chronyd.service "${BOARD_UNITS[@]}" >/dev/null
 
 # Grow the root partition to the card on first boot (systemd-repart), then
-# the filesystem (x-systemd.growfs in fstab).
-mkdir -p "$ROOT/etc/repart.d"
-cat >"$ROOT/etc/repart.d/50-root.conf" <<'EOF'
+# the filesystem (x-systemd.growfs in fstab). GROW_ROOT=no: never, on any
+# entry (the masks are files in /etc, independent of the kernel command
+# line and of kernel updates).
+if [ "$GROW_ROOT" = yes ]; then
+    mkdir -p "$ROOT/etc/repart.d"
+    cat >"$ROOT/etc/repart.d/50-root.conf" <<'EOF'
 [Partition]
 Type=root
 EOF
+else
+    systemctl --root="$ROOT" mask systemd-repart.service systemd-growfs-root.service >/dev/null
+fi
 
 # GRUB: BLS entries from kernel-install; grub.cfg as Fedora writes it, minus
 # what grub2-mkconfig would probe on the build host.
@@ -374,6 +402,11 @@ if [ "$BOOT_MODES" = protective ]; then
     # GRUB boots saved_entry: the newest kernel's protective entry.
     def=$(cd "$ROOT/boot/loader/entries" && ls -- *.conf | grep -v '~' | sed 's/\.conf$//' | sort -V | tail -1)
     chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "saved_entry=$def"
+    # FIRST_BOOT=maintenance: GRUB boots this once and clears it (grub.cfg).
+    if [ "$FIRST_BOOT" = maintenance ]; then
+        [ -f "$ROOT/boot/loader/entries/$def~maintenance.conf" ]
+        chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "next_entry=$def~maintenance"
+    fi
     systemctl --root="$ROOT" enable cubie-a7a-bootmode-ro.service >/dev/null
     # 20-grub.install runs grub2-mkconfig (replacing this grub.cfg and every
     # entry's options with GRUB_CMDLINE_LINUX) when /etc/kernel/cmdline is
@@ -426,6 +459,7 @@ STAGE1
 # --- stage 2: filesystem images (same user namespace mapping) ----------------
 ROOT_KIB=$(du -sk --apparent-size "$ROOT" | cut -f1)
 ROOT_MIB=$(((ROOT_KIB * 13 / 10) / 1024 + 512))
+((ROOT_MIB >= ROOT_MIN_MIB)) || ROOT_MIB=$ROOT_MIN_MIB
 export ROOT_MIB ESP_MIB ESP_ID TOP
 "$TOP/fedora/run-build-ns.sh" user bash -s <<'STAGE2'
 set -euo pipefail
@@ -490,6 +524,7 @@ packages     $W/packages.txt ($(wc -l <"$W/packages.txt") RPMs)
 kernel       $(grep -o '^kernel-core-[^ ]*' "$W/packages.txt" | tr '\n' ' ')
 firmware fs  $(grep '^image-firmware: ' "$W/firmware-audit.txt" | tail -1 | sed 's/^image-firmware: //') (audit, report only: $W/firmware-audit.txt)
 extra pkgs   ${EXTRA_PACKAGES:-none}
-boot modes   ${BOOT_MODES:-single entry per kernel}
+boot modes   ${BOOT_MODES:-single entry per kernel}${FIRST_BOOT:+; first boot: $FIRST_BOOT (one-shot)}
+root growth  $([ "$GROW_ROOT" = yes ] && echo "on first boot (repart + growfs)" || echo "never (repart and growfs masked)"); root $ROOT_MIB MiB
 EOF
 cat "$OUT.sha256" "$W/manifest.txt"
