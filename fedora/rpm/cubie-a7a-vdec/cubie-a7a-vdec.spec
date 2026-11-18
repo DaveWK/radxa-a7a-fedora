@@ -1,6 +1,6 @@
 Name:           cubie-a7a-vdec
 Version:        0.1
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Allwinner A733 video decoder (a733-cedrus) for the stock Fedora kernel
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -84,6 +84,13 @@ install -Dpm0755 %{SOURCE2} %{buildroot}%{_bindir}/cubie-a7a-vdec-selftest
 %{_bindir}/cubie-a7a-vdec-selftest
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.1-3
+- a733-cedrus is built for Linux 7.4 kernels too (was 7.3 only): the stock
+  cedrus of 7.4-rc3 uses the same V4L2 stateless interfaces as 7.3.3's (it
+  differs by an allocation helper and one compatible), and the sources
+  build unchanged against 7.4.0-0.rc3.26.fc46. Not yet run on a board
+  with that kernel
+
 * Wed Nov 11 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.1-2
 - DKMS version is the package's version-release (was the version alone), so
   an update builds and installs the new sources instead of keeping the old

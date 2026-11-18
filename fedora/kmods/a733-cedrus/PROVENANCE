@@ -117,3 +117,13 @@ Sources read for the A733 values include:
     https://github.com/jonas5/Allwinner-A733-kernel,
     patch/0003-allwinner-a733-cedrus-vpu-support.patch (a hint; that patch
     carries no SRAM, clock or reset handling)
+
+Linux 7.4 (2026-11-18): built for 7.4 kernels as well (dkms.conf
+BUILD_EXCLUSIVE_KERNEL). The stock drivers/staging/media/sunxi/cedrus of
+linux-7.4-rc3 (kernel-7.4.0-0.rc3.26.fc46.src.rpm, SRPM SHA256
+0673fad773faa1f3d621fffafb4af826a1915d12c87a34c37dd06259569828c3) differs
+from 7.3.3's only in cedrus.c: devm_kzalloc_obj() in probe and a new
+allwinner,sun50i-h616-video-engine compatible. No V4L2 stateless, media
+request or vb2 interface the driver uses changed, and these sources build
+unchanged against kernel-devel 7.4.0-0.rc3.26.fc46.aarch64. Not run on a
+board with that kernel.
