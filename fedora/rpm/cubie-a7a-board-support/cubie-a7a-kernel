@@ -3,8 +3,10 @@
 #
 # Keep every Fedora kernel on the Cubie A7A bootable with the A733 kmods.
 #
-# The A733 clock, pin, PMIC, DMA and Ethernet drivers are DKMS modules
-# (cubie-a7a-kmods). A Fedora kernel update must not leave the board on a
+# The A733 clock, PMIC and Ethernet drivers are DKMS modules
+# (cubie-a7a-kmods), and before Linux 7.4 the pin controller and the DMA
+# controller as well (7.4 has both: the pin controller built in, sun6i-dma
+# as its stock module). A Fedora kernel update must not leave the board on a
 # kernel whose initramfs lacks them (no SD root, no console, no Ethernet).
 #
 #   ensure KVER   build the kmods for KVER with DKMS when they are missing
@@ -39,15 +41,41 @@ log() {
 	return 0
 }
 
-# Boot kmods for a kernel. The sun6i-dma and dwmac-sun55i overrides carry
-# kernel-internal headers per kernel major.minor (dkms.conf); a kernel series
-# without them gets no override and therefore fails the check.
+# The kmod set of a kernel (the same table as cubie-a7a-kmods' dkms.conf):
+# 7.2 and 7.3 kernels need the A733 pinctrl module and the sun6i-dma
+# override; from 7.4 on the kernel has both itself.
+old_series() {
+	case $1 in
+	7.2.* | 7.3.*) return 0 ;;
+	esac
+	return 1
+}
+# Boot kmods for a kernel: they must come from extra/. The dwmac-sun55i
+# override carries kernel-internal headers per kernel series (dkms.conf); a
+# series without a header set gets no override and therefore fails the check.
 boot_modules() {
-	echo "sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma dwmac-sun55i"
+	if old_series "$1"; then
+		echo "sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma dwmac-sun55i"
+	else
+		echo "sun60i-a733-ccu axp318w axp318-regulator dwmac-sun55i"
+	fi
 }
 # Of those, the ones the initramfs must carry (dracut-cubie-a7a.conf).
 initramfs_modules() {
-	echo "sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma"
+	if old_series "$1"; then
+		echo "sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma"
+	else
+		echo "sun60i-a733-ccu axp318w axp318-regulator"
+	fi
+}
+# Stock modules of the same boot path that the initramfs must carry too.
+stock_initramfs_modules() {
+	old_series "$1" || echo "sun6i-dma"
+}
+# From 7.4 on the pin controllers must be in the kernel itself.
+pinctrl_builtin() {
+	old_series "$1" && return 0
+	grep -qx 'CONFIG_PINCTRL_SUN60I_A733=y' "$MODULES_DIR/$1/config" 2>/dev/null
 }
 
 module_path() {
@@ -58,19 +86,26 @@ module_path() {
 check() (
 	k=$1
 	missing=
-	for m in $(boot_modules); do
+	for m in $(boot_modules "$k"); do
 		p=$(module_path "$k" "$m")
 		case $p in
 		*/extra/*) ;;
 		*) missing="$missing $m" ;;
 		esac
 	done
+	pinctrl_builtin "$k" || missing="$missing pinctrl-sun60i-a733(neither-built-in-nor-module)"
 	img=/boot/initramfs-$k.img
 	if [ -f "$img" ]; then
 		list=$(lsinitrd "$img" 2>/dev/null)
-		for m in $(initramfs_modules); do
+		for m in $(initramfs_modules "$k"); do
 			case $list in
 			*"/extra/$m.ko"*) ;;
+			*) missing="$missing initramfs:$m" ;;
+			esac
+		done
+		for m in $(stock_initramfs_modules "$k"); do
+			case $list in
+			*"/$m.ko"*) ;;
 			*) missing="$missing initramfs:$m" ;;
 			esac
 		done
@@ -89,7 +124,7 @@ check() (
 initramfs_stale() (
 	img=/boot/initramfs-$1.img
 	[ -f "$img" ] || return 0
-	for m in $(initramfs_modules); do
+	for m in $(initramfs_modules "$1"); do
 		p=$(module_path "$1" "$m")
 		case $p in
 		*/extra/*) [ "$p" -nt "$img" ] && return 0 ;;
@@ -101,7 +136,7 @@ initramfs_stale() (
 ensure() {
 	k=$1
 	need_build=no
-	for m in $(boot_modules); do
+	for m in $(boot_modules "$k"); do
 		case $(module_path "$k" "$m") in
 		*/extra/*) ;;
 		*) need_build=yes ;;

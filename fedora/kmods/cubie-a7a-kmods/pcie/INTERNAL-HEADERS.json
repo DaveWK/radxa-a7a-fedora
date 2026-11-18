@@ -5,16 +5,36 @@
     {
       "origin": "drivers/pci/controller/dwc/pcie-designware.h",
       "sha256": "9c58efbbcbb1e71d64a595738053e6f81f275e95dcb4beb95c52c9772d50ee12",
-      "native": "pcie-designware.h",
+      "native": "k7.3/pcie-designware.h",
       "native_sha256": "b3f6da67e0cff0a42d12e48394d5561842f6b90cb725b65732995e75cd481035",
       "adjustment": "one relative include relocation only"
     },
     {
       "origin": "drivers/pci/pci.h",
       "sha256": "5a333fd6ffb0a961a901ead4c3bf0da18e4349993e7c3e007c662d4c7348d7fe",
-      "native": "pci-internal.h",
+      "native": "k7.3/pci-internal.h",
       "native_sha256": "5a333fd6ffb0a961a901ead4c3bf0da18e4349993e7c3e007c662d4c7348d7fe",
       "adjustment": "byte-identical"
     }
-  ]
+  ],
+  "layout": "one header pair per kernel series, pcie/k<series>/ (Makefile CUBIE_SERIES); k7.3 is used for 7.2 and 7.3 kernels",
+  "k7.4": {
+    "kernel": "signed Fedora 7.4.0-0.rc3.26.fc46 exact SRPM patched source (linux-7.4-rc3 + patch-7.4-redhat.patch)",
+    "srpm_sha256": "0673fad773faa1f3d621fffafb4af826a1915d12c87a34c37dd06259569828c3",
+    "headers": [
+      {
+        "origin": "drivers/pci/controller/dwc/pcie-designware.h",
+        "sha256": "64ca24764a4fa61a1ec2091c34e7014b608ca39e098efeb4eab71589d1a09cee",
+        "native": "k7.4/pcie-designware.h",
+        "adjustment": "one relative include relocation only (fedora/kmods/import-headers.py)"
+      },
+      {
+        "origin": "drivers/pci/pci.h",
+        "sha256": "94e054663c765844b4f124b16b5f1bbe093977f17bdd649b33576a325763ea83",
+        "native": "k7.4/pci-internal.h",
+        "adjustment": "byte-identical"
+      }
+    ],
+    "status": "pcie-sun60i-a733.c builds unchanged against this pair (kernel-devel 7.4.0-0.rc3.26.fc46.aarch64, W=1 clean); not run on hardware"
+  }
 }

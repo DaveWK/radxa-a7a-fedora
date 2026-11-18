@@ -1,0 +1,27 @@
+# dest  origin path  sha256-of-origin-file
+pcie/k7.4/pci-internal.h  drivers/pci/pci.h  94e054663c765844b4f124b16b5f1bbe093977f17bdd649b33576a325763ea83
+pcie/k7.4/pcie-designware.h  drivers/pci/controller/dwc/pcie-designware.h  64ca24764a4fa61a1ec2091c34e7014b608ca39e098efeb4eab71589d1a09cee
+stmmac/k7.4/common.h  drivers/net/ethernet/stmicro/stmmac/common.h  ab360212dd1a9671303fa874912c039383a4d33ddab260051133dbef617b86b1
+stmmac/k7.4/descs.h  drivers/net/ethernet/stmicro/stmmac/descs.h  2a0db8014406fbb939b9475e87b6be6eca44159ae4050e61b0fd1c779424c166
+stmmac/k7.4/descs_com.h  drivers/net/ethernet/stmicro/stmmac/descs_com.h  331ee1118cca39a3f30a0c0f6156c5b19731ea0d8cf0a702b5182c4d59ea92d7
+stmmac/k7.4/dwmac-intel.h  drivers/net/ethernet/stmicro/stmmac/dwmac-intel.h  f8ef9d34908a17540f951e86081fee91ad016ba3245ef975b16e6ad04b0fdfdf
+stmmac/k7.4/dwmac100.h  drivers/net/ethernet/stmicro/stmmac/dwmac100.h  5b94619d9eb859ca9e581bd5069ee4042bce3261e6b77d4cd0ef71f52e98deec
+stmmac/k7.4/dwmac1000.h  drivers/net/ethernet/stmicro/stmmac/dwmac1000.h  14b0b48a2cfe13f398326672f9ee51c8e345a65b7dac1a256f45cb857056c2f7
+stmmac/k7.4/dwmac4.h  drivers/net/ethernet/stmicro/stmmac/dwmac4.h  1a42ec98190cf2a258b0748908bf42ffc3c500dc7390829f48b01f73dd61e11f
+stmmac/k7.4/dwmac4_descs.h  drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.h  ad6fcd631cd7ffb594c7159563bd466cddfde7660730bb25be4b49dcb861061e
+stmmac/k7.4/dwmac4_dma.h  drivers/net/ethernet/stmicro/stmmac/dwmac4_dma.h  e76685ff8a52eb7fbdf7fda76e86e41bf88239f53a41ee4dc8fdd8f6ea960473
+stmmac/k7.4/dwmac5.h  drivers/net/ethernet/stmicro/stmmac/dwmac5.h  c4789bcfda2d1c91861dda568aa0564ed16b761cc20439fabfea77920cbadc3b
+stmmac/k7.4/dwmac_dma.h  drivers/net/ethernet/stmicro/stmmac/dwmac_dma.h  77a11adbcb8260a7633a85ad178f1da57cbbba90743b9a54d0b50decf159b9d9
+stmmac/k7.4/dwxgmac2.h  drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h  d35d102771d124a1ca4f27c1b09cabde6cd767b6b58417906154f2ccded08f2d
+stmmac/k7.4/dwxlgmac2.h  drivers/net/ethernet/stmicro/stmmac/dwxlgmac2.h  d1e9b29f2be305be85ef099249c2a0db2e28c7e5ca3728dcfd4fdb71efdc47fc
+stmmac/k7.4/hwif.h  drivers/net/ethernet/stmicro/stmmac/hwif.h  d285cfd63fb645d1274d275dec3285997894e56af1602c4b6c56e650183bc567
+stmmac/k7.4/mmc.h  drivers/net/ethernet/stmicro/stmmac/mmc.h  bcedb8463e6d2ae2b4182df4704501a0ae7a558752ac0253644dce0e86e0a95f
+stmmac/k7.4/stmmac.h  drivers/net/ethernet/stmicro/stmmac/stmmac.h  e048990eb2a0ce4320c22d641486a49ad6f5c22dc52a9ef248e56ffaab2d1372
+stmmac/k7.4/stmmac_est.h  drivers/net/ethernet/stmicro/stmmac/stmmac_est.h  4d72cd751a88304a82b885b3fdf3a0405f2817ce1c9ded055ad99bc56d5f7fcf
+stmmac/k7.4/stmmac_fpe.h  drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.h  9a0b4f18cbfe2424853ac5a653991788784771a5371f4d43a9ac90630b1be220
+stmmac/k7.4/stmmac_libpci.h  drivers/net/ethernet/stmicro/stmmac/stmmac_libpci.h  00d5ba3e02cb7cf5274fd9be9d490e906facf33331be1ba8f63c107f45cdb1be
+stmmac/k7.4/stmmac_pcs.h  drivers/net/ethernet/stmicro/stmmac/stmmac_pcs.h  cd329172df0bc1b7fbdd0fece5bdb3d7c3a0a9fad1102eac601101cfad5b66f7
+stmmac/k7.4/stmmac_platform.h  drivers/net/ethernet/stmicro/stmmac/stmmac_platform.h  20bbffc85497aa45781f79bbc64ddaf34592ce0073b321376791b1dc3c3ff1d3
+stmmac/k7.4/stmmac_ptp.h  drivers/net/ethernet/stmicro/stmmac/stmmac_ptp.h  a65555a8bb4863ef742574d179f9ecde653bd215c8e256e47782344da14c211c
+stmmac/k7.4/stmmac_vlan.h  drivers/net/ethernet/stmicro/stmmac/stmmac_vlan.h  48f9c18c23ca3edb5df65e94d3f745c76602272df14fbe9ee51b56d18125c2fe
+stmmac/k7.4/stmmac_xdp.h  drivers/net/ethernet/stmicro/stmmac/stmmac_xdp.h  2b97824f013d887ed7c1379d3c5e8f84452cd3c7ff6d557037b9b84955cdb0b2

@@ -1,6 +1,6 @@
 Name:           cubie-a7a-board-support
-Version:        0.15
-Release:        2%{?dist}
+Version:        0.16
+Release:        1%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -49,7 +49,10 @@ initialises the Ethernet PHY, and PCIe/USB for the interim device tree).
     the built-in drivers and every other Allwinner board untouched.
   - sun6i-dma, dwmac-sun55i (and sun55i-pck600): replace the stock modules
     with A733 support (depmod.d override). They embed kernel-internal
-    headers, one set for the 7.2 and 7.3 series.
+    headers, one set for the 7.2 and 7.3 series and one for 7.4.
+  - Linux 7.4: the A733 pin controllers are built into the kernel and the
+    stock sun6i-dma has the A733, so neither module is built there; the
+    initramfs policy and the kernel guard follow the kernel series.
   - sun60i-a733-serdes, sun60i-a733-pcie, sun55i-pck600: built but not
     loaded automatically yet (modprobe.d), enabled one peripheral at a time.
   - sun8i_thermal, nvmem_sunxi_sid: the stock drivers with the A733 entries
@@ -157,6 +160,24 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-1
+- Linux 7.4 (Fedora Rawhide, 7.4.0-0.rc3.26.fc46): mainline has the A733
+  pin controllers since v7.4-rc1 and Fedora builds them in
+  (CONFIG_PINCTRL_SUN60I_A733=y), and the stock sun6i-dma has the A733 DMA
+  controller. cubie-a7a-kmods builds neither pinctrl-sun60i-a733 nor the
+  sun6i-dma override for 7.4 kernels; 7.2 and 7.3 kernels get both as before
+- Internal header sets per kernel series: stmmac/k7.3 and pcie/k7.3 (the
+  set used so far, unchanged) and stmmac/k7.4 and pcie/k7.4 from Fedora's
+  7.4.0-0.rc3.26.fc46 source; dkms.conf picks by kernel version. A series
+  without a set still gets no override modules and fails the guard
+- dracut policy: force-loads each A733 boot module only where the kernel
+  has it as a module (no pinctrl-sun60i-a733.ko on 7.4)
+- /usr/libexec/cubie-a7a/kernel: the boot module list follows the kernel
+  series; from 7.4 on the check wants CONFIG_PINCTRL_SUN60I_A733=y in the
+  kernel's config and the stock sun6i-dma in the initramfs
+- The module sources are unchanged (CCU, AXP318W, GMAC, PPU, thermal, SID,
+  SerDes, PCIe build for both series as they are)
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.15-2
 - sysctl drop-in /usr/lib/sysctl.d/60-cubie-a7a-panic.conf:
   kernel.panic_on_oops = 1 and kernel.panic = 10. On 2026-11-12 a
