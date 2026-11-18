@@ -246,6 +246,8 @@ if [ "$BOOT_MODES" = protective ]; then
         "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
     install -Dm0644 "$TOP/fedora/bootmodes/cubie-a7a-bootmode-ro.service" \
         "$ROOT/etc/systemd/system/cubie-a7a-bootmode-ro.service"
+    install -Dm0644 "$TOP/fedora/bootmodes/cubie-a7a-bootmode-next.service" \
+        "$ROOT/etc/systemd/system/cubie-a7a-bootmode-next.service"
     sed -i "s|\$| $("$TOP/fedora/bootmodes/cubie-a7a-bootmode" default-args)|" "$ROOT/etc/kernel/cmdline"
 fi
 # A machine id for kernel-install's entry names; emptied at the end so the
@@ -411,6 +413,9 @@ if [ "$BOOT_MODES" = protective ]; then
         chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "next_entry=$def~maintenance"
     fi
     systemctl --root="$ROOT" enable cubie-a7a-bootmode-ro.service >/dev/null
+    # A rw boot clears a next_entry GRUB could not (read-only firmware
+    # Block I/O: GRUB's save_env fails), so a one-shot stays one-shot.
+    systemctl --root="$ROOT" enable cubie-a7a-bootmode-next.service >/dev/null
     # 20-grub.install runs grub2-mkconfig (replacing this grub.cfg and every
     # entry's options with GRUB_CMDLINE_LINUX) when /etc/kernel/cmdline is
     # older than /etc/default/grub.

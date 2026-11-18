@@ -1,0 +1,21 @@
+[Unit]
+Description=Cubie A7A: a rw boot consumes GRUB's one-shot next_entry
+Documentation=file:/usr/local/bin/cubie-a7a-bootmode
+# GRUB clears next_entry itself (save_env) only where the firmware's Block
+# I/O is writable; the EDK2 microSD and eMMC are read-only by default, so
+# the first rw boot after a one-shot clears it here. The protective boot
+# never writes the drive and is skipped.
+ConditionKernelCommandLine=!systemd.volatile=overlay
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+RequiresMountsFor=/boot/grub2
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cubie-a7a-bootmode consume-next
+
+[Install]
+WantedBy=sysinit.target

@@ -248,6 +248,7 @@ if [ "$BOOT_MODES" = protective ]; then
     check "kernel-install plugin 96-cubie-a7a-bootmodes installed" test -x "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
     check "the plugin and cubie-a7a-bootmode-ro.service call the installed helper" bash -c "for f in '$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install' '$ROOT/etc/systemd/system/cubie-a7a-bootmode-ro.service'; do for h in \$(grep -o '/usr/[a-z/]*/cubie-a7a-bootmode\\b' \"\$f\" | sort -u); do [ -x '$ROOT'\$h ] || exit 1; done; grep -q '/usr/local/bin/cubie-a7a-bootmode' \"\$f\" || exit 1; done"
     check "cubie-a7a-bootmode-ro.service enabled" bash -c "ls '$ROOT'/etc/systemd/system/sysinit.target.wants/cubie-a7a-bootmode-ro.service >/dev/null 2>&1"
+    check "cubie-a7a-bootmode-next.service enabled, rw boots only (clears a next_entry GRUB could not)" bash -c "ls '$ROOT'/etc/systemd/system/sysinit.target.wants/cubie-a7a-bootmode-next.service >/dev/null 2>&1 && grep -q '^ConditionKernelCommandLine=!systemd.volatile=overlay\$' '$ROOT/etc/systemd/system/cubie-a7a-bootmode-next.service' && grep -q '^ExecStart=/usr/local/bin/cubie-a7a-bootmode consume-next\$' '$ROOT/etc/systemd/system/cubie-a7a-bootmode-next.service'"
     dargs=$(bash "$bm" default-args 2>/dev/null)
     hat=cubie_a7a.hat=0
     protect=${dargs#"$hat" }

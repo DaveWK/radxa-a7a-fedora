@@ -31,6 +31,14 @@
 #             remove entries of removed kernels (kernel-install runs this)
 #        cubie-a7a-bootmode default-args
 #             print PROTECT_ARGS
+#        cubie-a7a-bootmode consume-next
+#             (cubie-a7a-bootmode-next.service, rw boots only) unset GRUB's
+#             next_entry if it is still set: GRUB booted it, so this boot
+#             consumed it. GRUB's own save_env cannot clear it when the
+#             firmware's Block I/O is read-only (the EDK2 microSD and eMMC
+#             default), which left every later boot on the one-shot entry.
+#             A one-shot entry is always a rw entry, so a rw boot is where
+#             it lands. Nothing is written when next_entry is not set.
 #        cubie-a7a-bootmode ro-setup
 #             (cubie-a7a-bootmode-ro.service, protective boot only) make
 #             /boot/grub2/grubenv read-only so that grub2-reboot and
@@ -269,6 +277,18 @@ cmd_status() {
     done
 }
 
+cmd_consume_next() {
+    local cur
+    is_protective_boot && exit 0
+    [ -f "$GRUBENV" ] || exit 0
+    cur=$(grub2-editenv "$GRUBENV" list | sed -n 's/^next_entry=//p')
+    [ -n "$cur" ] || exit 0
+    grub2-editenv "$GRUBENV" unset next_entry
+    ! grub2-editenv "$GRUBENV" list | grep -q '^next_entry=' ||
+        die "next_entry still set in $GRUBENV"
+    echo "one-shot entry $cur consumed by this boot; next_entry cleared (next boot: the default entry)"
+}
+
 cmd_ro_setup() {
     is_protective_boot || exit 0
     if [ -f "$GRUBENV" ] && ! findmnt -rn "$GRUBENV" >/dev/null; then
@@ -290,6 +310,7 @@ status) cmd_status ;;
 next) cmd_next "${2:-}" ;;
 sync) cmd_sync ;;
 default-args) echo "$HAT_OFF $PROTECT_ARGS" ;;
+consume-next) cmd_consume_next ;;
 ro-setup) cmd_ro_setup ;;
 *)
     sed -n '/^# usage:/,/^# PROTECT_ARGS/p' "$0" | sed 's/^# \{0,1\}//' >&2
