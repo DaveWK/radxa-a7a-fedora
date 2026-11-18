@@ -1,5 +1,5 @@
 Name:           cubie-a7a-dtb
-Version:        0.19
+Version:        0.20
 Release:        1%{?dist}
 Summary:        Radxa Cubie A7A device tree, used when newer than the firmware's
 License:        (GPL-2.0-only OR MIT) AND BSD-2-Clause AND MIT
@@ -85,6 +85,14 @@ fi
 %dir %{_sharedstatedir}/cubie-a7a
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.20-1
+- Binding stamp 25: the SDC0-D3 (PF4) workaround of stamp 17 is removed.
+  mmc0 is the series' 4-bit
+  node again (mmc0_pins, PF0..PF5), with no 1-bit pin group and no fixed
+  regulator holding PF4 high. The first board's slot is dead either way;
+  the 6 GB board's healthy slot ran 1-bit for nothing. bt0 and EDK2 go
+  back to 4 bits at the same time
+
 * Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.19-1
 - Binding stamp 24: mmc2 runs HS200 at 1.8 V, card clock up to 150 MHz
   (stamp 23 had HS200 off, so Linux chose DDR52). vqmmc
