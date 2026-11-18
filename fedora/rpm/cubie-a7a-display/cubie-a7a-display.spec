@@ -1,6 +1,6 @@
 Name:           cubie-a7a-display
 Version:        0.1
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Allwinner A733 HDMI display driver (sunxidrm) for the stock Fedora kernel
 License:        GPL-2.0-or-later AND GPL-2.0-only
 BuildArch:      noarch
@@ -71,6 +71,15 @@ install -Dpm0644 %{SOURCE1} %{buildroot}%{_prefix}/lib/modprobe.d/cubie-a7a-disp
 %{_prefix}/lib/modprobe.d/cubie-a7a-display.conf
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.1-3
+- sunxidrm builds against Linux 7.4 (7.4.0-0.rc3.26.fc46) as well as 7.3:
+  the fbdev helper header moved (compat/drm/drm_fb_helper.h), CRTC and
+  plane initial state through .atomic_create_state where the kernel has no
+  .reset, drm_encoder_init() in place of the removed
+  drm_simple_encoder_init()
+- The plane reset no longer frees an uninitialised pointer on its first
+  call. Not yet run on a board with a 7.4 kernel
+
 * Wed Nov 11 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.1-2
 - DKMS version is the package's version-release (was the version alone), so
   an update builds and installs the new sources instead of keeping the old

@@ -79,6 +79,23 @@ Changes to imported files:
     property is -EINVAL, which as u32 sized a 16 GiB kmalloc and a bogus
     drive_size), checks the cell count, allocates count u32s with kcalloc,
     frees the buffer on a read error and sets drive_size only on success
+  - Linux 7.4 (2026-11-18; builds against 7.3.4-300.fc45 and
+    7.4.0-0.rc3.26.fc46, not run on a board with 7.4):
+    - compat/drm/drm_fb_helper.h (new): 7.4 moved <drm/drm_fb_helper.h> to
+      <drm/clients/drm_fbdev_helper.h>; found only where the kernel lacks
+      the old name (compat/ follows the kernel's include directories)
+    - sunxi_drm_crtc.c: 7.4 dropped drm_crtc_funcs.reset,
+      drm_plane_funcs.reset and the __drm_atomic_helper_{crtc,plane}_reset()
+      helpers; the core builds the initial state through
+      .atomic_create_state. The state setup of sunxi_crtc_reset() and
+      sunxi_atomic_plane_reset() moved into sunxi_crtc_alloc_state() and
+      sunxi_plane_alloc_state(), used by .atomic_create_state on 7.4 and by
+      the reset functions before. The plane reset no longer calls kfree()
+      on an uninitialised pointer when the plane has no state yet, and
+      neither reset dereferences a failed allocation
+    - sunxi_drm_hdmi.c: drm_simple_encoder_init() (removed in 7.4) replaced
+      by drm_encoder_init() with a cleanup-only drm_encoder_funcs, which is
+      what the helper did
 
 Device tree: fedora/dts/cubie-a7a-display.dtsi (included from binding stamp
 15, cubie-a7a-dtb 0.10) describes the nodes

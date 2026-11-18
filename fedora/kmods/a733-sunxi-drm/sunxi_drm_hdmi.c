@@ -3334,6 +3334,15 @@ static int _sunxi_hdmi_init_drv(struct sunxi_drm_hdmi *hdmi)
 	return 0;
 }
 
+/*
+ * What drm_simple_encoder_init() registered: an encoder whose only function
+ * is its cleanup. Linux 7.4 removed that helper; drm_encoder_init() with
+ * these functions is the same on every kernel.
+ */
+static const struct drm_encoder_funcs sunxi_hdmi_encoder_funcs = {
+	.destroy = drm_encoder_cleanup,
+};
+
 static int _sunxi_hdmi_init_drm(struct sunxi_drm_hdmi *hdmi)
 {
 	int ret = 0;
@@ -3351,7 +3360,8 @@ static int _sunxi_hdmi_init_drm(struct sunxi_drm_hdmi *hdmi)
 
 	/* drm encoder register */
 	drm_encoder_helper_add(encoder, &sunxi_hdmi_encoder_helper_funcs);
-	ret = drm_simple_encoder_init(drm, encoder, DRM_MODE_ENCODER_TMDS);
+	ret = drm_encoder_init(drm, encoder, &sunxi_hdmi_encoder_funcs,
+			       DRM_MODE_ENCODER_TMDS, NULL);
 	if (ret != 0) {
 		hdmi_err("drm hdmi register encoder failed\n");
 		return -1;

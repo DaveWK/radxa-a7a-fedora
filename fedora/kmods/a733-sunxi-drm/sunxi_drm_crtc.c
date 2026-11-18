@@ -1003,27 +1003,25 @@ static void sunxi_atomic_plane_destroy_state(struct drm_plane *plane,
 	kfree(cstate);
 }
 
-static void sunxi_atomic_plane_reset(struct drm_plane *plane)
+/*
+ * A pristine channel state, not yet attached to the plane. Linux 7.4 dropped
+ * drm_plane_funcs.reset and __drm_atomic_helper_plane_reset(): the core
+ * builds the initial state through .atomic_create_state and attaches it.
+ */
+static struct display_channel_state *sunxi_plane_alloc_state(struct drm_plane *plane)
 {
 	struct display_channel_state *state;
 	int i;
 
-	if (plane->state) {
-		state = to_display_channel_state(plane->state);
-		sunxi_atomic_plane_destroy_state(plane, plane->state);
-	} else {
-		kfree(state);
-	}
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
 	if (!state) {
 		DRM_ERROR("%s fail, no mem\n", __FUNCTION__);
-		return;
+		return NULL;
 	}
 
 	/* prepare for pqd */
 	state->frontend_blob = drm_property_create_blob(plane->dev, sizeof(struct de_frontend_data), NULL);
 
-	__drm_atomic_helper_plane_reset(plane, &state->base);
 	for (i = 0; i < MAX_LAYER_NUM_PER_CHN - 1; i++) {
 		state->alpha[i] = DRM_BLEND_ALPHA_OPAQUE;
 		state->pixel_blend_mode[i] = DRM_MODE_BLEND_PREMULTI;
@@ -1033,7 +1031,33 @@ static void sunxi_atomic_plane_reset(struct drm_plane *plane)
 	state->color_range = DE_COLOR_RANGE_DEFAULT;
 	state->fake_layer0 = false;
 	state->layer_id = COMMIT_ALL_LAYER;
+	return state;
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+static struct drm_plane_state *sunxi_atomic_plane_create_state(struct drm_plane *plane)
+{
+	struct display_channel_state *state = sunxi_plane_alloc_state(plane);
+
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+	__drm_atomic_helper_plane_state_init(&state->base, plane);
+	return &state->base;
+}
+#else
+static void sunxi_atomic_plane_reset(struct drm_plane *plane)
+{
+	struct display_channel_state *state;
+
+	if (plane->state)
+		sunxi_atomic_plane_destroy_state(plane, plane->state);
+	plane->state = NULL;
+	state = sunxi_plane_alloc_state(plane);
+	if (!state)
+		return;
+	__drm_atomic_helper_plane_reset(plane, &state->base);
+}
+#endif
 
 static bool sunxi_plane_format_mod_supported(struct drm_plane *plane, u32 format, u64 modifier)
 {
@@ -1061,7 +1085,11 @@ static const struct drm_plane_funcs sunxi_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+	.atomic_create_state = sunxi_atomic_plane_create_state,
+#else
 	.reset = sunxi_atomic_plane_reset,
+#endif
 	.atomic_duplicate_state = sunxi_atomic_plane_duplicate_state,
 	.atomic_destroy_state = sunxi_atomic_plane_destroy_state,
 	.atomic_set_property = sunxi_atomic_plane_set_property,
@@ -1764,13 +1792,17 @@ static void sunxi_crtc_destroy_state(struct drm_crtc *crtc,
 	kfree(state);
 }
 
-static void sunxi_crtc_reset(struct drm_crtc *crtc)
+/*
+ * A pristine CRTC state, not yet attached (see sunxi_plane_alloc_state():
+ * Linux 7.4 has .atomic_create_state in place of .reset).
+ */
+static struct sunxi_crtc_state *sunxi_crtc_alloc_state(struct drm_crtc *crtc)
 {
 	struct sunxi_crtc_state *state = kzalloc(sizeof(*state), GFP_KERNEL);
 	struct sunxi_drm_crtc *scrtc = to_sunxi_crtc(crtc);
 
-	if (crtc->state)
-		sunxi_crtc_destroy_state(crtc, crtc->state);
+	if (!state)
+		return NULL;
 	state->px_fmt_space = DE_FORMAT_SPACE_RGB;
 	state->yuv_sampling = DE_YUV444;
 	state->eotf = DE_EOTF_BT709;
@@ -1785,9 +1817,33 @@ static void sunxi_crtc_reset(struct drm_crtc *crtc)
 
 	/* prepare for pqd */
 	state->backend_blob = drm_property_create_blob(crtc->dev, sizeof(struct de_backend_data), NULL);
+	return state;
+}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+static struct drm_crtc_state *sunxi_crtc_create_state(struct drm_crtc *crtc)
+{
+	struct sunxi_crtc_state *state = sunxi_crtc_alloc_state(crtc);
+
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+	__drm_atomic_helper_crtc_state_init(&state->base, crtc);
+	return &state->base;
+}
+#else
+static void sunxi_crtc_reset(struct drm_crtc *crtc)
+{
+	struct sunxi_crtc_state *state;
+
+	if (crtc->state)
+		sunxi_crtc_destroy_state(crtc, crtc->state);
+	crtc->state = NULL;
+	state = sunxi_crtc_alloc_state(crtc);
+	if (!state)
+		return;
 	__drm_atomic_helper_crtc_reset(crtc, &state->base);
 }
+#endif
 
 u64 sunxi_get_fpsraw_and_vblankcnt(struct drm_crtc *crtc)
 {
@@ -2269,7 +2325,11 @@ static const struct drm_crtc_funcs sunxi_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
 	.destroy = drm_crtc_cleanup,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+	.atomic_create_state = sunxi_crtc_create_state,
+#else
 	.reset = sunxi_crtc_reset,
+#endif
 	.atomic_print_state = sunxi_crtc_atomic_print_state,
 	.atomic_duplicate_state = sunxi_crtc_duplicate_state,
 	.atomic_destroy_state = sunxi_crtc_destroy_state,
