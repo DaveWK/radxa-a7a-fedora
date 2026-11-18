@@ -37,23 +37,40 @@
  * PC0 (DS) is still muxed, pulled down as the vendor does, so the module's
  * RCLK output never sees a floating input.
  *
- * Speed (conservative until the module has run, 2026-11-18): High Speed
- * SDR at 52 MHz on 8 bits. sunxi-mmc adds MMC_CAP_1_8V_DDR itself on the
- * new timing mode (sunxi_mmc_probe), so the core selects DDR52 on this
- * module whatever this node says; there is no DT property to drop it.
- * HS200 is off: stock sunxi-mmc has no execute_tuning, so HS200 would run
- * untuned, and an HS200 switch or bus-test failure fails the whole card
- * init, which on an eMMC root means no root. Bring-up macros (cpp):
- *   -DEMMC_HS200             add mmc-hs200-1_8v (raise EMMC_MAX_HZ with it)
- *   -DEMMC_MAX_HZ=150000000  cap the card clock (default 52 MHz; 150 MHz is
- *                            the mainline A523 value, 600 MHz / 2 / 2)
+ * Speed: HS200 at 1.8 V, card clock up to 150 MHz. What the stock
+ * sunxi-mmc does with it (D1 entry, new timing mode, kernel 7.3.3):
+ * - HS200 stays in caps2 (only HS400 is masked); vqmmc is CLDO5, fixed at
+ *   1.8 V, so the core's 1.8 V signal switch succeeds and is a no-op.
+ * - There is no execute_tuning: mmc_execute_tuning() returns 0 without
+ *   CMD21, so HS200 runs untuned with the sample delay calibration at 0
+ *   (sunxi_mmc_calibrate). The vendor kernel uses a non-zero HS200 sample
+ *   delay at 100 and 150 MHz (its sdc_tm4_sm3 values); the mainline A523
+ *   boards (same controller generation, same driver entry, Avaota A1)
+ *   run HS200 at 150 MHz with delay 0.
+ * - If the HS200 switch itself reports an error (-EBADMSG) the core falls
+ *   back to High Speed/DDR52 (mmc_select_timing). Data CRC errors after a
+ *   good switch are not caught at init: they show as I/O errors later.
+ *   The image keeps the stamp-23 DTB (DDR52, 52 MHz) for a GRUB entry.
+ * - cap-mmc-hw-reset is harmless here: the module's RST_n_FUNCTION is 0,
+ *   so it ignores RST_n, and Linux never writes that one-time field.
+ * - DS (PC0) is wired (R124 0R) and muxed, but HS400 needs DS delay
+ *   calibration and the HS400 switch, which the stock driver lacks.
+ * Bring-up macros (cpp):
+ *   -DEMMC_NO_HS200          DDR52/HS52 only (the stamp-23 behaviour)
+ *   -DEMMC_MAX_HZ=100000000  cap the card clock (default 150 MHz, the
+ *                            mainline A523 value: 600 MHz / 2 / 2; 100 MHz
+ *                            is 800 MHz / 4 / 2)
  *
  * The SoC dtsi has no mmc2 pin group; the one below belongs there (as in
  * sun55i-a523.dtsi) once the Linux series carries it.
  */
 
 #ifndef EMMC_MAX_HZ
+#ifdef EMMC_NO_HS200
 #define EMMC_MAX_HZ 52000000
+#else
+#define EMMC_MAX_HZ 150000000
+#endif
 #endif
 
 / {
@@ -96,7 +113,7 @@
 	cap-mmc-highspeed;
 	cap-mmc-hw-reset;
 	mmc-ddr-1_8v;
-#ifdef EMMC_HS200
+#ifndef EMMC_NO_HS200
 	mmc-hs200-1_8v;
 #endif
 	max-frequency = <EMMC_MAX_HZ>;

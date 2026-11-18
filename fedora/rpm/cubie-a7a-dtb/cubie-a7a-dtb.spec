@@ -1,5 +1,5 @@
 Name:           cubie-a7a-dtb
-Version:        0.18
+Version:        0.19
 Release:        1%{?dist}
 Summary:        Radxa Cubie A7A device tree, used when newer than the firmware's
 License:        (GPL-2.0-only OR MIT) AND BSD-2-Clause AND MIT
@@ -85,6 +85,15 @@ fi
 %dir %{_sharedstatedir}/cubie-a7a
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.19-1
+- Binding stamp 24: mmc2 runs HS200 at 1.8 V, card clock up to 150 MHz
+  (stamp 23 had HS200 off, so Linux chose DDR52). vqmmc
+  stays CLDO5 at 1.8 V. The stock sunxi-mmc runs HS200 untuned (no
+  execute_tuning; sample delay 0), as on the mainline A523 boards. HS400
+  stays off: the stock driver masks it and has no data strobe
+  calibration. The Fedora eMMC image keeps the stamp-23 DTB for a
+  non-default "safe eMMC speed" GRUB entry
+
 * Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.18-1
 - Binding stamp 23: stamp 22 (WDT0) plus the eMMC module socket on mmc2
   (cubie-a7a-emmc.dtsi, from the draft that used stamp 21 and 0.16 and

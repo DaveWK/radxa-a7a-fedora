@@ -41,8 +41,8 @@
 #include "cubie-a7a-watchdog.dtsi"
 
 /*
- * eMMC module socket on mmc2 (8-bit; High Speed, DDR52 by the driver; HS200
- * off until it has run). With no module fitted mmc2 logs one failed init and
+ * eMMC module socket on mmc2 (8-bit, HS200 at 1.8 V up to 150 MHz; DDR52
+ * with -DEMMC_NO_HS200). With no module fitted mmc2 logs one failed init and
  * idles.
  */
 #include "cubie-a7a-emmc.dtsi"
