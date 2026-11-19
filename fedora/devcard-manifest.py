@@ -15,13 +15,13 @@ Commands:
       Write {"files": [...]} of the staged ESP tree ESP_DIR (every file and
       directory with its type and sha256) to OUT, so the build can capture it
       before mtools empties the mount point.
-  write IMG ROOT RPMS_DIR FIXTURES_DIR MANIFEST --esp-dir DIR | --esp-model FILE
+  write IMG ROOT RPM_RECORDS FIXTURES_DIR MANIFEST --esp-dir DIR | --esp-model FILE
       Write MANIFEST for the built image IMG: the sfdisk GPT, the sha256 of
       every partition's bytes and of the firmware gap (LBA 256 to the first
       partition), the whole-image sha256, the ESP files (from DIR or FILE),
       the initramfs files under ROOT/boot, the DTB stamps, the pinned-unit
-      fixture digests, and the board RPM set (NEVRA, %{ARCH}, sha256) from the
-      checked RPM manifests in RPMS_DIR. IMG and ROOT are only read.
+       fixture digests, and board RPMs (NEVRA, %{ARCH}, sha256) using the
+       JSON records retained from RPM selection. IMG and ROOT are only read.
   verify IMG MANIFEST
       Load MANIFEST, check its schema, and recompute every value from IMG:
       the GPT, each partition's and the gap's sha256, the whole image, the
@@ -242,35 +242,28 @@ def _pinned_units_model(fixtures_dir):
     return units
 
 
-def _rpm_model(rpms_dir):
-    """NEVRA, ARCH and sha256 of every board RPM in the checked manifests."""
-    base = Path(rpms_dir)
+def _rpm_model(records):
+    """Rehash the DNF inputs against the records held since RPM selection."""
+    if not isinstance(records, list) or not records:
+        raise ManifestError("no retained RPM snapshot records")
     entries = []
-    for manifest_name in ("checked-rpms.json", "checked-aarch64-rpms.json"):
-        path = base / manifest_name
-        if not path.is_file():
-            continue
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ManifestError(f"cannot read {path}: {exc}") from exc
-        for rec in data.get("rpms", []):
-            nevra = rec.get("nevra")
-            arch = rec.get("arch")
-            rel = rec.get("relpath")
-            sha = rec.get("sha256")
-            if not all(isinstance(v, str) and v for v in (nevra, arch, rel, sha)):
-                raise ManifestError(f"{path}: incomplete RPM record {rec!r}")
-            target = base / rel
-            if target.is_symlink() or not target.is_file():
-                raise ManifestError(f"{path}: missing RPM {rel}")
-            entries.append({"nevra": nevra, "arch": arch, "sha256": sha})
-    if not entries:
-        raise ManifestError(f"{rpms_dir}: no checked RPM manifests")
+    for rec in records:
+        if not isinstance(rec, dict) or not all(
+            isinstance(rec.get(key), str) and rec[key]
+            for key in ("nevra", "arch", "path", "sha256")
+        ):
+            raise ManifestError(f"incomplete RPM snapshot record {rec!r}")
+        target = Path(rec["path"])
+        if target.is_symlink() or not target.is_file():
+            raise ManifestError(f"missing or non-regular consumed RPM {target}")
+        actual = _sha256_path(target)
+        if actual != rec["sha256"]:
+            raise ManifestError(f"sha256 mismatch for consumed RPM {target}")
+        entries.append({"nevra": rec["nevra"], "arch": rec["arch"], "sha256": actual})
     return sorted(entries, key=lambda e: e["nevra"])
 
 
-def write_manifest(img, root, esp_files, rpms_dir, fixtures_dir, manifest):
+def write_manifest(img, root, esp_files, rpm_records, fixtures_dir, manifest):
     img = Path(img)
     root = Path(root)
     payload = {
@@ -289,7 +282,7 @@ def write_manifest(img, root, esp_files, rpms_dir, fixtures_dir, manifest):
             "package_stamp_sha256": _sha256_path(root / PKG_DTB_VERSION),
         },
         "pinned_units": _pinned_units_model(fixtures_dir),
-        "rpms": _rpm_model(rpms_dir),
+        "rpms": _rpm_model(rpm_records),
         "image_sha256": _sha256_path(img),
     }
     out = Path(manifest)
@@ -466,7 +459,7 @@ def main(argv=None):
     p = sub.add_parser("write")
     p.add_argument("img", type=Path)
     p.add_argument("root", type=Path)
-    p.add_argument("rpms_dir", type=Path)
+    p.add_argument("rpm_records")
     p.add_argument("fixtures_dir", type=Path)
     p.add_argument("manifest", type=Path)
     esp = p.add_mutually_exclusive_group(required=True)
@@ -504,8 +497,12 @@ def main(argv=None):
                     raise ManifestError(
                         f"cannot read esp-model {a.esp_model}: {exc}"
                     ) from exc
+            try:
+                rpm_records = json.loads(a.rpm_records)
+            except json.JSONDecodeError as exc:
+                raise ManifestError(f"cannot read retained RPM records: {exc}") from exc
             payload = write_manifest(
-                a.img, a.root, esp_files, a.rpms_dir, a.fixtures_dir, a.manifest
+                a.img, a.root, esp_files, rpm_records, a.fixtures_dir, a.manifest
             )
             print(_sha256_path(a.manifest))
         else:

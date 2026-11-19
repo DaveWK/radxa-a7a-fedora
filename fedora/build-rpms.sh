@@ -14,11 +14,11 @@
 #   cubie-a7a-fwlog          firmware log reader + journal unit (aarch64; its
 #                            binary RPM is built by build-aarch64-rpms.sh)
 #
-# Usage: fedora/build-rpms.sh [OUT_DIR]   (default build/fedora/rpmbuild, or
-#        build/fedora/rpmbuild-<release> when FEDORA_RELEASE is not 45)
+# Usage: fedora/build-rpms.sh [BUILDROOT] (defaults to build/fedora/rpmbuild
+#        with a release suffix when needed). Prints the new run directory.
 # FEDORA_RELEASE (45 | rawhide, fedora/release.sh) sets the dist tag only:
 # the packages are noarch sources and scripts, the same for every release.
-# Rootless; needs rpm-build, dtc, cpp, make, systemd-rpm-macros.
+# Rootless; needs rpm-build, dtc, cpp, make, systemd-rpm-macros, createrepo_c.
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,12 +32,10 @@ if [ "$FWREPO" != none ] && [ ! -f "$FWREPO/tools/a7a-fwlog/a7a-fwlog.c" ]; then
     echo "build-rpms: $FWREPO is missing (FWREPO=none skips cubie-a7a-fwlog)" >&2
     exit 1
 fi
-publish=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
-mkdir -p "$publish/tmp"
-publish=$(realpath "$publish")
-# A fresh topdir isolates both specs and binary outputs from earlier builds.
-OUT=$(mktemp -d "$publish/tmp/build-rpms.XXXXXXXX")
-trap 'rm -rf "$OUT"' EXIT
+BR=${1:-${BUILDROOT:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}}
+POLICY=$TOP/fedora/devcard-policy.py
+RUN=$(python3 -I "$POLICY" new-rpm-run "$BR")
+OUT=$RUN/rpmbuild
 mkdir -p "$OUT"/{SOURCES,SPECS,SRPMS,RPMS,BUILD,tmp}
 
 ver() { sed -n 's/^Version:[[:space:]]*//p' "$1"; }
@@ -87,7 +85,7 @@ for pair in cubie-a7a-npu:a733-vipcore cubie-a7a-rk1828:rk1828-pcie-rkep \
             continue
         fi
         python3 -I "$TOP/fedora/stage-aic8800.py" stage "$src" "$OUT" "$v" \
-            --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list" ||
+            --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list" >&2 ||
             {
                 echo "build-rpms: refusing the $pkg driver source (reviewed inputs only)" >&2
                 exit 1
@@ -124,11 +122,11 @@ if [ "$FWREPO" != none ]; then
 fi
 
 for s in "$OUT"/SPECS/*.spec; do
-    rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bs "$s"
+    rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bs "$s" >&2
     case $s in
     *cubie-a7a-fwlog.spec) ;; # ExclusiveArch aarch64
     *)
-        rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bb "$s"
+        rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bb "$s" >&2
         case $s in
         *cubie-a7a-aic8800-usb.spec)
             # The built RPM must carry only the reviewed driver inputs and
@@ -140,46 +138,32 @@ for s in "$OUT"/SPECS/*.spec; do
                 exit 1
             fi
             python3 -I "$TOP/fedora/stage-aic8800.py" payload "${rpms[0]}" \
-                --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list"
+                --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list" >&2
             ;;
         esac
         ;;
     esac
 done
-# Preserve the consumer layout, publishing only after checking this run, and
-# record an atomic checked manifest so mkdevcard.sh consumes only this run's RPMs.
+# Publish only into the directory allocated for this run.
 shopt -s nullglob
 built_rpms=("$OUT"/RPMS/*/*.rpm)
 if ((${#built_rpms[@]} == 0)); then
     echo "build-rpms: no binary RPMs built" >&2
     exit 1
 fi
-cp -a "$OUT"/{SPECS,SOURCES,RPMS,SRPMS} "$publish/"
-published_rpms=()
-for rpm_file in "${built_rpms[@]}"; do
-    published_rpms+=("$publish/${rpm_file#"$OUT"/}")
-done
-# Always clear any prior aarch64 manifest (even when FWREPO is set): the new
-# noarch run gets a fresh run_id, and build-aarch64-rpms.sh must bind its
-# aarch64 manifest to that exact run_id.
-rm -f "$publish/RPMS/checked-aarch64-rpms.json"
-manifest_args=(--kind noarch)
+cp -a "$OUT"/SRPMS/. "$RUN/srpms/"
+cp -a "$OUT"/RPMS/. "$RUN/out/"
 if [ "$FWREPO" != none ]; then
-    # Bind this run's fwlog SRPM (path and sha256): build-aarch64-rpms.sh
-    # rebuilds that one file and nothing else from the shared SRPMS/.
-    fwlog_srpms=("$OUT"/SRPMS/cubie-a7a-fwlog-*.src.rpm)
+    # Keep the noarch/SRPM build check private to the optional second stage.
+    fwlog_srpms=("$RUN"/srpms/cubie-a7a-fwlog-*.src.rpm)
     if ((${#fwlog_srpms[@]} != 1)); then
         echo "build-rpms: expected one cubie-a7a-fwlog SRPM from this run" >&2
         exit 1
     fi
-    manifest_args+=(--expect-aarch64 --srpm "$publish/SRPMS/${fwlog_srpms[0]##*/}")
+    python3 -I "$POLICY" write-rpm-manifest "$RUN/out" "$RUN/rpm-checks/checked-rpms.json" \
+        --kind noarch --run-id "${RUN##*/}" --expect-aarch64 --srpm "${fwlog_srpms[0]}" \
+        "$RUN"/out/noarch/*.rpm
+else
+    python3 -I "$POLICY" seal-rpm-run "$RUN"
 fi
-if [ -n "${RPM_BUILD_RUN_ID:-}" ]; then
-    manifest_args+=(--run-id "$RPM_BUILD_RUN_ID")
-fi
-python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
-    "$publish/RPMS" "$publish/RPMS/checked-rpms.json" "${manifest_args[@]}" \
-    "${published_rpms[@]}"
-for rpm_file in "$OUT"/SRPMS/*.rpm "${built_rpms[@]}"; do
-    printf '%s/%s\n' "$publish" "${rpm_file#"$OUT"/}"
-done
+printf '%s\n' "$RUN"

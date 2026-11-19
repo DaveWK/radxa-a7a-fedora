@@ -92,25 +92,15 @@ def build_image(tmp):
     (rpms / "noarch").mkdir(parents=True)
     rpm1 = rpms / "noarch/cubie-a7a-dtb-1.0-0.noarch.rpm"
     rpm1.write_bytes(b"fake dtb rpm bytes")
-    data = {
-        "version": 3,
-        "kind": "noarch",
-        "run_id": "a" * 32,
-        "count": 1,
-        "expect_aarch64": False,
-        "rpms": [
-            {
-                "package": "cubie-a7a-dtb",
-                "nevra": "cubie-a7a-dtb-1.0-0.noarch",
-                "arch": "noarch",
-                "relpath": "noarch/cubie-a7a-dtb-1.0-0.noarch.rpm",
-                "sha256": hashlib.sha256(rpm1.read_bytes()).hexdigest(),
-            }
-        ],
-    }
-    (rpms / "checked-rpms.json").write_text(
-        json.dumps(data, indent=2, sort_keys=True) + "\n"
-    )
+    records = [
+        {
+            "package": "cubie-a7a-dtb",
+            "nevra": "cubie-a7a-dtb-1.0-0.noarch",
+            "arch": "noarch",
+            "path": str(rpm1),
+            "sha256": hashlib.sha256(rpm1.read_bytes()).hexdigest(),
+        }
+    ]
 
     esp_img = tmp / "esp.img"
     root_img = tmp / "root.img"
@@ -172,7 +162,7 @@ def build_image(tmp):
         ],
         check=True,
     )
-    return img, root, esp, rpms
+    return img, root, esp, json.dumps(records)
 
 
 def _needed():

@@ -29,7 +29,7 @@ trees and real tool output, so a format is never re-derived from packed bytes:
   initramfs-unpack IMG DEST
                       unpack IMG with dracut's own ``lsinitrd --unpack`` into a
                       fresh DEST (the system's initramfs reader).
-  esp-staged ROOT --esp-dir DIR --dtb-rpm RPM
+  esp-staged ROOT --esp-dir DIR --dtb-rpm RPM [--dtb-rpm-sha256 DIGEST]
                       the one ESP admission rule at build, on the staged tree
                       before mtools: the stamps are validated first; the DTB
                       and marker bytes, the VERSION file and the esp-override
@@ -46,9 +46,15 @@ trees and real tool output, so a format is never re-derived from packed bytes:
   shadow              stdin is /etc/shadow: "salt<TAB>root-hash<TAB>others".
   passwd-sole-root FILE
                       exactly one uid 0 named root and no other human user.
-  write-rpm-manifest ...  (also records NEVRA and %{ARCH} per RPM)
-  stage-srpm, select-rpms, verify-rpmdb-list, absence-check
-                      the RPM provenance and filesystem absence checks.
+  new-rpm-run BUILDROOT
+                      allocate a fresh RPM build directory and print its path.
+  seal-rpm-run RUN    snapshot and freeze built RPMs, then make the local repo.
+  load-rpm-run RUN    check local RPM copies, output the retained records and
+                      tab-separated package, digest and path rows.
+  write-rpm-manifest, stage-srpm, select-rpms
+                      private provenance checks for the optional aarch64 stage.
+  verify-rpmdb-list, absence-check
+                      installed package and filesystem absence checks.
 
 The exact build manifest and its verify live in fedora/devcard-manifest.py.
 """
@@ -67,6 +73,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 AIC_PATTERN = re.compile(r"aic8800", re.IGNORECASE)
@@ -824,7 +831,7 @@ def _rpm_payload_sha256(records, rel, rpm_path):
     return digest
 
 
-def esp_staged(root, esp_dir, dtb_rpm, overlay=None):
+def esp_staged(root, esp_dir, dtb_rpm, overlay=None, dtb_rpm_sha256=None):
     """The one ESP admission rule, at build, on the staged tree before mtools.
 
     Order: the stamps are validated first (a malformed one is refused, never
@@ -836,6 +843,8 @@ def esp_staged(root, esp_dir, dtb_rpm, overlay=None):
     problems = []
     fw = _dtb_stamp(root, FW_DTB_STAMP)
     pkg = _dtb_stamp(root, PKG_DTB_VERSION)
+    if dtb_rpm_sha256 is not None:
+        _check_rpm_digest(dtb_rpm, dtb_rpm_sha256)
     # The passed RPM must be the DTB package.
     q = subprocess.run(
         ["rpm", "-qp", "--qf", "%{NAME}", str(dtb_rpm)], capture_output=True, text=True
@@ -953,9 +962,192 @@ OPTIONAL_NOARCH_PACKAGES = (
     "cubie-a7a-aic8800-usb",
 )
 OPTIONAL_AARCH64_PACKAGES = ("cubie-a7a-fwlog",)
-RUN_ID_RE = re.compile(r"^[0-9a-f]{32,64}$")
+RUN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
 RPM_MANIFEST_VERSION = 3
 FWLOG_SRPM_PACKAGE = "cubie-a7a-fwlog"
+RPM_ITEM_RE = re.compile(r"(?:noarch|aarch64)/[A-Za-z0-9_.+~-]+\.rpm")
+
+
+def rpm_run_id():
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(4)
+
+
+def new_rpm_run(buildroot):
+    parent = Path(buildroot).resolve() / "runs"
+    parent.mkdir(parents=True, exist_ok=True)
+    run = parent / rpm_run_id()
+    run.mkdir(mode=0o700)  # No reuse, even on a collision or a failed build.
+    for name in ("srpms", "out"):
+        (run / name).mkdir()
+    return run
+
+
+def _rpm_run_path(run):
+    run = Path(run).resolve(strict=True)
+    if (
+        run.parent.name != "runs"
+        or not RUN_ID_RE.fullmatch(run.name)
+        or not run.is_dir()
+    ):
+        raise PolicyError(f"not a run directory from build-rpms.sh: {run}")
+    return run
+
+
+def _readonly_tree(tree):
+    for root, dirs, files in os.walk(tree, topdown=False):
+        for name in dirs + files:
+            path = Path(root) / name
+            path.chmod(path.stat().st_mode & ~0o222)
+    tree.chmod(tree.stat().st_mode & ~0o222)
+
+
+def _check_rpm_digest(path, expected):
+    if path.is_symlink() or not path.is_file():
+        raise PolicyError(f"missing or non-regular RPM: {path}")
+    if _file_digest(path, "sha256") != expected:
+        raise PolicyError(f"sha256 mismatch for snapshot RPM: {path}")
+
+
+def _rpm_inventory(base):
+    paths = []
+    for arch in sorted(base.iterdir()):
+        if (
+            arch.name not in ("aarch64", "noarch")
+            or arch.is_symlink()
+            or not arch.is_dir()
+        ):
+            raise PolicyError(f"unexpected output directory: {arch}")
+        for path in sorted(arch.iterdir()):
+            rel = path.relative_to(base).as_posix()
+            if (
+                not RPM_ITEM_RE.fullmatch(rel)
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                raise PolicyError(f"unexpected output RPM: {path}")
+            paths.append(path)
+    return paths
+
+
+def _allowed_rpm(package, arch):
+    if arch == "noarch":
+        return package in REQUIRED_BOARD_PACKAGES or package in OPTIONAL_NOARCH_PACKAGES
+    return arch == "aarch64" and package in OPTIONAL_AARCH64_PACKAGES
+
+
+def seal_rpm_run(run):
+    run = _rpm_run_path(run)
+    snapshot = run / "rpm-snapshot.json"
+    repo = run / "repo"
+    if os.path.lexists(snapshot) or os.path.lexists(repo):
+        raise PolicyError(f"{run}: RPM snapshot or repository already exists")
+    base = run / "out"
+    if base.is_symlink() or not base.is_dir():
+        raise PolicyError(f"{base}: expected the run's regular output directory")
+    paths = _rpm_inventory(base)
+    checks = run / "rpm-checks"
+    if checks.exists():
+        selected = select_checked_rpms(base, checks)
+        if {p for _, p in selected} != set(paths):
+            raise PolicyError(
+                f"{base}: RPM outputs do not match the checked build stages"
+            )
+    records = []
+    seen = set()
+    for path in paths:
+        package, nevra, arch = _rpm_name_nevra_arch(path)
+        if (
+            arch != path.parent.name
+            or not _allowed_rpm(package, arch)
+            or package in seen
+        ):
+            raise PolicyError(f"{path}: unexpected or duplicate {package} ({arch})")
+        if arch == "aarch64" and not checks.exists():
+            raise PolicyError(f"{path}: no bound aarch64 build stage")
+        seen.add(package)
+        records.append(
+            {
+                "package": package,
+                "nevra": nevra,
+                "arch": arch,
+                "relpath": path.relative_to(base).as_posix(),
+                "sha256": _file_digest(path, "sha256"),
+            }
+        )
+    if not set(REQUIRED_BOARD_PACKAGES) <= seen:
+        raise PolicyError(f"{base}: missing required board RPMs")
+    with snapshot.open("x", encoding="utf-8") as fh:
+        json.dump({"run_id": run.name, "rpms": records}, fh, indent=2)
+        fh.write("\n")
+    snapshot.chmod(0o444)
+    _readonly_tree(base)
+    repo.mkdir()
+    for rec in records:
+        path = repo / rec["relpath"]
+        path.parent.mkdir(exist_ok=True)
+        shutil.copyfile(base / rec["relpath"], path)
+        _check_rpm_digest(path, rec["sha256"])
+    subprocess.run(
+        [
+            os.environ.get("CREATEREPO_C", "createrepo_c"),
+            "--checksum",
+            "sha256",
+            str(repo),
+        ],
+        check=True,
+        stdout=sys.stderr,
+    )
+    _readonly_tree(repo)
+
+
+def load_rpm_run(run):
+    """Read the single snapshot once; bind exact local copy paths for DNF and sealing."""
+    run = _rpm_run_path(run)
+    snapshot = run / "rpm-snapshot.json"
+    if snapshot.is_symlink() or not snapshot.is_file():
+        raise PolicyError(f"{run}: missing sealed RPM snapshot")
+    repo = run / "repo"
+    if (
+        repo.is_symlink()
+        or not (repo / "repodata/repomd.xml").is_file()
+        or repo.stat().st_mode & 0o222
+    ):
+        raise PolicyError(f"{repo}: missing sealed RPM repository")
+    data = json.loads(snapshot.read_text(encoding="utf-8"))
+    if (
+        not isinstance(data, dict)
+        or data.get("run_id") != run.name
+        or not isinstance(data.get("rpms"), list)
+    ):
+        raise PolicyError(f"{snapshot}: invalid run identity or RPM records")
+    selected = []
+    seen = set()
+    for rec in data["rpms"]:
+        if not isinstance(rec, dict) or not all(
+            isinstance(rec.get(key), str) and rec[key]
+            for key in ("package", "nevra", "arch", "relpath", "sha256")
+        ):
+            raise PolicyError(f"{snapshot}: incomplete RPM record")
+        package, arch, rel = rec["package"], rec["arch"], rec["relpath"]
+        if (
+            not RPM_ITEM_RE.fullmatch(rel)
+            or not rel.startswith(arch + "/")
+            or not SHA256_HEX_RE.fullmatch(rec["sha256"])
+            or not _allowed_rpm(package, arch)
+            or package in seen
+        ):
+            raise PolicyError(
+                f"{snapshot}: invalid or duplicate RPM record for {package!r}"
+            )
+        path = repo / rel
+        if path.parent.is_symlink() or any(c in str(path) for c in "\t\n\r"):
+            raise PolicyError(f"{snapshot}: unsupported RPM path: {path!r}")
+        _check_rpm_digest(path, rec["sha256"])
+        seen.add(package)
+        selected.append({**rec, "path": str(path)})
+    if not set(REQUIRED_BOARD_PACKAGES) <= seen:
+        raise PolicyError(f"{snapshot}: missing required board RPMs")
+    return selected
 
 
 def _rpm_name_nevra_arch(path):
@@ -1049,7 +1241,7 @@ def write_rpm_manifest(
         if bind_noarch is not None:
             raise PolicyError("--bind-noarch is only valid for kind='aarch64'")
         if run_id is None:
-            run_id = secrets.token_hex(16)
+            run_id = rpm_run_id()
         if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
             raise PolicyError(f"invalid run_id: {run_id!r}")
         if bind_noarch_sha256 is not None:
@@ -1272,7 +1464,7 @@ def stage_srpm(noarch_manifest, dest_dir):
     except OSError as exc:
         raise PolicyError(f"cannot read {mpath}: {exc}") from exc
     msha = hashlib.sha256(raw).hexdigest()
-    rpms_dir = mpath.parent
+    rpms_dir = mpath.parent.parent / "out"
     snap = Path(dest_dir) / ".noarch-manifest.json"
     dest = Path(dest_dir)
     try:
@@ -1299,10 +1491,10 @@ def stage_srpm(noarch_manifest, dest_dir):
     return copy, msha
 
 
-def select_checked_rpms(rpms_dir):
-    """Select board RPMs strictly from the checked manifest(s) under RPMS_DIR."""
+def select_checked_rpms(rpms_dir, checks_dir):
+    """Validate both private build stages before snapshotting an aarch64 run."""
     base = Path(rpms_dir)
-    noarch_manifest = base / "checked-rpms.json"
+    noarch_manifest = checks_dir / "checked-rpms.json"
     selected, noarch_run_id, expect_aarch64, noarch_data = _load_rpm_manifest(
         base,
         noarch_manifest,
@@ -1312,7 +1504,7 @@ def select_checked_rpms(rpms_dir):
     for req in REQUIRED_BOARD_PACKAGES:
         if req not in selected:
             raise PolicyError(f"{noarch_manifest}: missing required package {req}")
-    aarch64_manifest = base / "checked-aarch64-rpms.json"
+    aarch64_manifest = checks_dir / "checked-aarch64-rpms.json"
     has_aarch64 = aarch64_manifest.exists() or aarch64_manifest.is_symlink()
     if has_aarch64:
         if not expect_aarch64:
@@ -1486,6 +1678,7 @@ def main(argv=None):
     p.add_argument("root", type=Path)
     p.add_argument("--esp-dir", type=Path, required=True)
     p.add_argument("--dtb-rpm", type=Path, required=True)
+    p.add_argument("--dtb-rpm-sha256")
     p = sub.add_parser("overlay-esp")
     p.add_argument("overlay", type=Path)
     p = sub.add_parser("enabled-repos")
@@ -1513,6 +1706,13 @@ def main(argv=None):
     p.add_argument("dest_dir", type=Path)
     p = sub.add_parser("select-rpms")
     p.add_argument("rpms_dir", type=Path)
+    p.add_argument("checks_dir", type=Path)
+    p = sub.add_parser("new-rpm-run")
+    p.add_argument("buildroot", type=Path)
+    p = sub.add_parser("seal-rpm-run")
+    p.add_argument("run", type=Path)
+    p = sub.add_parser("load-rpm-run")
+    p.add_argument("run", type=Path)
     p = sub.add_parser("verify-rpmdb-list")
     p.add_argument("root", type=Path)
     p.add_argument("packages_file", type=Path)
@@ -1580,7 +1780,9 @@ def main(argv=None):
         return 0
     if a.cmd == "esp-staged":
         try:
-            ok, problems = esp_staged(a.root, a.esp_dir, a.dtb_rpm)
+            ok, problems = esp_staged(
+                a.root, a.esp_dir, a.dtb_rpm, dtb_rpm_sha256=a.dtb_rpm_sha256
+            )
         except PolicyError as exc:
             print(f"esp-staged: {exc}", file=sys.stderr)
             return 1
@@ -1652,10 +1854,25 @@ def main(argv=None):
         return 0
     if a.cmd == "select-rpms":
         try:
-            for pkg, rpm_path in select_checked_rpms(a.rpms_dir):
+            for pkg, rpm_path in select_checked_rpms(a.rpms_dir, a.checks_dir):
                 print(f"{pkg}\t{rpm_path}")
         except PolicyError as exc:
             print(f"select-rpms: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd in ("new-rpm-run", "seal-rpm-run", "load-rpm-run"):
+        try:
+            if a.cmd == "new-rpm-run":
+                print(new_rpm_run(a.buildroot))
+            elif a.cmd == "seal-rpm-run":
+                seal_rpm_run(a.run)
+            else:
+                records = load_rpm_run(a.run)
+                print(json.dumps(records))
+                for rec in records:
+                    print(f"{rec['package']}\t{rec['sha256']}\t{rec['path']}")
+        except (PolicyError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+            print(f"{a.cmd}: {exc}", file=sys.stderr)
             return 1
         return 0
     if a.cmd == "verify-rpmdb-list":

@@ -33,16 +33,21 @@ Each kernel module directory keeps its upstream licence headers and a
 ## Build
 
 Requirements on a Fedora 45 host: `rpm-build`, `dtc`, `cpp`, `make`,
-`systemd-rpm-macros`, `dnf5`, `util-linux` (`unshare`), `e2fsprogs`,
+`systemd-rpm-macros`, `createrepo_c`, `dnf5`, `util-linux` (`unshare`), `e2fsprogs`,
 `dosfstools`, `mtools`, `openssl`, `xz`, `python3-libselinux`, and
 `qemu-user-static-aarch64` with its binfmt handler (the `F` flag) on x86_64
 hosts.
 
-    fedora/build-rpms.sh build/fedora/rpmbuild          # SRPMs + noarch RPMs
+    run=$(fedora/build-rpms.sh build/fedora/rpmbuild)   # SRPMs + noarch RPMs
     WORK=build/fedora/image OUT=build/image/a7a-fedora45.img \
-      fedora/mkdevcard.sh none build/fedora/rpmbuild/RPMS  # image, no firmware
+      fedora/mkdevcard.sh none "$run"                   # image, no firmware
 
-`mkdevcard.sh FIRMWARE_BIN RPMS_DIR` builds the image rootless. It installs
+Each build creates a new `runs/<id>` directory. With `FWREPO` set, run
+`fedora/build-aarch64-rpms.sh "$run"` before making the image. The final
+stage records `rpm-snapshot.json`, seals the RPM outputs and creates the
+local repository from verified copies.
+
+`mkdevcard.sh FIRMWARE_BIN RUN_DIR` builds the image rootless. It installs
 Fedora packages with dnf5 into an aarch64 installroot inside a user
 namespace, and the package scriptlets (DKMS, initramfs) run under
 qemu-aarch64. With `none` as FIRMWARE_BIN, sectors 256-32767 stay zero for

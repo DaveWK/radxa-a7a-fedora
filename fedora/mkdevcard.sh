@@ -33,7 +33,7 @@
 # DHCP on, no Cockpit, no SSH keys of anyone, no host keys (generated on
 # first boot).
 #
-# Usage: fedora/mkdevcard.sh FIRMWARE_BIN RPMS_DIR   (rpmbuild RPMS/: noarch/ and aarch64/)
+# Usage: fedora/mkdevcard.sh FIRMWARE_BIN RUN_DIR (a sealed build-rpms.sh run)
 #
 # Optional (unset: the image as before):
 #   KERNEL_VERSION=V-R     install exactly kernel-V-R (e.g.
@@ -69,7 +69,7 @@ set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 FIRMWARE=${1:?firmware.bin}
-RPMDIR=${2:?rpmbuild RPMS directory with noarch/ and aarch64/ cubie-a7a packages}
+RPM_RUN=$(realpath -e "${2:?sealed run directory printed by build-rpms.sh}")
 # shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
 W=${WORK:-$TOP/build/fedora/devcard$RELEASE_SUFFIX}
@@ -129,9 +129,8 @@ else
     FW_END=$((SEEK * 512 + $(stat -c %s "$FIRMWARE")))
     ((FW_END <= 16 * 1024 * 1024)) || die "firmware ends at $FW_END, inside the first partition"
 fi
-# Select only the checked RPMs recorded by build-rpms.sh (and optionally
-# build-aarch64-rpms.sh); never glob the shared RPMS directory, so a stale
-# package left behind after an AIC skip or older build can never be picked up.
+# Read the run's snapshot once and retain the records through image sealing.
+# DNF and the DTB admission use the exact checked copies in this run's repo.
 # Its firmware comes from Fedora's linux-firmware (aic/aic8800d80;
 # fedora/WIFI-FIRMWARE.md), which the image installs and requires by the
 # driver package; verify-devcard.sh rejects only unowned, modified or
@@ -139,19 +138,26 @@ fi
 BOARD_RPMS=()
 BOARD_UNITS=(cubie-a7a-dtb.service)
 DTB_RPM=
-rpm_rows=$(python3 -I "$TOP/fedora/devcard-policy.py" select-rpms "$RPMDIR") ||
-    die "cannot select checked board RPMs from $RPMDIR (run fedora/build-rpms.sh)"
-while IFS=$'\t' read -r pkg rpm_path; do
+DTB_RPM_SHA=
+rpm_inputs=$(python3 -I "$TOP/fedora/devcard-policy.py" load-rpm-run "$RPM_RUN") ||
+    die "cannot select checked board RPMs from $RPM_RUN"
+RPM_RECORDS=${rpm_inputs%%$'\n'*}
+RPM_REPO_ID=a7a-board-${RPM_RUN##*/}
+RPM_REPO_URL=$(python3 -I -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).as_uri())' "$RPM_RUN/repo")
+while IFS=$'\t' read -r pkg rpm_sha rpm_path; do
     [ -n "$pkg" ] || continue
     BOARD_RPMS+=("$rpm_path")
     case $pkg in
     cubie-a7a-fwlog) BOARD_UNITS+=(a7a-fwlog.service) ;;
     cubie-a7a-hat) BOARD_UNITS+=(cubie-a7a-hat.service) ;;
-    cubie-a7a-dtb) DTB_RPM=$rpm_path ;;
+    cubie-a7a-dtb)
+        DTB_RPM=$rpm_path
+        DTB_RPM_SHA=$rpm_sha
+        ;;
     esac
-done <<<"$rpm_rows"
-((${#BOARD_RPMS[@]} >= 2)) || die "checked RPM manifest in $RPMDIR is incomplete"
-[ -n "$DTB_RPM" ] || die "the checked RPM manifest lacks cubie-a7a-dtb"
+done <<<"${rpm_inputs#*$'\n'}"
+((${#BOARD_RPMS[@]} >= 2)) || die "RPM snapshot in $RPM_RUN is incomplete"
+[ -n "$DTB_RPM" ] || die "the RPM snapshot lacks cubie-a7a-dtb"
 # Wi-Fi and Bluetooth userspace, in every image (Wi-Fi out of the box),
 # whether or not the driver package was built: NetworkManager
 # manages wlan0 only with its Wi-Fi plugin (without it the device shows as
@@ -248,7 +254,7 @@ echo "mkdevcard: root UUID $ROOT_UUID, ESP $ESP_UUID"
 # REPOSDIR and the repository names come from fedora/release.sh.
 DNF_CACHE=${DNF_CACHE:-$W/../dnf/cache-ns$RELEASE_SUFFIX}
 RELEASE_REPO_ARGS=${RELEASE_REPOS[*]}
-export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH FEDORA_RELEASE FEDORA_RAWHIDE_VERSION RELEASEVER RELEASE_LABEL RELEASE_REPO_ARGS DNF_CACHE KERNEL_VERSION FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT
+export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH FEDORA_RELEASE FEDORA_RAWHIDE_VERSION RELEASEVER RELEASE_LABEL RELEASE_REPO_ARGS DNF_CACHE KERNEL_VERSION FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT RPM_REPO_ID RPM_REPO_URL
 "$TOP/fedora/run-build-ns.sh" mount bash -s \
     "${PACKAGES[@]}" -- "${EXCLUDES[@]}" <<'STAGE1'
 set -euo pipefail
@@ -309,13 +315,17 @@ exclude=$(IFS=,; echo "${ex[*]}")
 mkdir -p "$W/rpm-home"
 echo '%_install_langs en_US' >"$W/rpm-home/.rpmmacros"
 # persistdir is relative to the installroot (a host path would be recreated
-# inside the image).
+# inside the image). Explicit local paths pin the exact board package files;
+# Fedora's package signature policy stays enabled for the Fedora repositories.
+read -ra release_repos <<<"$RELEASE_REPO_ARGS"
 HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --forcearch=aarch64 --releasever="$RELEASEVER" \
     --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$DNF_CACHE" \
     --setopt=persistdir=/var/lib/dnf --setopt=countme=False \
     --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
     --setopt=keepcache=True --setopt=gpgcheck=True --setopt=localpkg_gpgcheck=False \
-    --exclude="$exclude" $RELEASE_REPO_ARGS "${pkgs[@]}"
+    --repofrompath="$RPM_REPO_ID,$RPM_REPO_URL" --repo="$RPM_REPO_ID" \
+    --setopt="$RPM_REPO_ID.gpgcheck=False" --setopt="$RPM_REPO_ID.repo_gpgcheck=False" \
+    --exclude="$exclude" "${release_repos[@]}" "${pkgs[@]}"
 
 # BOOT_MODES=protective: every kernel's maintenance and full entries, with
 # the arguments the board package added to all entries after the kernel's
@@ -653,7 +663,7 @@ done <"$W/kernel.txt"
 # RPM's own file list (stamps first; DTB, VERSION and esp-override from rpm -qp
 # --dump; the exact entry set with types). The manifest records these bytes.
 python3 -I "$TOP/fedora/devcard-policy.py" esp-staged --root "$ROOT" \
-    --esp-dir "$ROOT/boot/efi" --dtb-rpm "$DTB_RPM" ||
+    --esp-dir "$ROOT/boot/efi" --dtb-rpm "$DTB_RPM" --dtb-rpm-sha256 "$DTB_RPM_SHA" ||
     {
         echo "mkdevcard: the ESP (boot/efi) is not our build's (RPM-bound)" >&2
         exit 1
@@ -742,10 +752,10 @@ EOF
 # GPT, the sha256 of each partition's bytes and of the firmware gap, the whole
 # image, the ESP files (from the staged-tree model captured before mtools), the
 # initramfs files, the DTB stamps, the pinned-unit fixture digests and the RPM
-# set. verify-devcard.sh recomputes every value and requires exact equality.
+# set (from the records retained at RPM selection).
 MANIFEST_PATH="$OUT.devcard-manifest.json"
 manifest_sha=$(python3 -I "$TOP/fedora/devcard-manifest.py" write "$OUT" "$ROOT" \
-    "$RPMDIR" "$TOP/fedora/fixtures/units" "$MANIFEST_PATH" \
+    "$RPM_RECORDS" "$TOP/fedora/fixtures/units" "$MANIFEST_PATH" \
     --esp-model "$W/esp-model.json") ||
     die "cannot write the build manifest"
 cat >>"$W/manifest.txt" <<EOF

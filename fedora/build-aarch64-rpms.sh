@@ -4,72 +4,67 @@
 # Rebuild the aarch64 SRPMs (cubie-a7a-fwlog) natively, rootless: an aarch64
 # buildroot of FEDORA_RELEASE (45 | rawhide, fedora/release.sh) made with
 # dnf5 --installroot --forcearch inside a user namespace, rpmbuild run in it
-# under qemu-aarch64 binfmt (what a COPR builder does natively). Each release
-# has its own buildroot and dnf cache.
+# under qemu-aarch64 binfmt (what a COPR builder does natively). The chroot
+# belongs to the run; only Fedora's DNF cache is shared within a release.
 #
-# Usage: fedora/build-aarch64-rpms.sh [RPMBUILD_DIR]  (default build/fedora/rpmbuild,
-#        or build/fedora/rpmbuild-<release> when FEDORA_RELEASE is not 45)
+# Usage: fedora/build-aarch64-rpms.sh RUN_DIR
+# RUN_DIR is the fresh directory printed by build-rpms.sh with FWREPO set.
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
-OUT=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
-BR=${BUILDROOT:-$TOP/build/fedora/buildroot-aarch64$RELEASE_SUFFIX}
+RUN=$(realpath -e "${1:?run directory printed by build-rpms.sh}")
+POLICY=$TOP/fedora/devcard-policy.py
 CACHE=${DNF_CACHE:-$TOP/build/fedora/dnf/cache-ns$RELEASE_SUFFIX}
 
 [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || {
     echo "no qemu-aarch64 binfmt handler" >&2
     exit 1
 }
-mkdir -p "$OUT/RPMS" "$OUT/tmp"
-OUT=$(realpath "$OUT")
-NOARCH_MANIFEST=$OUT/RPMS/checked-rpms.json
-# Only the fwlog SRPM the noarch run recorded (path and sha256), copied into
-# a run-private directory; the noarch manifest's sha256 as read now binds the
-# aarch64 manifest written at the end (a run change in between is refused).
-PRIV=$(mktemp -d "$OUT/tmp/build-aarch64.XXXXXXXX")
-trap 'rm -rf "$PRIV"' EXIT
-staged=$(python3 -I "$TOP/fedora/devcard-policy.py" stage-srpm "$NOARCH_MANIFEST" "$PRIV/srpm") || {
+NOARCH_MANIFEST=$RUN/rpm-checks/checked-rpms.json
+[ -f "$NOARCH_MANIFEST" ] && [ ! -e "$RUN/rpm-snapshot.json" ] || {
+    echo "build-aarch64-rpms: expected an unsealed run with a bound source RPM" >&2
+    exit 1
+}
+BUILD_SYS=$RUN/aarch64-root
+mkdir "$BUILD_SYS"
+staged=$(python3 -I "$POLICY" stage-srpm "$NOARCH_MANIFEST" "$BUILD_SYS/sources") || {
     echo "build-aarch64-rpms: no bound cubie-a7a-fwlog SRPM in $NOARCH_MANIFEST" >&2
     exit 1
 }
 SRPM=${staged%%$'\t'*}
 NOARCH_SHA256=${staged##*$'\t'}
 
-export BR CACHE OUT DIST RELEASEVER REPOSDIR SRPM
-"$TOP/fedora/run-build-ns.sh" mount bash -s -- "${RELEASE_REPOS[@]}" <<'NS'
+export BUILD_SYS CACHE DIST RELEASEVER REPOSDIR SRPM
+"$TOP/fedora/run-build-ns.sh" mount bash -s -- "${RELEASE_REPOS[@]}" >&2 <<'NS'
 set -euo pipefail
-mkdir -p "$BR"/{proc,dev,run,var/lib/dnf,srpms,out}
-if [ ! -x "$BR/usr/bin/rpmbuild" ]; then
-    dnf5 -y -q install --use-host-config --installroot="$BR" --forcearch=aarch64 --releasever="$RELEASEVER" \
+mkdir -p "$BUILD_SYS"/{proc,dev,run,var/lib/dnf,work/tmp}
+if [ ! -x "$BUILD_SYS/usr/bin/rpmbuild" ]; then
+    dnf5 -y -q install --use-host-config --installroot="$BUILD_SYS" --forcearch=aarch64 --releasever="$RELEASEVER" \
         --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$CACHE" \
-        --setopt=persistdir="$BR/var/lib/dnf" --setopt=countme=False --setopt=keepcache=True \
+        --setopt=persistdir=/var/lib/dnf --setopt=countme=False --setopt=keepcache=True \
         --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
         --setopt=gpgcheck=True "$@" \
         fedora-release bash coreutils rpm-build redhat-rpm-config systemd-rpm-macros gcc make
 fi
-mount -t proc proc "$BR/proc"
-for n in null zero random urandom full; do touch "$BR/dev/$n"; mount --bind "/dev/$n" "$BR/dev/$n"; done
-mount -t tmpfs tmpfs "$BR/run"
-rm -rf "$BR/srpms"/* "$BR/out"/*
-cp "$SRPM" "$BR/srpms/"
-chroot "$BR" rpmbuild --define "_topdir /out" --define "dist $DIST" \
-    --rebuild "/srpms/${SRPM##*/}"
-mkdir -p "$OUT/RPMS/aarch64"
-cp "$BR"/out/RPMS/aarch64/*.rpm "$OUT/RPMS/aarch64/"
+mount -t proc proc "$BUILD_SYS/proc"
+for n in null zero random urandom full; do touch "$BUILD_SYS/dev/$n"; mount --bind "/dev/$n" "$BUILD_SYS/dev/$n"; done
+mount -t tmpfs tmpfs "$BUILD_SYS/run"
+chroot "$BUILD_SYS" rpmbuild --define "_topdir /work" --define "_tmppath /work/tmp" \
+    --define "dist $DIST" --rebuild "/sources/${SRPM##*/}"
 NS
 shopt -s nullglob
-built_aarch64=()
-for rpm_file in "$BR"/out/RPMS/aarch64/*.rpm; do
-    built_aarch64+=("$OUT/RPMS/aarch64/$(basename "$rpm_file")")
-done
+built_aarch64=("$BUILD_SYS"/work/RPMS/aarch64/*.rpm)
 if ((${#built_aarch64[@]} == 0)); then
     echo "build-aarch64-rpms: no aarch64 binary RPMs built" >&2
     exit 1
 fi
-python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
-    "$OUT/RPMS" "$OUT/RPMS/checked-aarch64-rpms.json" --kind aarch64 \
+mkdir "$RUN/out/aarch64"
+cp "${built_aarch64[@]}" "$RUN/out/aarch64/"
+python3 -I "$POLICY" write-rpm-manifest \
+    "$RUN/out" "$RUN/rpm-checks/checked-aarch64-rpms.json" --kind aarch64 \
     --bind-noarch "$NOARCH_MANIFEST" --bind-noarch-sha256 "$NOARCH_SHA256" \
-    "${built_aarch64[@]}"
-printf '%s\n' "${built_aarch64[@]}"
+    "$RUN"/out/aarch64/*.rpm
+python3 -I "$POLICY" seal-rpm-run "$RUN"
+printf '%s\n' "$RUN"
