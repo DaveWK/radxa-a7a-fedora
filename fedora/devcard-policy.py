@@ -605,7 +605,7 @@ ESP_BASE_ENTRIES = frozenset(
         "efi/fedora/bootaa64.csv",
         "efi/fedora/grub.cfg",
         "efi/fedora/grubaa64.efi",
-        "efi/fedora/mmmaa64.efi",
+        "efi/fedora/mmaa64.efi",
         "efi/fedora/shim.efi",
         "efi/fedora/shimaa64.efi",
     )

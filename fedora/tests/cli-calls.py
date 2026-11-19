@@ -74,7 +74,7 @@ ARGV_SHA256 = {
     "fedora/verify-devcard.sh": "6014641e021af19ccaf4f5ee97fe220563198dba7aaa2a6b9cfb1b152acffdc1",
     "fedora/release.sh": "5837f8288befda61852227486211ddcff34711bc3204a1f6118882c34fddc6e6",
     "fedora/bootmodes/cubie-a7a-bootmode": "7ebd7ff865a77c14f7933cb1d90e5e33a37561fe3cef9ecc017f48bfbb049bd5",
-    POLICY: "7b61dd68d6017fc01b75accc7245ed87e100e1c0a42f5e0f54719e7c95dc2b65",
+    POLICY: "a7d7644524f17510a286a90b12b0467ad3b2a4d990641f2af963d908a97dd124",
     MANIFEST: "bbc7ef17a5e94756c76172cdc07b565343b1ddea450ef9582f079d3b1e0489fd",
     "fedora/stage-aic8800.py": "c3381b3bd7b7ca8e455a1f5ab39a889c1000171e3612d5c160312018cb1777c1",
 }
