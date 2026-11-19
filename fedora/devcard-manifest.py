@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """The build manifest of a Cubie A7A dev card, and its exact verify.
 
-mkdevcard.sh writes `devcard-manifest.json` next to the image after the build;
-verify-devcard.sh recomputes every value in it from the image and requires
-exact equality. Neither side interprets formats beyond hashing the bytes it is
+mkdevcard.sh writes `devcard-manifest.json` next to the image after the build.
+verify-devcard.sh recomputes the image measurements and requires exact equality.
+The profile and RPM inputs are build records, not independently recovered from
+the image. Neither side interprets formats beyond hashing the bytes it is
 told to: the GPT comes from ``sfdisk --json``, each partition's bytes are
 hashed by offset, ESP entries are read with mtools, and the initramfs files
 are dumped per path with debugfs. Whether what was built is correct is proven
@@ -19,11 +20,11 @@ Commands:
       Write MANIFEST for the built image IMG: the sfdisk GPT, the sha256 of
       every partition's bytes and of the firmware gap (LBA 256 to the first
       partition), the whole-image sha256, the ESP files (from DIR or FILE),
-      the initramfs files under ROOT/boot, the DTB stamps, and board RPMs (NEVRA, %{ARCH}, sha256) using the
-       JSON records retained from RPM selection, plus the requested build
-       profile. IMG and ROOT are only read.
+      the initramfs files under ROOT/boot and the DTB stamps. Record the requested
+      build profile and the board RPM inputs (NEVRA, %{ARCH}, sha256) from the
+      retained RPM selection. IMG and ROOT are only read.
   verify IMG MANIFEST
-      Load MANIFEST, check its schema, and recompute every value from IMG:
+      Load MANIFEST, check its schema, and recompute the measurements from IMG:
       the GPT, each partition's and the gap's sha256, the whole image, the
       ESP entries via mtools, and the initramfs files via debugfs per path.
       Require exact equality; print and exit on the first named mismatch or a
@@ -431,8 +432,8 @@ def verify_manifest(img, manifest):
             raise ManifestError(f"{mpath}: missing initramfs")
         _compare("initramfs", exp_initramfs, _verify_initramfs(root_file, data, tmp))
 
-    # RPM files and DTB stamps are read off the image's tree
-    # only through the digests already recorded: nothing more is recomputed.
+    # The profile and RPM inputs are build records; DTB stamps are not
+    # separately re-read here. The image and partition hashes cover the bytes.
     return data
 
 

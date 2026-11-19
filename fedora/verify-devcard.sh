@@ -16,7 +16,8 @@
 # The manifest holds each value mkdevcard.sh recorded from the build -- the GPT,
 # the sha256 of every partition's bytes and of the firmware gap, the whole
 # image, the ESP entries (via mtools) and the initramfs (via debugfs per path) --
-# and every one is recomputed here and required to match exactly. The first
+# these image measurements are recomputed here and required to match exactly.
+# The requested profile and RPM inputs are build records. The first
 # mismatch is named. No CPIO, zstd, systemd, ext4-walk or FAT-listing logic:
 # verify interprets no format beyond hashing the bytes it is told to.
 set -euo pipefail
