@@ -63,6 +63,8 @@ def sha256(path):
 
 
 def _cpio(tree, out_img):
+    import compression.zstd as zstd
+
     entries = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*"))
     res = subprocess.run(
         ["cpio", "-o", "-H", "newc", "--quiet"],
@@ -71,7 +73,7 @@ def _cpio(tree, out_img):
         capture_output=True,
         check=True,
     )
-    out_img.write_bytes(res.stdout)
+    out_img.write_bytes(zstd.compress(res.stdout))
 
 
 def make_image(root, overlay_repart_initramfs=False):
@@ -490,7 +492,9 @@ def test_image_firmware_truncation_and_list_refusal():
             capture_output=True,
             check=True,
         ).stdout
-        rd_img.write_bytes(cpio_out)
+        import compression.zstd as zstd
+
+        rd_img.write_bytes(zstd.compress(cpio_out))
 
         inject_ls = work / "inject-lsinitrd.log"
         ls_wrap = work / "bin-ls/lsinitrd"

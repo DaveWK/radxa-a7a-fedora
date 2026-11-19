@@ -45,18 +45,14 @@ Commands:
 
 import argparse
 import base64
-import bz2
 import errno
 import fnmatch
-import gzip
 import hashlib
 import importlib
 import json
-import lzma
 import os
 import re
 import shlex
-import shutil
 import stat
 import subprocess
 import sys
@@ -1013,6 +1009,7 @@ def repart_root_ok(root):
 LSINITRD_RULE = "=" * 72
 LS_ROW_RE = re.compile(r"^([dlcbps-])[rwxsStT-]{9}[.+@]?\s")
 CPIO_NEWC_MAGICS = (b"070701", b"070702")
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
 def _norm_archive_path(name):
@@ -1022,49 +1019,56 @@ def _norm_archive_path(name):
     return rel if rel else "."
 
 
-def _decompress_initramfs_segment(buf):
-    """Decompress a compressed initramfs segment, failing closed on truncation/error."""
-    if buf.startswith(b"\x1f\x8b"):
+def _decompress_zstd_members(data, start_pos):
+    """Decompress one or more zstd frames starting at START_POS, member by member.
+
+    Our build's dracut configuration uses Fedora's default compressor (zstd:
+    dracut-cubie-a7a.conf and /usr/lib/dracut/dracut.conf.d/01-dist.conf leave
+    compress unset, /usr/bin/dracut selects $DRACUT_COMPRESS_ZSTD first, and
+    the dracut RPM requires zstd). Any other compressor, truncated frame,
+    skippable frame or trailing bytes after the last frame is refused.
+    """
+    try:
+        zstd = importlib.import_module("compression.zstd")
+    except ImportError as exc:
+        raise PolicyError(
+            f"compression.zstd is unavailable to verify zstd initramfs: {exc}"
+        ) from exc
+    view = memoryview(data)
+    pos = start_pos
+    length = len(data)
+    if pos >= length:
+        raise PolicyError("missing zstd initramfs payload")
+    chunks = []
+    members = 0
+    while pos < length:
+        if bytes(view[pos : pos + 4]) != ZSTD_MAGIC:
+            raise PolicyError(
+                f"refused non-zstd or trailing initramfs bytes at offset {pos}: "
+                f"{bytes(view[pos : pos + 8])!r}"
+            )
+        dec = zstd.ZstdDecompressor()
         try:
-            return gzip.decompress(buf)
-        except OSError as exc:
-            raise PolicyError(f"truncated or corrupt gzip initramfs: {exc}") from exc
-    if buf.startswith(b"\xfd7zXZ\x00"):
-        try:
-            return lzma.decompress(buf)
-        except lzma.LZMAError as exc:
-            raise PolicyError(f"truncated or corrupt xz initramfs: {exc}") from exc
-    if buf.startswith(b"BZh"):
-        try:
-            return bz2.decompress(buf)
-        except OSError as exc:
-            raise PolicyError(f"truncated or corrupt bzip2 initramfs: {exc}") from exc
-    if buf.startswith(b"\x28\xb5\x2f\xfd"):
-        try:
-            zstd = importlib.import_module("compression.zstd")
-            return zstd.decompress(buf)
-        except ImportError:
-            pass
+            out = dec.decompress(view[pos:])
         except Exception as exc:
-            raise PolicyError(f"truncated or corrupt zstd initramfs: {exc}") from exc
-        if not shutil.which("zstd"):
-            raise PolicyError("zstd is unavailable to verify zstd initramfs")
-        res = subprocess.run(["zstd", "-qdc"], input=buf, capture_output=True)
-        if res.returncode != 0 or res.stderr.strip():
             raise PolicyError(
-                f"truncated or corrupt zstd initramfs: {res.stderr.decode(errors='replace').strip()}"
-            )
-        return res.stdout
-    if buf.startswith((b"\x04\x22\x4d\x18", b"\x02\x21\x4c\x18")):
-        if not shutil.which("lz4"):
-            raise PolicyError("lz4 is unavailable to verify lz4 initramfs")
-        res = subprocess.run(["lz4", "-qdc"], input=buf, capture_output=True)
-        if res.returncode != 0 or res.stderr.strip():
+                f"truncated or corrupt zstd initramfs frame {members + 1} at offset {pos}: {exc}"
+            ) from exc
+        if not dec.eof:
             raise PolicyError(
-                f"truncated or corrupt lz4 initramfs: {res.stderr.decode(errors='replace').strip()}"
+                f"truncated zstd initramfs frame {members + 1} at offset {pos}: missing end-of-frame"
             )
-        return res.stdout
-    raise PolicyError(f"unrecognized initramfs segment magic {buf[:8]!r}")
+        consumed = (length - pos) - len(dec.unused_data)
+        if consumed <= 0:
+            raise PolicyError(
+                f"zstd initramfs frame {members + 1} at offset {pos} consumed zero bytes"
+            )
+        chunks.append(out)
+        pos += consumed
+        members += 1
+    if members == 0 or pos != length:
+        raise PolicyError("incomplete zstd initramfs consumption")
+    return b"".join(chunks)
 
 
 def _parse_cpio_one(data, offset):
@@ -1089,18 +1093,19 @@ def _parse_cpio_one(data, offset):
         if namesize < 1 or pos + namesize > length:
             raise PolicyError("truncated cpio entry name before TRAILER!!!")
         raw_name = data[pos : pos + namesize]
-        if not raw_name.endswith(b"\x00"):
+        nul_idx = raw_name.find(b"\x00")
+        if nul_idx < 0 or not raw_name.endswith(b"\x00"):
             raise PolicyError("unterminated cpio entry name")
-        name = os.fsdecode(raw_name[:-1])
-        pos += namesize
-        if pos % 4:
-            pos += 4 - (pos % 4)
+        if any(byte != 0 for byte in raw_name[nul_idx:]):
+            raise PolicyError("non-NUL byte after NUL terminator in cpio entry name")
+        if nul_idx == 0:
+            raise PolicyError("empty cpio entry name")
+        name = os.fsdecode(raw_name[:nul_idx])
+        pos += namesize + (-(110 + namesize)) % 4
         if pos + filesize > length:
             raise PolicyError(f"truncated cpio payload for {name!r}")
         payload = data[pos : pos + filesize]
-        pos += filesize
-        if pos % 4:
-            pos += 4 - (pos % 4)
+        pos += filesize + (-filesize) % 4
         if name == "TRAILER!!!":
             return entries, pos
         rel = _norm_archive_path(name)
@@ -1134,10 +1139,13 @@ def parse_cpio_stream(data):
 
 
 def parse_cpio_initramfs(archive_path):
-    """Independently parse an initramfs image (early uncompressed + compressed cpio).
+    """Independently parse our build's initramfs (optional early cpio + zstd cpio).
 
-    Every cpio segment must terminate cleanly at TRAILER!!! and every compressed
-    segment must decompress cleanly with zero unparsed trailing bytes.
+    Leading uncompressed early-CPIO segments (if present) must each end cleanly
+    at TRAILER!!! with only NUL alignment bytes before the zstd payload. The
+    main payload must consist solely of one or more complete zstd frames
+    consuming the input to exact EOF, and its decompressed cpio stream(s) must
+    each terminate cleanly at TRAILER!!!.
     """
     path = Path(archive_path)
     try:
@@ -1153,14 +1161,16 @@ def parse_cpio_initramfs(archive_path):
         while pos < length and data[pos] == 0:
             pos += 1
         if pos >= length:
-            break
+            raise PolicyError(
+                f"refused uncompressed-only initramfs {path} (expected zstd main payload)"
+            )
         if data[pos : pos + 6] in CPIO_NEWC_MAGICS:
             part, pos = _parse_cpio_one(data, pos)
             entries.extend(part)
-        else:
-            decompressed = _decompress_initramfs_segment(data[pos:])
-            entries.extend(parse_cpio_stream(decompressed))
-            pos = length
+            continue
+        break
+    decompressed = _decompress_zstd_members(data, pos)
+    entries.extend(parse_cpio_stream(decompressed))
     if not entries:
         raise PolicyError(f"initramfs {path} contains no entries")
     return entries

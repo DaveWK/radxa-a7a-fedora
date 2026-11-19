@@ -676,7 +676,7 @@ def repart_absent_passes():
         assert ok, problems
 
 
-def _build_cpio_initramfs(tree, out_img):
+def _raw_cpio(tree):
     entries = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*"))
     res = subprocess.run(
         ["cpio", "-o", "-H", "newc", "--quiet"],
@@ -685,7 +685,13 @@ def _build_cpio_initramfs(tree, out_img):
         capture_output=True,
         check=True,
     )
-    out_img.write_bytes(res.stdout)
+    return res.stdout
+
+
+def _build_cpio_initramfs(tree, out_img):
+    import compression.zstd as zstd
+
+    out_img.write_bytes(zstd.compress(_raw_cpio(tree)))
 
 
 def repart_pinned_refusals():
@@ -1003,27 +1009,100 @@ def repart_silent_truncated_listing():
             not ok
         ), f"silent truncated listing (with forged closing rule) passed: {problems}"
 
-        # Case 3: valid two-part initramfs (early cpio + gzip/xz/zstd main cpio) passes.
-        early = work / "early"
-        write(early / "early_cpio", "1\n")
-        early_img = work / "early.cpio"
-        _build_cpio_initramfs(early, early_img)
-        main_tree = work / "main"
-        build_repart_root(main_tree)
-        main_cpio = work / "main.cpio"
-        _build_cpio_initramfs(main_tree, main_cpio)
-        raw_main = main_cpio.read_bytes()
+        # Case 3: valid two-part initramfs (early cpio + zstd main cpio) and
+        # multi-frame zstd pass.
+        import bz2
+        import compression.zstd as zstd
         import gzip
         import lzma
 
-        for name, compressed in (
+        early = work / "early"
+        write(early / "early_cpio", "1\n")
+        raw_early = _raw_cpio(early)
+        main_tree = work / "main"
+        build_repart_root(main_tree)
+        raw_main = _raw_cpio(main_tree)
+        zstd_main = zstd.compress(raw_main)
+
+        combo = work / "combo-zstd.img"
+        combo.write_bytes(raw_early + zstd_main)
+        ok, problems = policy.repart_initramfs_ok(combo)
+        assert ok, ("early+zstd", problems)
+
+        multi = work / "multi-zstd.img"
+        multi.write_bytes(zstd.compress(raw_main[:64]) + zstd.compress(raw_main[64:]))
+        ok, problems = policy.repart_initramfs_ok(multi)
+        assert ok, ("multi-zstd", problems)
+
+        # Case 4 (B2): valid zstd frame followed by truncated frame, garbage or trailing NUL is refused.
+        for label, bad_bytes in (
+            ("zstd+trunc", zstd_main + zstd_main[:10]),
+            ("zstd+garbage", zstd_main + b"TRAILING_GARBAGE"),
+            ("zstd+nul", zstd_main + b"\x00"),
+            ("early+zstd+garbage", raw_early + zstd_main + b"JUNK"),
+        ):
+            bad_img = work / f"{label}.img"
+            bad_img.write_bytes(bad_bytes)
+            try:
+                policy.parse_cpio_initramfs(bad_img)
+                raise AssertionError(f"{label} must be refused")
+            except policy.PolicyError:
+                pass
+
+        # Case 5 (B2 + 4b): non-zstd compressors and uncompressed-only cpio are refused.
+        for label, other_bytes in (
             ("gzip", gzip.compress(raw_main)),
             ("xz", lzma.compress(raw_main)),
+            ("xz+garbage", lzma.compress(raw_main) + b"TRAILING_GARBAGE"),
+            ("bzip2", bz2.compress(raw_main)),
+            ("bzip2+garbage", bz2.compress(raw_main) + b"TRAILING_GARBAGE"),
+            ("lz4", b"\x04\x22\x4d\x18" + b"\x00" * 16),
+            ("lzo", b"\x89LZO\x00\x0d\x0a\x1a\x0a" + b"\x00" * 16),
+            ("lzma-legacy", b"\x5d\x00\x00\x80\x00" + b"\x00" * 16),
+            ("uncompressed-only", raw_main),
         ):
-            combo = work / f"combo-{name}.img"
-            combo.write_bytes(early_img.read_bytes() + compressed)
-            ok, problems = policy.repart_initramfs_ok(combo)
-            assert ok, (name, problems)
+            other_img = work / f"other-{label}.img"
+            other_img.write_bytes(other_bytes)
+            try:
+                policy.parse_cpio_initramfs(other_img)
+                raise AssertionError(f"non-zstd compressor {label} must be refused")
+            except policy.PolicyError:
+                pass
+
+        # Case 6 (4b): padded newc names (extra trailing NULs inside namesize, 4-byte aligned)
+        # parse cleanly and match lsinitrd; non-NUL after NUL is refused.
+        def newc_rec(raw_name, payload=b"", mode=0o100644):
+            hdr = (
+                f"070701{1:08x}{mode:08x}{0:08x}{0:08x}{1:08x}{0:08x}"
+                f"{len(payload):08x}{0:08x}{0:08x}{0:08x}{0:08x}"
+                f"{len(raw_name):08x}{0:08x}"
+            ).encode("ascii")
+            rec = hdr + raw_name
+            rec += b"\x00" * ((-len(rec)) % 4)
+            rec += payload
+            rec += b"\x00" * ((-len(rec)) % 4)
+            return rec
+
+        padded_cpio = newc_rec(b"etc/hello.txt\x00\x00\x00", b"hi\n") + newc_rec(
+            b"TRAILER!!!\x00", b"", mode=0
+        )
+        padded_img = work / "padded-name.img"
+        padded_img.write_bytes(zstd.compress(padded_cpio))
+        parsed = policy.parse_cpio_initramfs(padded_img)
+        assert parsed == [("file", "etc/hello.txt", 3)], parsed
+        all_rows, _ = policy.inspect_initramfs(padded_img)
+        assert [r[1] for r in all_rows] == ["etc/hello.txt"], all_rows
+
+        corrupt_cpio = newc_rec(b"etc/a\x00junk\x00", b"hi\n") + newc_rec(
+            b"TRAILER!!!\x00", b"", mode=0
+        )
+        corrupt_img = work / "corrupt-name.img"
+        corrupt_img.write_bytes(zstd.compress(corrupt_cpio))
+        try:
+            policy.parse_cpio_initramfs(corrupt_img)
+            raise AssertionError("embedded non-NUL after NUL in newc name must fail")
+        except policy.PolicyError:
+            pass
 
 
 def initramfs_check_truncation_cases():
