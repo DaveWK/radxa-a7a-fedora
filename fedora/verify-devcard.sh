@@ -273,6 +273,39 @@ check "file capabilities in ext4 are version 2 (no namespace rootid)" bash -c "d
 check "SELinux labels in ext4 match target policy" "$TOP/fedora/run-build-ns.sh" user python3 -I "$TOP/fedora/selinux-label.py" --verify "$ROOT" "$W/root.img" "$W/selinux-verify"
 check "no first-boot relabel required (all image labels verified)" test ! -e "$ROOT/.autorelabel"
 check "machine-id empty (first boot)" test ! -s "$ROOT/etc/machine-id"
+# systemd-repart discards the unpartitioned gap in front of the first
+# partition whenever it changes the partition table (--discard=yes is its
+# default), and that gap holds the boot firmware. Every repart unit in the
+# image must therefore run its own command line plus --discard=no
+# (mkdevcard.sh writes the drop-ins); an image with a repart.d configuration
+# and no such setting loses its firmware on the first rw boot from a native
+# eMMC or SD slot.
+repart_no_discard() { # UNIT: its drop-in is the unit's ExecStart plus --discard=no, and nothing else sets ExecStart
+    local u=$1 stock others dir=$ROOT/etc/systemd/system/$1.d
+    stock=$(sed -n 's/^ExecStart=//p' "$ROOT/usr/lib/systemd/system/$u")
+    [ -n "$stock" ] && [ "$(wc -l <<<"$stock")" = 1 ] || return 1
+    [ "$(grep -v '^#' "$dir/10-cubie-a7a-no-discard.conf" | grep -v '^$')" = "[Service]
+ExecStart=
+ExecStart=$stock --discard=no" ] || return 1
+    # no other drop-in sets ExecStart again, and no copy in /etc replaces the unit
+    others=$(grep -lsE '^ExecStart' "$dir"/*.conf "$ROOT/usr/lib/systemd/system/$u.d"/*.conf | grep -v '/10-cubie-a7a-no-discard\.conf$')
+    [ -z "$others" ] || return 1
+    [ ! -f "$ROOT/etc/systemd/system/$u" ] || [ -L "$ROOT/etc/systemd/system/$u" ]
+}
+initramfs_repart_no_discard() { # an initramfs that carries systemd-repart carries the drop-in too
+    local f
+    for f in "$W"/initramfs-*.txt; do
+        ! grep -q 'systemd-repart' "$f" || grep -q 'systemd-repart\.service\.d/10-cubie-a7a-no-discard\.conf' "$f" || return 1
+    done
+}
+for u in systemd-repart.service systemd-repart@.service; do
+    if [ -f "$ROOT/usr/lib/systemd/system/$u" ]; then
+        check "$u runs with --discard=no (the unpartitioned gap holds the boot firmware)" repart_no_discard "$u"
+    elif find "$ROOT/etc/repart.d" "$ROOT/usr/lib/repart.d" "$ROOT/usr/local/lib/repart.d" -name '*.conf' 2>/dev/null | grep -q . && [ "$u" = systemd-repart.service ]; then
+        bad "repart.d configuration without a $u to carry --discard=no"
+    fi
+done
+check "initramfs: no systemd-repart, or one with the --discard=no drop-in" initramfs_repart_no_discard
 if [ "$GROW_ROOT" = yes ]; then
     check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
 else

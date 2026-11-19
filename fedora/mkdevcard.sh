@@ -17,7 +17,9 @@
 #   16 MiB      GPT 1 "EFI"  FAT32 ESP, 512 MiB (shim + grub, Fedora layout)
 #   528 MiB     GPT 2 "root" ext4 "Fedora<release>-root" (type root-arm64), grown to
 #                       the card on first boot by systemd-repart + growfs
-#                       (GROW_ROOT=no: never grown)
+#                       (GROW_ROOT=no: never grown). systemd-repart runs
+#                       with --discard=no: by default it discards the
+#                       unpartitioned gap, which holds firmware.bin
 #
 # Root filesystem: stock Fedora packages (signature-checked by dnf) plus
 # cubie-a7a-dtb and cubie-a7a-board-support, installed with dnf5 into an
@@ -381,6 +383,48 @@ EOF
 else
     systemctl --root="$ROOT" mask systemd-repart.service systemd-growfs-root.service >/dev/null
 fi
+
+# systemd-repart must not discard on this board's media. Whenever it changes
+# the partition table (growing the root on the first rw boot is such a
+# change) it also issues BLKDISCARD on the unpartitioned space between the
+# first usable LBA and the first partition ("gap at beginning of disk";
+# --discard=yes is its default). That gap holds the boot firmware
+# (firmware.bin at LBA 256, up to 16 MiB): an eMMC or SD slot honours the
+# discard, the firmware reads back as zeros and the board no longer boots.
+# A card whose first rw boot ran in a USB reader that ignores discards
+# survives, which hides the problem. --discard= is repart's only switch for
+# this (no kernel command line option, credential or configuration file
+# sets it), so the boot-time unit and the Varlink service each get a drop-in
+# that repeats the unit's own ExecStart with --discard=no (systemd 262:
+# "systemd-repart --dry-run=no" and "systemd-repart"). Written whatever
+# GROW_ROOT says: a masked unit ignores the drop-in, and it is in place if
+# the mask is ever lifted. verify-devcard.sh checks the drop-ins against the
+# units.
+for u in systemd-repart.service systemd-repart@.service; do
+    unit=$ROOT/usr/lib/systemd/system/$u
+    if [ ! -f "$unit" ]; then
+        [ "$u" = systemd-repart.service ] && [ "$GROW_ROOT" = yes ] &&
+            { echo "mkdevcard: GROW_ROOT=yes but the image has no $u" >&2; exit 1; }
+        continue
+    fi
+    stock=$(sed -n 's/^ExecStart=//p' "$unit")
+    case $stock in
+    *discard* | *$'\n'*) stock= ;;
+    systemd-repart | "systemd-repart "*) ;;
+    *) stock= ;;
+    esac
+    [ -n "$stock" ] ||
+        { echo "mkdevcard: $u: ExecStart is not one plain systemd-repart command; adapt the no-discard drop-in" >&2; exit 1; }
+    mkdir -p "$ROOT/etc/systemd/system/$u.d"
+    cat >"$ROOT/etc/systemd/system/$u.d/10-cubie-a7a-no-discard.conf" <<EOF
+# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of
+# the first partition holds the boot firmware, so systemd-repart must not
+# discard it. The unit's own command line, plus --discard=no.
+[Service]
+ExecStart=
+ExecStart=$stock --discard=no
+EOF
+done
 
 # GRUB: BLS entries from kernel-install; grub.cfg as Fedora writes it, minus
 # what grub2-mkconfig would probe on the build host.
