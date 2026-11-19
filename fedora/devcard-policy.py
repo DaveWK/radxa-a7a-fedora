@@ -86,9 +86,10 @@ SYSTEMD_UNIT_DIRS = (
     "lib/systemd/system",
 )
 DISCARD_FLAG = "--discard=no"
+REPART_NAME = r"systemd-repart(?:-[A-Za-z0-9_:.\\-]+)?(?:@[A-Za-z0-9_:.\\-]*)?\.service"
 INITRAMFS_REPART_RE = re.compile(
     r"^(?:etc|run|usr/local/lib|usr/lib|lib)/systemd/system/"
-    r"(?:systemd-repart(?:@)?\.service|(?:systemd-repart(?:@)?\.service|service)\.d/[^/]+\.conf)$"
+    rf"(?:(?:[^/]+\.(?:wants|requires)/)?{REPART_NAME}|(?:{REPART_NAME}|systemd-(?:repart-)?\.service|service)\.d/[^/]+\.conf)$"
     r"|^(?:etc|usr/lib|usr/local/lib)/repart\.d/[^/]+\.conf$"
 )
 # rpm's PGPHASHALGO values (rpm/rpmpgp.h).
@@ -685,55 +686,66 @@ def _active_unit_dirs(root):
     return dirs
 
 
-def _unit_files(root, unit):
-    """Base unit file and drop-ins in systemd precedence order.
+def _repart_units(root):
+    names = set(REPART_UNITS)
+    for directory in _active_unit_dirs(root):
+        path = root / directory
+        for pattern in (
+            "systemd-repart*",
+            "*.wants/systemd-repart*",
+            "*.requires/systemd-repart*",
+        ):
+            for candidate in path.glob(pattern):
+                name = candidate.name.removesuffix(".d")
+                if re.fullmatch(REPART_NAME, name):
+                    names.add(name)
+    return sorted(names)
 
-    Returns None when UNIT is masked (/dev/null), [] when absent, or
-    [base, drop-in, ...] where:
-      - base is the highest-precedence unit file (etc > run > usr/local > usr/lib)
-      - drop-ins from service.d/*.conf then <unit>.d/*.conf are deduplicated
-        by filename (higher-precedence directory wins, /dev/null masks that
-        drop-in filename) and sorted lexicographically by filename.
+
+def _unit_files(root, unit):
+    """Apply systemd.unit(5): instance before template, progressively shorter
+    dashed prefixes, then type-wide defaults. Resolve each basename once;
+    apply the winners in global filename order, not per-directory order.
     """
     root = Path(root)
     unit_dirs = _active_unit_dirs(root)
+    bases = [unit]
+    if "@" in unit and not unit.endswith("@.service"):
+        bases.append(unit.split("@", 1)[0] + "@.service")
     base = None
-    for directory in unit_dirs:
-        candidate = root / directory / unit
-        if candidate.is_symlink():
+    for name in bases:
+        for directory in unit_dirs:
+            candidate = root / directory / name
             if _masked(candidate):
                 return None
-            resolved = _resolve_within(root, candidate)
-            if resolved is None:
-                return [candidate]  # unreadable/escaping -> fail closed
-            base = resolved
-            break
-        if candidate.is_file():
-            base = candidate
+            if candidate.is_file() or candidate.is_symlink():
+                base = _resolve_within(root, candidate)
+                if base is None:
+                    raise PolicyError(f"cannot resolve unit {candidate}")
+                break
+        if base is not None:
             break
     if base is None:
         return []
-    ordered_dropins = []
-    for dropin_name in ("service.d", f"{unit}.d"):
-        by_name = {}
+    prefix = unit.removesuffix(".service").split("@", 1)[0]
+    scopes = list(bases)
+    while "-" in prefix:
+        prefix = prefix.rsplit("-", 1)[0]
+        scopes.append(prefix + "-.service")
+    scopes.append("service")
+    by_name = {}
+    for scope in scopes:
         for directory in unit_dirs:
-            dpath = root / directory / dropin_name
-            if not dpath.is_dir():
-                continue
-            for conf in sorted(dpath.glob("*.conf")):
-                if conf.name in by_name:
-                    continue  # higher-precedence directory already won
-                if conf.is_symlink():
+            for conf in (root / directory / (scope + ".d")).glob("*.conf"):
+                if conf.name not in by_name:
                     if _masked(conf):
-                        by_name[conf.name] = None  # masked drop-in
+                        by_name[conf.name] = None
                     else:
-                        by_name[conf.name] = _resolve_within(root, conf) or conf
-                elif conf.is_file():
-                    by_name[conf.name] = conf
-        for name in sorted(by_name):
-            if by_name[name] is not None:
-                ordered_dropins.append(by_name[name])
-    return [base] + ordered_dropins
+                        resolved = _resolve_within(root, conf)
+                        if resolved is None:
+                            raise PolicyError(f"cannot resolve drop-in {conf}")
+                        by_name[conf.name] = resolved
+    return [base] + [by_name[n] for n in sorted(by_name) if by_name[n] is not None]
 
 
 def _effective_exec_start(files):
@@ -790,18 +802,13 @@ def repart_root_ok(root):
     """Every effective systemd-repart invocation carries --discard=no."""
     root = Path(root)
     problems = []
-    unit_dirs = _active_unit_dirs(root)
     repart_service_seen = False
-    for unit in REPART_UNITS:
-        present = any(
-            (root / directory / unit).exists() or (root / directory / unit).is_symlink()
-            for directory in unit_dirs
-        )
-        if not present:
+    for unit in _repart_units(root):
+        files = _unit_files(root, unit)
+        if files == []:
             continue
         if unit == "systemd-repart.service":
             repart_service_seen = True
-        files = _unit_files(root, unit)
         if files is None:
             continue  # masked: cannot run
         commands = _effective_exec_start(files)
@@ -822,12 +829,14 @@ def repart_root_ok(root):
 def _parse_lsinitrd_listing(listing):
     """Return list of (kind, relpath, size_or_target) for repart-related entries."""
     entries = []
+    recognized = 0
     for line in listing.splitlines():
         if not line or line[0] not in ("-", "l"):
             continue
         parts = line.split(None, 8)
-        if len(parts) < 9:
+        if len(parts) < 9 or not parts[4].isdigit():
             continue
+        recognized += 1
         mode, size_str, rest = parts[0], parts[4], parts[8]
         if mode.startswith("l"):
             if " -> " not in rest:
@@ -845,7 +854,7 @@ def _parse_lsinitrd_listing(listing):
             if INITRAMFS_REPART_RE.match(rel):
                 size = int(size_str) if size_str.isdigit() else 0
                 entries.append(("file", rel, size))
-    return entries
+    return recognized, entries
 
 
 def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
@@ -855,16 +864,26 @@ def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
     """
     cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
     listing = subprocess.run(cmd + [str(img)], capture_output=True, text=True)
-    if listing.returncode != 0 or "========" not in listing.stdout:
+    if (
+        listing.returncode != 0
+        or listing.stderr.strip()
+        or "========" not in listing.stdout
+    ):
         msg = listing.stderr.strip() or listing.stdout.strip() or "lsinitrd failed"
         return False, [f"cannot inspect initramfs {img}: {msg}"]
-    entries = _parse_lsinitrd_listing(listing.stdout)
+    recognized, entries = _parse_lsinitrd_listing(listing.stdout)
+    if not recognized:
+        return False, [f"cannot inspect initramfs {img}: no recognized file rows"]
     if not entries:
         return True, []
     with tempfile.TemporaryDirectory(prefix="a7a-initramfs-repart-") as td:
         tree = Path(td)
         for kind, rel, meta in entries:
+            if ".." in Path(rel).parts:
+                return False, [f"invalid initramfs path: {rel}"]
             dest = tree / rel
+            if dest.is_symlink() or dest.exists():
+                return False, [f"duplicate initramfs path: {rel}"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             if kind == "symlink":
                 if dest.exists() or dest.is_symlink():
@@ -874,12 +893,16 @@ def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
                 extracted = subprocess.run(
                     cmd + ["-f", rel, str(img)], capture_output=True
                 )
-                if extracted.returncode != 0 or (meta > 0 and not extracted.stdout):
+                if (
+                    extracted.returncode != 0
+                    or extracted.stderr.strip()
+                    or len(extracted.stdout) != meta
+                ):
                     return False, [f"cannot extract {rel} from {img}"]
                 dest.write_bytes(extracted.stdout)
         if forbid_repart:
             problems = []
-            for unit in REPART_UNITS:
+            for unit in _repart_units(tree):
                 files = _unit_files(tree, unit)
                 if files:
                     problems.append(f"initramfs contains active {unit}")

@@ -680,6 +680,46 @@ def _build_cpio_initramfs(tree, out_img):
     out_img.write_bytes(res.stdout)
 
 
+def repart_precedence_cases():
+    for scope in ("service.d", "systemd-.service.d", "systemd-repart@demo.service.d"):
+        with fixture() as tree:
+            build_repart_root(tree)
+            if "@" in scope:
+                write(
+                    tree / "usr/lib/systemd/system/systemd-repart@.service", GOOD_DROPIN
+                )
+            write(
+                tree / "etc/systemd/system" / scope / "90-reset.conf",
+                "[Service]\nExecStart=\nExecStart=systemd-repart\n",
+            )
+            ok, _ = policy.repart_root_ok(tree)
+            assert not ok, scope
+            img = tree / "test.img"
+            _build_cpio_initramfs(tree, img)
+            ok, problems = policy.repart_initramfs_ok(img)
+            assert not ok and any("--discard=no" in p for p in problems), (
+                scope,
+                problems,
+            )
+
+
+def repart_incomplete_listing():
+    with fixture() as work:
+        fake = work / "listing"
+        for body in ("", "echo 'cpio: incomplete archive' >&2"):
+            fake.write_text("#!/bin/sh\necho ========\n" + body + "\n")
+            fake.chmod(0o755)
+            ok, _ = policy.repart_initramfs_ok(work / "fixture.img", [str(fake)])
+            assert not ok, "an incomplete listing cannot certify absence"
+        tree = work / "tree"
+        build_repart_root(tree)
+        img = work / "truncated.img"
+        _build_cpio_initramfs(tree, img)
+        img.write_bytes(img.read_bytes()[:256])
+        ok, _ = policy.repart_initramfs_ok(img)
+        assert not ok, "lsinitrd can exit successfully despite cpio listing errors"
+
+
 def repart_initramfs_cases():
     assert shutil.which("lsinitrd") and shutil.which("cpio"), "need lsinitrd and cpio"
     with fixture() as tmp:
@@ -778,6 +818,11 @@ def main():
     case("shadow: root, others, empty", shadow_cases)
     case("passwd: sole root policy", passwd_sole_root_cases)
     case("passwd: malformed uid/gid fails", passwd_malformed_ids_fail)
+    case(
+        "repart: effective generic, dash and instance overrides",
+        repart_precedence_cases,
+    )
+    case("repart: incomplete listing fails closed", repart_incomplete_listing)
     case("repart: good root", repart_good_root)
     case("repart: indented override drops flag", repart_indented_override_drops_flag)
     case(
