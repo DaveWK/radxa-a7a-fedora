@@ -1,0 +1,16 @@
+efi-filesystem-0:6-9.fc45.noarch 5e8d7812a2c42ce61a87e1d8e30398e53f6a48be3f1b6d95e3c4b19e6f6d182a
+/boot/efi/EFI
+/boot/efi/EFI/BOOT
+/boot/efi/EFI/fedora
+
+grub2-efi-aa64-1:2.12-83.fc45.aarch64 fa4f0655f9c22f6f647200189010fb071a37b53ecaee636313404cc594d20923
+/boot/efi/EFI/fedora/grub.cfg
+/boot/efi/EFI/fedora/grubaa64.efi
+
+shim-aa64-0:16.1-7.aarch64 33758c9391c0ea1cada0a4d2ad04ecf76506b7a820fc87d56dc7a4c75f1ca0f0
+/boot/efi/EFI/BOOT/BOOTAA64.EFI
+/boot/efi/EFI/BOOT/fbaa64.efi
+/boot/efi/EFI/fedora/BOOTAA64.CSV
+/boot/efi/EFI/fedora/mmaa64.efi
+/boot/efi/EFI/fedora/shim.efi
+/boot/efi/EFI/fedora/shimaa64.efi
