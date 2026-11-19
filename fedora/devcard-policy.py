@@ -617,6 +617,16 @@ def passwd_sole_root(text):
             r"[0-9]+", gid_field
         ):
             return False
+        # uid_t/gid_t exclude the all-ones sentinel. Bound before int() so a
+        # very long decimal field produces a policy rejection, not an exception.
+        uid_field, gid_field = (
+            value.lstrip("0") or "0" for value in (uid_field, gid_field)
+        )
+        if any(
+            len(value) > 10 or int(value) > 4294967294
+            for value in (uid_field, gid_field)
+        ):
+            return False
         uid = int(uid_field)
         if uid == 0:
             if user != "root":

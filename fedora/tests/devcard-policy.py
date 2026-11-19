@@ -500,6 +500,14 @@ def passwd_sole_root_cases():
 
 
 def passwd_malformed_ids_fail():
+    root = "root:x:0:0:root:/root:/bin/bash\n"
+    assert policy.passwd_sole_root(
+        root + "daemon:x:4294967294:4294967294::/:/bin/false\n"
+    )
+    for uid, gid in (("4294967295", "0"), ("20", "4294967295"), ("9" * 5000, "1")):
+        assert not policy.passwd_sole_root(
+            root + f"daemon:x:{uid}:{gid}::/:/bin/false\n"
+        )
     assert not policy.passwd_sole_root(
         "root:x:oops:0:root:/root:/bin/bash\n"
     ), "a malformed UID must fail, not read as 0"
