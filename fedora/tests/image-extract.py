@@ -204,24 +204,162 @@ def test_grow_root_no_catches_post_overlay_initramfs_from_img():
 
 
 def test_silent_partial_extraction():
-    with tempfile.TemporaryDirectory(prefix="a7a-extract-") as td:
+    """B3: fault wrapper matches ANY `rdump` form (074f9b6 and head) and logs injection."""
+    real_debugfs = shutil.which("debugfs")
+    assert real_debugfs, "need debugfs"
+    for mode in ("truncate", "drop"):
+        with tempfile.TemporaryDirectory(prefix="a7a-extract-") as td:
+            work = Path(td)
+            _, image, _ = make_image(work)
+            inject_log = work / "inject.log"
+            wrapper = work / "bin/debugfs"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                f"#!{sys.executable}\n"
+                "import os, shlex, subprocess, sys\n"
+                "from pathlib import Path\n"
+                f"real = {real_debugfs!r}\n"
+                f"mode = {mode!r}\n"
+                f"log_path = Path({str(inject_log)!r})\n"
+                "data = sys.stdin.buffer.read() if not sys.stdin.isatty() else None\n"
+                "res = subprocess.run([real] + sys.argv[1:], input=data, capture_output=True)\n"
+                "sys.stdout.buffer.write(res.stdout)\n"
+                "sys.stderr.buffer.write(res.stderr)\n"
+                "if res.returncode != 0:\n"
+                "    sys.exit(res.returncode)\n"
+                "cmd = None\n"
+                "args = sys.argv[1:]\n"
+                "for idx, tok in enumerate(args):\n"
+                "    if tok == '-R' and idx + 1 < len(args):\n"
+                "        cmd = args[idx + 1]\n"
+                "        break\n"
+                "if cmd and cmd.lstrip().startswith('rdump '):\n"
+                "    parts = shlex.split(cmd)\n"
+                "    dst = Path(parts[2])\n"
+                "    if mode == 'truncate':\n"
+                "        target = dst / 'etc/motd'\n"
+                "        target.write_bytes(b'')\n"
+                "    else:\n"
+                "        target = dst / 'opt/vendor/runtime.bin'\n"
+                "        target.unlink()\n"
+                "    with log_path.open('a') as fh:\n"
+                "        fh.write(f'injected:{mode}:{cmd}:{target.resolve()}\\n')\n"
+                "sys.exit(0)\n"
+            )
+            wrapper.chmod(0o755)
+            res = subprocess.run(
+                [sys.executable, "-I", str(tool), "extract-root", image, work / "out"],
+                env={**os.environ, "PATH": f"{wrapper.parent}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+            )
+            assert inject_log.is_file(), f"fault wrapper never fired for mode={mode}"
+            log_text = inject_log.read_text()
+            assert f"injected:{mode}:rdump " in log_text, log_text
+            assert res.returncode != 0, (
+                f"extract-root silently accepted {mode} fault "
+                f"(injected: {log_text.strip()})"
+            )
+
+
+def test_silent_truncated_inventory():
+    """S0-3: silently truncated debugfs `ls -l -p` (exit 0, banner-only stderr) fails."""
+    real_debugfs = shutil.which("debugfs")
+    assert real_debugfs, "need debugfs"
+    with tempfile.TemporaryDirectory(prefix="a7a-inv-") as td:
         work = Path(td)
         _, image, _ = make_image(work)
+        inject_log = work / "inject-ls.log"
         wrapper = work / "bin/debugfs"
         wrapper.parent.mkdir()
+        # Truncate root `ls -l -p <2>` after `.`, `..`, and one valid entry (`lost+found`),
+        # exit 0, normal version banner only. Matches both -R (999648a) and -f - (head).
         wrapper.write_text(
-            "#!/bin/sh\n"
-            f'"{shutil.which("debugfs")}" "$@" || exit $?\n'
-            'if [ "$2" = "rdump / ." ]; then : > etc/motd; fi\n'
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"real = {real_debugfs!r}\n"
+            f"log_path = Path({str(inject_log)!r})\n"
+            "args = sys.argv[1:]\n"
+            "stdin_bytes = sys.stdin.buffer.read() if not sys.stdin.isatty() else b''\n"
+            "res = subprocess.run([real] + args, input=stdin_bytes, capture_output=True)\n"
+            "is_root_ls = any('ls -l -p <2>' in a for a in args) or b'ls -l -p <2>' in stdin_bytes\n"
+            "if is_root_ls and res.returncode == 0:\n"
+            "    kept = []\n"
+            "    valid_rows = 0\n"
+            "    for line in res.stdout.splitlines(keepends=True):\n"
+            "        if line.startswith(b'debugfs: ls -l -p'):\n"
+            "            kept.append(line)\n"
+            "            continue\n"
+            "        if line.startswith(b'/'):\n"
+            "            kept.append(line)\n"
+            "            valid_rows += 1\n"
+            "            if valid_rows == 3:\n"
+            "                break\n"
+            "    with log_path.open('a') as fh:\n"
+            "        fh.write(f'injected:ls-trunc:rows={valid_rows}:args={args!r}\\n')\n"
+            "    sys.stdout.buffer.write(b''.join(kept))\n"
+            "    sys.stderr.buffer.write(res.stderr)\n"
+            "    sys.exit(0)\n"
+            "sys.stdout.buffer.write(res.stdout)\n"
+            "sys.stderr.buffer.write(res.stderr)\n"
+            "sys.exit(res.returncode)\n"
+        )
+        wrapper.chmod(0o755)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{wrapper.parent}:{old_path}"
+        try:
+            assert hasattr(extract, "_inventory"), "base lacks _inventory"
+            try:
+                got = extract._inventory(image)
+                raise AssertionError(
+                    f"_inventory accepted silently truncated ls -l -p: {sorted(got)}"
+                )
+            except ValueError:
+                pass
+        finally:
+            os.environ["PATH"] = old_path
+        assert (
+            inject_log.is_file()
+            and "injected:ls-trunc:rows=3" in inject_log.read_text()
+        )
+
+
+def test_truncated_sfdisk_json():
+    """S0-14: silently truncated `sfdisk -J` JSON (exit 0, no stderr) fails closed."""
+    real_sfdisk = shutil.which("sfdisk")
+    assert real_sfdisk, "need sfdisk"
+    with tempfile.TemporaryDirectory(prefix="a7a-sfdisk-") as td:
+        work = Path(td)
+        disk, _, _ = make_image(work)
+        inject_log = work / "inject-sfdisk.log"
+        wrapper = work / "bin/sfdisk"
+        wrapper.parent.mkdir()
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"real = {real_sfdisk!r}\n"
+            f"log_path = Path({str(inject_log)!r})\n"
+            "res = subprocess.run([real] + sys.argv[1:], capture_output=True)\n"
+            "lines = res.stdout.splitlines(keepends=True)\n"
+            "cut = b''.join(lines[:10])\n"
+            "with log_path.open('a') as fh:\n"
+            "    fh.write(f'injected:sfdisk-trunc:bytes={len(cut)}\\n')\n"
+            "sys.stdout.buffer.write(cut)\n"
+            "sys.exit(0)\n"
         )
         wrapper.chmod(0o755)
         res = subprocess.run(
-            [sys.executable, "-I", str(tool), "extract-root", image, work / "out"],
+            [sys.executable, "-I", str(tool), "partitions", disk],
             env={**os.environ, "PATH": f"{wrapper.parent}:{os.environ['PATH']}"},
             capture_output=True,
             text=True,
         )
-        assert res.returncode != 0 and "size" in res.stderr, res.stderr
+        assert (
+            inject_log.is_file() and "injected:sfdisk-trunc:" in inject_log.read_text()
+        )
+        assert res.returncode != 0, "truncated sfdisk JSON must fail closed"
 
 
 def test_verifier_rejects_damaged_inode():
@@ -267,7 +405,16 @@ def test_verifier_rejects_damaged_inode():
 
 def main():
     case(
-        "extract-root: reject a silent short extraction", test_silent_partial_extraction
+        "extract-root: reject a silent short extraction (B3)",
+        test_silent_partial_extraction,
+    )
+    case(
+        "extract-root: reject silently truncated debugfs inventory (S0-3)",
+        test_silent_truncated_inventory,
+    )
+    case(
+        "partitions: reject silently truncated sfdisk JSON (S0-14)",
+        test_truncated_sfdisk_json,
     )
     case(
         "verify-devcard rejects a corrupted inode before querying RPM",
