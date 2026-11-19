@@ -11,6 +11,7 @@ import ast
 from collections import Counter, defaultdict
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+import hashlib
 import io
 from itertools import product
 from pathlib import Path, PurePosixPath
@@ -52,9 +53,225 @@ FORWARDED = {
         ),
     )
 }
-# An unresolved target/argv must have a location, explanation and explicit samples.
-# The live scan fails on unlisted or stale overrides.
-UNRESOLVED = {}
+# Hand-written argv for the few source lines deliberately not tokenized. Bind
+# each sample to its exact logical source line, including all continuations.
+POLICY = "fedora/devcard-policy.py"
+MANIFEST = "fedora/devcard-manifest.py"
+INITRAMFS = "fedora/initramfs-policy.py"
+STAGED = "fedora/staged-root-policy.py"
+SELINUX = "fedora/selinux-label.py"
+MKDEV = "fedora/mkdevcard.sh"
+PROFILES = tuple(
+    ("--boot-modes", boot, "--grow-root", grow, "--first-boot", first)
+    for boot, grow, first in product(
+        VALUES["BOOT_MODES"], VALUES["GROW_ROOT"], VALUES["FIRST_BOOT"]
+    )
+)
+FIRMWARE = (
+    "--firmware-sha256",
+    DIGEST,
+    "--firmware-seek",
+    "256",
+    "--firmware-size",
+    "1024",
+)
+MANUAL_RECORDS = {
+    ("fedora/build-aarch64-rpms.sh", 32): (
+        "e1f97bac420a4e3888255828c3839b9366f020d41b69a80c8d85dcaa3f7dd525",
+        POLICY,
+        ("stage-srpm /stub/NOARCH_MANIFEST /stub/BUILD_SYS/sources",),
+    ),
+    ("fedora/build-rpms.sh", 37): (
+        "5a742699b2a826504b1f3fd4923d00b5a42bbc0814b809f64d6113c72a783232",
+        POLICY,
+        ("new-rpm-run /stub/BR",),
+    ),
+    ("fedora/build-rpms.sh", 163): (
+        "fb739d6c88aaffd5bd68c0f0125fb4aeda0ed207b9aae994d918dc8d304ca79f",
+        POLICY,
+        (
+            "write-rpm-manifest /stub/RUN/out /stub/RUN/rpm-checks/checked-rpms.json "
+            "--kind noarch --run-id fixture-run --expect-aarch64 --srpm /stub/fwlog.src.rpm "
+            "/stub/RUN/out/noarch/board.rpm",
+        ),
+    ),
+    (MKDEV, 187): (
+        "51b9a1bba2d0dfa75146ec58dd9ce9bfa0f199ab75da3a9ab95389bc5bea5ca6",
+        POLICY,
+        ("load-rpm-run /stub/RPM_RUN",),
+    ),
+    (MKDEV, 378): (
+        "b8b23efdca814575932844ca19f01b89af34d3f8c7d001caab628cc82dd4bb0f",
+        POLICY,
+        ("check-installed-rpms /stub/ROOT '[]'",),
+    ),
+    (MKDEV, 588): (
+        "a9f1083f6b7e7e4c3eb46e628042fa96f79183d6b198dd7be74ec19ae7b956d2",
+        POLICY,
+        ("aic-provenance /stub/ROOT --report /stub/W/aic-provenance.tsv",),
+    ),
+    (MKDEV, 597): (
+        "266d5bcd0c46572218271538bbeca6914f9dae8aacb3b252d61518c99e7ac031",
+        INITRAMFS,
+        (
+            "capture-digest /stub/ROOT /stub/W/kernel.txt /stub/W/initramfs-digests.json",
+        ),
+    ),
+    (MKDEV, 603): (
+        "40fc6e105e73522ca3f567875f6bdf6274a2a123d00838b7661cb6b7852b9971",
+        INITRAMFS,
+        ("overlay /stub/OVERLAY",),
+    ),
+    (MKDEV, 605): (
+        "42e0b7d6ddf234fbc71e925708a6dad5c712c46ed6d56cabba0975f01e00b425",
+        STAGED,
+        ("overlay /stub/OVERLAY",),
+    ),
+    (MKDEV, 614): (
+        "b00cc7922af34a2c39f78f65076ebe21af023cf1284408d53e97cc0e49bd0495",
+        POLICY,
+        (
+            "aic-overlay /stub/OVERLAY",
+            "aic-overlay /stub/OVERLAY --manifest /stub/ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest",
+        ),
+    ),
+    (MKDEV, 618): (
+        "258dcc19199c8288f7c11d2fc90f2b0ec98c4af5a33aec16fae93f650d2f5c8b",
+        POLICY,
+        ("overlay-esp /stub/OVERLAY",),
+    ),
+    (MKDEV, 630): (
+        "d869f605432e06a5386bbd8144df4a6f2c7eb4467e3341f513b24457807a5d2b",
+        POLICY,
+        ("check-installed-rpms /stub/ROOT '[]'",),
+    ),
+    (MKDEV, 634): (
+        "ef0d4ac2b7cd672aaeeb6b4d75226ae0dd439543b75d2b3c58a1389c2ea0baa0",
+        POLICY,
+        ("aic-provenance /stub/ROOT --report /stub/W/aic-provenance-final.tsv",),
+    ),
+    (MKDEV, 642): (
+        "c5d1fcee9e105649cd58f846360101a04a411095cbc3a0eb93ad656cd2934bbd",
+        INITRAMFS,
+        ("root-modules /stub/ROOT /stub/k --board /stub/boot",),
+    ),
+    (MKDEV, 669): (
+        "02d19c635041eea1a6e68f80b86a1c0d095e709784d59f0f7504235ba9a73a5a",
+        STAGED,
+        (
+            "staged /stub/ROOT /stub/expected /stub/W/kernel.txt /stub/ROOT_UUID /stub/default_args /stub/def",
+        ),
+    ),
+    (MKDEV, 707): (
+        "0d8c064385e9d93e861a5fc0ca2115cba3ea57b38a1121d40b9eba42ded15b70",
+        MANIFEST,
+        ("check-fat /stub/esp",),
+    ),
+    (MKDEV, 710): (
+        "fa105ba31e42ca14fbf83636c4bc3ff93d2519f207d3a2ae42d5884b54c37d8b",
+        MANIFEST,
+        ("esp-model /stub/ROOT/boot/efi /stub/W/esp-model.json",),
+    ),
+    (MKDEV, 719): (
+        "6fcf166f6ae41a11000308def225c970e8c5996e284ae871fda7e406b94221ce",
+        SELINUX,
+        ("/stub/ROOT /stub/rootimg /stub/W/selinux",),
+    ),
+    (MKDEV, 720): (
+        "0e47db519b97ff9c5b0b162c840458c518095bcdca7d1401b6766f2abb64ea2c",
+        SELINUX,
+        ("--verify /stub/ROOT /stub/rootimg /stub/W/selinux-verify",),
+    ),
+    (MKDEV, 723): (
+        "513c9c1bca2e1315b2bc34f839c79b7fad9b055a745443a48f899f551da9bb5c",
+        STAGED,
+        ("packed /stub/rootimg", "packed /stub/rootimg --protective"),
+    ),
+    (MKDEV, 785): (
+        "5ffbce4d8e73b0432cd3323f95dbcfd5c061b5ca370e7c4ceb9b94de4cfb9ffc",
+        MANIFEST,
+        tuple(
+            shlex.join(
+                (
+                    "write",
+                    "/stub/OUT",
+                    "/stub/ROOT",
+                    "[]",
+                    "/stub/manifest",
+                    "--esp-model",
+                    "/stub/W/esp-model.json",
+                    *profile,
+                    *firmware,
+                )
+            )
+            for profile, firmware in product(PROFILES, ((), FIRMWARE))
+        ),
+    ),
+    (MKDEV, 795): (
+        "b6b04e75a2a8195d8bb225b88bd71db35aa0e2dea687b922fe87dd0842e2bcc1",
+        MANIFEST,
+        tuple(
+            shlex.join(
+                (
+                    "seal",
+                    "/stub/OUT",
+                    "/stub/manifest",
+                    "/stub/receipt",
+                    "/stub/RPM_SNAPSHOT",
+                    "/stub/W/initramfs-digests.json",
+                    *profile,
+                    "--dram-identity",
+                    "",
+                    "--source-commit",
+                    "a" * 40,
+                    "--run-id",
+                    "fixture-run",
+                    "--started-utc",
+                    "2026-01-01T00:00:00Z",
+                    "--finished-utc",
+                    "2026-01-01T00:01:00Z",
+                    "--expect-manifest-sha256",
+                    DIGEST,
+                    "--expect-snapshot-sha256",
+                    DIGEST,
+                )
+            )
+            for profile in PROFILES
+        ),
+    ),
+}
+
+
+def reviewed_body(key):
+    path, line = key
+    if path == MKDEV and 305 < line < 672:
+        return ("STAGE1", "'")
+    if path == MKDEV and 698 < line < 724:
+        return ("STAGE2", "'")
+    return None
+
+
+UNRESOLVED = {
+    key: (
+        target,
+        tuple(tuple(shlex.split(sample)) for sample in samples),
+        (
+            f"quoted {body[0]} shell heredoc; sample checked against the parser"
+            if (body := reviewed_body(key))
+            else "substitution or quoted #; sample checked against the parser"
+        ),
+    )
+    for key, (_, target, samples) in MANUAL_RECORDS.items()
+}
+# This exact sentence inside the quoted STAGE1 text is a comment, not a call.
+HEREDOC_PROSE = {
+    (
+        MKDEV,
+        616,
+        ("STAGE1", "'"),
+        "# The ESP holds the packages' files only (devcard-policy.py esp-staged, the",
+    )
+}
 
 WORD = r"""(?:"[^"]*"|'[^']*'|[^\s();<>|&]+)"""
 COMMAND_START = re.compile(r"(?:^\s*[@+-]?|\$\(|&&|\|\||[;|]|\b(?:do|then|else)\s+)\s*")
@@ -84,23 +301,6 @@ class Call:
     note: str = ""
 
 
-def logical_lines(source):
-    """Keep the first physical line number while joining shell continuations."""
-    text = ""
-    for number, line in enumerate(source.splitlines(), 1):
-        if not text:
-            start = number
-            if line.lstrip().startswith("#"):
-                continue
-        if line.endswith("\\"):
-            text += line[:-1] + " "
-            continue
-        yield start, text + line
-        text = ""
-    if text:
-        yield start, text
-
-
 def target_for(word, source, programs):
     if word in programs:
         return word
@@ -114,21 +314,142 @@ def target_for(word, source, programs):
     return matches[0] if len(matches) == 1 else ""
 
 
-def shell_contexts(text):
+def shell_lex(text, quote=None, comments=False):
     """Quote state at each unescaped character, before shlex removes quotes."""
-    quote = None
+    contexts = {}
     escaped = False
     for position, char in enumerate(text):
         if escaped:
             escaped = False
             continue
-        yield position, quote
+        if (
+            comments
+            and char == "#"
+            and quote is None
+            and (
+                position == 0
+                or text[position - 1].isspace()
+                or text[position - 1] in STOP
+            )
+        ):
+            return contexts, quote, position
+        contexts[position] = quote
         if char == "\\" and quote != "'":
             escaped = True
         elif char == quote:
             quote = None
         elif quote is None and char in "\"'":
             quote = char
+    return contexts, quote, len(text)
+
+
+def shell_contexts(text):
+    return shell_lex(text)[0].items()
+
+
+HEREDOC_WORD = re.compile(
+    r"""(?P<tabs>-?)[ \t]*(?P<quote>['"]?)(?P<word>[A-Za-z0-9_][A-Za-z0-9_-]*)(?P=quote)(?=$|[\s;|&<>)])"""
+)
+
+
+def shell_records(path, source):
+    """Read heredoc bodies as data with exact physical delimiter matching."""
+    # Bash compares the delimiter on physical LF-delimited lines. A CR or
+    # trailing space is data, not part of an exact closing delimiter.
+    lines = source.split("\n")
+    index = 0
+    end_quote = None
+    spec_prose = False
+    while index < len(lines):
+        start = index
+        text = lines[index]
+        index += 1
+        if path.endswith(".spec"):
+            section = re.match(
+                r"^\s*%(description|changelog|files|package|prep|build|install|check"
+                r"|clean|generate_buildrequires|(?:pre|post)\w*"
+                r"|(?:transfile|file)?trigger\w*|verifyscript)\b",
+                text,
+            )
+            if section:
+                spec_prose = section[1] in {"description", "changelog", "files"}
+            if spec_prose:
+                continue
+        if end_quote is None and text.lstrip().startswith("#"):
+            continue
+        initial = end_quote
+        # In substitution-bearing text the simple quote state is not enough
+        # to decide where a shell comment begins. Keep those bytes.
+        while True:
+            contexts, end_quote, safe_end = shell_lex(
+                text, initial, comments=initial is None and "$(" not in text
+            )
+            if not (
+                text.endswith("\\")
+                and safe_end == len(text)
+                and len(text) - 1 in contexts
+                and contexts[len(text) - 1] != "'"
+                and index < len(lines)
+            ):
+                break
+            text = text[:-1] + " " + lines[index]
+            index += 1
+        possible = [
+            match.start() for match in re.finditer(r"(?<!<)<<(?!<)", text[:safe_end])
+        ]
+        if "$(" in text and possible:
+            raise ValueError(f"{path}:{start + 1}: unsupported heredoc in substitution")
+        redirects = [
+            pos for pos in possible if pos in contexts and contexts[pos] is None
+        ]
+        redirect = None
+        if redirects:
+            if (
+                len(redirects) != 1
+                or initial is not None
+                or any(
+                    text[pos] in "({" and quote is None
+                    for pos, quote in contexts.items()
+                    if pos < redirects[0]
+                )
+            ):
+                raise ValueError(f"{path}:{start + 1}: unsupported heredoc redirect")
+            redirect = HEREDOC_WORD.match(text, redirects[0] + 2, safe_end)
+            if not redirect:
+                raise ValueError(f"{path}:{start + 1}: unsupported heredoc delimiter")
+        yield start + 1, text, initial, safe_end, None
+        if not redirect:
+            continue
+        delimiter = redirect["word"]
+        strip_tabs = bool(redirect["tabs"])
+        body_start = index
+        while index < len(lines):
+            candidate = lines[index].lstrip("\t") if strip_tabs else lines[index]
+            if candidate == delimiter:
+                break
+            index += 1
+        if index == len(lines):
+            raise ValueError(f"{path}:{start + 1}: unterminated heredoc {delimiter}")
+        body = lines[body_start:index]
+        prefix = text[: redirects[0]]
+        if redirect["quote"] and re.match(r"^\s*python3\s+-I\s+-(?:\s|$)", prefix):
+            # A known stdin-Python invocation has its own syntax check. Names
+            # of repo programs inside it still need explicit CLI evidence.
+            try:
+                ast.parse("\n".join(body), filename=f"{path}:{body_start + 1}")
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"{path}:{start + 1}: invalid inline Python heredoc: {exc}"
+                ) from exc
+        for number, row in enumerate(body, body_start + 1):
+            first = number
+            if number > body_start + 1 and lines[number - 2].endswith("\\"):
+                continue
+            while row.endswith("\\") and number < index:
+                row = row[:-1] + " " + lines[number]
+                number += 1
+            yield first, row, None, len(row), (delimiter, redirect["quote"])
+        index += 1
 
 
 def shell_spans(text):
@@ -213,8 +534,6 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
     aliases = {}
     used_aliases = set()
     arrays = defaultdict(list)
-    heredoc_end = None
-    spec_prose = False
     names = {PurePosixPath(program).name for program in programs}
     basename = re.compile(
         r"(?<![\w.-])(?:" + "|".join(map(re.escape, sorted(names))) + r")(?![\w.-])"
@@ -226,47 +545,63 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
                 f"{path}:{line}: multiple unresolved Python references; "
                 f"split into separately inventoried calls: {detail}"
             )
+        key = (path, line)
+        if key in MANUAL_RECORDS:
+            fingerprint = hashlib.sha256(raw.encode()).hexdigest()
+            if fingerprint != MANUAL_RECORDS[key][0] or body != reviewed_body(key):
+                raise ValueError(
+                    f"{path}:{line}: source changed; re-audit the manual argv"
+                )
         call = manual_call(path, line, detail)
         used_manual.add((path, line))
+        used_aliases.update(
+            match[1] or match[2]
+            for match in VARIABLE.finditer(raw)
+            if (match[1] or match[2]) in aliases
+        )
         return call
 
     def alias_name(word):
         ref = VARIABLE.fullmatch(word)
         return (ref[1] or ref[2]) if ref else ""
 
-    for line, text in logical_lines(source):
-        if heredoc_end:
-            if text.strip() == heredoc_end:
-                heredoc_end = None
-            continue
-        if path.endswith(".spec"):
-            section = re.match(
-                r"^\s*%(description|changelog|files|package|prep|build|install|check"
-                r"|clean|generate_buildrequires|(?:pre|post)\w*"
-                r"|(?:transfile|file)?trigger\w*|verifyscript)\b",
-                text,
+    for line, raw, initial, safe_end, body in shell_records(path, source):
+        raw_contexts = shell_lex(raw, initial)[0]
+        end_quote = shell_lex(raw[:safe_end], initial)[1]
+        uncertain = (
+            initial is not None
+            or end_quote is not None
+            or "$(" in raw
+            or any(
+                raw[pos] == "#" and quote is not None
+                for pos, quote in raw_contexts.items()
             )
-            if section:
-                spec_prose = section[1] in {"description", "changelog", "files"}
-            if spec_prose:
-                continue
+        )
+        text = raw if uncertain else raw[:safe_end]
         if PurePosixPath(path).name == "Makefile" or path.endswith(".mk"):
             # A simple make variable is not a shell command substitution.
             text = re.sub(r"(?<!\$)\$\(([A-Za-z_]\w*)\)", r"${\1}", text)
-        contexts = dict(shell_contexts(text))
-        for pos, quote in contexts.items():
-            if (
-                text[pos] == "#"
-                and quote is None
-                and (pos == 0 or text[pos - 1].isspace() or text[pos - 1] in STOP)
-            ):
-                text = text[:pos]
-                break
+        contexts = shell_lex(text, initial)[0]
         mentions = {match.start(): match[0] for match in basename.finditer(text)}
         for match in VARIABLE.finditer(text):
             alias = (match[1] or match[2]).split("[", 1)[0]
             if alias in aliases:
                 mentions[match.start()] = match[0]
+
+        if (body or uncertain) and mentions:
+            if body and (path, line, body, raw.strip()) in HEREDOC_PROSE:
+                continue
+            yield unresolved(
+                line,
+                (
+                    "repository Python reference in heredoc body"
+                    if body
+                    else "repository Python reference on an ambiguous shell line"
+                ),
+            )
+            continue
+        if body or initial is not None:
+            continue
 
         def cover(begin, end):
             for pos in tuple(mentions):
@@ -320,8 +655,6 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
             arg_offset = offset + first.end()
             if interpreter and re.match(r"^(?:-[IBEsS]+\s+)*(?:-c|-)(?:\s|$)", tail):
                 yield Call(path, line, "interpreter", (), "not a CLI", "inline Python")
-                if marker := re.search(r"<<-?\s*['\"]?(\w+)", tail):
-                    heredoc_end = marker[1]
                 continue
             try:
                 tokens = list(shell_spans(tail))
@@ -513,7 +846,11 @@ def inventory():
         if scan:
             found.extend(
                 shell_calls(
-                    name, path.read_text(), programs, used_manual, used_forwarded
+                    name,
+                    path.read_bytes().decode(),
+                    programs,
+                    used_manual,
+                    used_forwarded,
                 )
             )
     if used_manual != UNRESOLVED.keys() or used_forwarded != FORWARDED.keys():
@@ -582,41 +919,71 @@ def check_argv(target, argv):
 def fixture_failures():
     target = "fedora/devcard-policy.py"
     folder = Path(__file__).parent / "fixtures" / "cli-calls"
-    for name, fails_in_inventory in (
-        ("case-arm.sh.fixture", True),
-        ("array-command.sh.fixture", True),
-        ("quoted-operator.sh.fixture", False),
+    for source, diagnostic in (
+        ("cat <<$dynamic\n", "unsupported heredoc delimiter"),
+        ("cat <<END-PY\nEND\n", "unterminated heredoc END-PY"),
+        ("cat <<END-PY\nEND-PY\r\n", "unterminated heredoc END-PY"),
+    ):
+        try:
+            list(shell_records("<malformed heredoc fixture>", source))
+        except ValueError as exc:
+            if diagnostic not in str(exc):
+                yield f"malformed heredoc fixture: unexpected error: {exc}"
+        else:
+            yield f"malformed heredoc fixture: no error for {source!r}"
+    for name, expected_error, parsed_line in (
+        ("case-arm.sh.fixture", "outside a resolved call", None),
+        ("array-command.sh.fixture", "in command array", None),
+        ("quoted-operator.sh.fixture", None, 1),
+        ("quoted-comment-substitution.sh.fixture", "ambiguous shell line", None),
+        ("inline-fake-heredoc.sh.fixture", None, 2),
+        ("hyphenated-heredoc.sh.fixture", None, 4),
+        ("unquoted-heredoc-body.sh.fixture", "in heredoc body", None),
     ):
         path = folder / name
         try:
             calls = list(
                 shell_calls(
                     path.relative_to(ROOT).as_posix(),
-                    path.read_text(),
+                    path.read_bytes().decode(),
                     {target},
                     set(),
                     set(),
                 )
             )
         except ValueError as exc:
-            if fails_in_inventory and "unlisted unresolved call:" in str(exc):
+            if (
+                expected_error
+                and "unlisted unresolved call:" in str(exc)
+                and expected_error in str(exc)
+            ):
                 print(f"Fixture {name}: PASS (inventory rejected unresolved form)")
             else:
                 yield f"fixture {name}: unexpected inventory error: {exc}"
             continue
-        if fails_in_inventory:
+        if expected_error:
             yield f"fixture {name}: unresolved form did not raise an inventory error"
             continue
-        argv = ("passwd-sole-root", "/stub/path", "|", "--unexpected")
-        actual = [(call.target, variant) for call in calls for variant in call.variants]
-        if actual != [(target, argv)]:
-            yield f"fixture {name}: quoted operator or trailing option lost: {actual!r}"
+        quoted = ("|",) if name == "quoted-operator.sh.fixture" else ()
+        argv = ("passwd-sole-root", "/stub/path", *quoted, "--unexpected")
+        actual = [
+            (call.line, call.target, variant)
+            for call in calls
+            for variant in call.variants
+        ]
+        if actual != [(parsed_line, target, argv)]:
+            yield f"fixture {name}: bad argv not inventoried as written: {actual!r}"
             continue
         message = check_argv(target, argv)
-        if "unrecognized arguments: | --unexpected" not in message:
+        if (
+            f"unrecognized arguments: {' '.join((*quoted, '--unexpected'))}"
+            not in message
+        ):
             yield f"fixture {name}: real parser did not reject the full argv: {message!r}"
         else:
-            print(f"Fixture {name}: PASS (parser rejected | --unexpected)")
+            print(
+                f"Fixture {name}: PASS (parser rejected full argv at line {parsed_line})"
+            )
 
 
 def main():

@@ -1,0 +1,4 @@
+python3 -I - <<END-PY
+print("inline data")
+END-PY
+python3 -I "$TOP/fedora/devcard-policy.py" passwd-sole-root "$path" --unexpected

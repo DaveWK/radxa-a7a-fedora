@@ -1,0 +1,3 @@
+cat <<END-PY
+# $(python3 -I "$TOP/fedora/devcard-policy.py" passwd-sole-root "$path" --unexpected)
+END-PY
