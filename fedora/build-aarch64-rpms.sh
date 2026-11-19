@@ -22,9 +22,22 @@ CACHE=${DNF_CACHE:-$TOP/build/fedora/dnf/cache-ns$RELEASE_SUFFIX}
     echo "no qemu-aarch64 binfmt handler" >&2
     exit 1
 }
-mkdir -p "$OUT/RPMS"
+mkdir -p "$OUT/RPMS" "$OUT/tmp"
+OUT=$(realpath "$OUT")
+NOARCH_MANIFEST=$OUT/RPMS/checked-rpms.json
+# Only the fwlog SRPM the noarch run recorded (path and sha256), copied into
+# a run-private directory; the noarch manifest's sha256 as read now binds the
+# aarch64 manifest written at the end (a run change in between is refused).
+PRIV=$(mktemp -d "$OUT/tmp/build-aarch64.XXXXXXXX")
+trap 'rm -rf "$PRIV"' EXIT
+staged=$(python3 -I "$TOP/fedora/devcard-policy.py" stage-srpm "$NOARCH_MANIFEST" "$PRIV/srpm") || {
+    echo "build-aarch64-rpms: no bound cubie-a7a-fwlog SRPM in $NOARCH_MANIFEST" >&2
+    exit 1
+}
+SRPM=${staged%%$'\t'*}
+NOARCH_SHA256=${staged##*$'\t'}
 
-export BR CACHE OUT DIST RELEASEVER REPOSDIR
+export BR CACHE OUT DIST RELEASEVER REPOSDIR SRPM
 "$TOP/fedora/run-build-ns.sh" mount bash -s -- "${RELEASE_REPOS[@]}" <<'NS'
 set -euo pipefail
 mkdir -p "$BR"/{proc,dev,run,var/lib/dnf,srpms,out}
@@ -40,11 +53,9 @@ mount -t proc proc "$BR/proc"
 for n in null zero random urandom full; do touch "$BR/dev/$n"; mount --bind "/dev/$n" "$BR/dev/$n"; done
 mount -t tmpfs tmpfs "$BR/run"
 rm -rf "$BR/srpms"/* "$BR/out"/*
-cp "$OUT"/SRPMS/cubie-a7a-fwlog-*.src.rpm "$BR/srpms/"
-for s in "$BR"/srpms/*.src.rpm; do
-    chroot "$BR" rpmbuild --define "_topdir /out" --define "dist $DIST" \
-        --rebuild "/srpms/$(basename "$s")"
-done
+cp "$SRPM" "$BR/srpms/"
+chroot "$BR" rpmbuild --define "_topdir /out" --define "dist $DIST" \
+    --rebuild "/srpms/${SRPM##*/}"
 mkdir -p "$OUT/RPMS/aarch64"
 cp "$BR"/out/RPMS/aarch64/*.rpm "$OUT/RPMS/aarch64/"
 NS
@@ -59,6 +70,6 @@ if ((${#built_aarch64[@]} == 0)); then
 fi
 python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
     "$OUT/RPMS" "$OUT/RPMS/checked-aarch64-rpms.json" --kind aarch64 \
-    --bind-noarch "$OUT/RPMS/checked-rpms.json" \
+    --bind-noarch "$NOARCH_MANIFEST" --bind-noarch-sha256 "$NOARCH_SHA256" \
     "${built_aarch64[@]}"
 printf '%s\n' "${built_aarch64[@]}"

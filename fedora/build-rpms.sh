@@ -165,7 +165,14 @@ done
 rm -f "$publish/RPMS/checked-aarch64-rpms.json"
 manifest_args=(--kind noarch)
 if [ "$FWREPO" != none ]; then
-    manifest_args+=(--expect-aarch64)
+    # Bind this run's fwlog SRPM (path and sha256): build-aarch64-rpms.sh
+    # rebuilds that one file and nothing else from the shared SRPMS/.
+    fwlog_srpms=("$OUT"/SRPMS/cubie-a7a-fwlog-*.src.rpm)
+    if ((${#fwlog_srpms[@]} != 1)); then
+        echo "build-rpms: expected one cubie-a7a-fwlog SRPM from this run" >&2
+        exit 1
+    fi
+    manifest_args+=(--expect-aarch64 --srpm "$publish/SRPMS/${fwlog_srpms[0]##*/}")
 fi
 if [ -n "${RPM_BUILD_RUN_ID:-}" ]; then
     manifest_args+=(--run-id "$RPM_BUILD_RUN_ID")

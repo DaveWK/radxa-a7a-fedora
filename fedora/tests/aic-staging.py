@@ -30,8 +30,13 @@ spec.loader.exec_module(stage_aic)
 
 FAILURES = []
 
+# A7A_TEST_ONLY=fn1,fn2 runs only the named test functions (red/green runs).
+ONLY = {n for n in os.environ.get("A7A_TEST_ONLY", "").split(",") if n}
+
 
 def case(name, fn):
+    if ONLY and fn.__name__ not in ONLY:
+        return
     try:
         fn()
     except AssertionError as exc:
@@ -620,189 +625,281 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
         ), "mkdevcard accepted tampered RPM bytes"
 
 
+def _policy(*args, env=None):
+    return subprocess.run(
+        [sys.executable, "-I", "-B", str(repo_fedora / "devcard-policy.py"), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _fwrepo(root):
+    fwrepo = root / "fwrepo"
+    (fwrepo / "tools/a7a-fwlog").mkdir(parents=True)
+    (fwrepo / "tools/a7a-fwlog/a7a-fwlog.c").write_text("int main(void){return 0;}\n")
+    (fwrepo / "docs").mkdir(parents=True)
+    (fwrepo / "docs/fwlog.md").write_text("# fwlog\n")
+    return fwrepo
+
+
+def _fake_fwlog_binary(work, srpm, out_dir):
+    """A binary cubie-a7a-fwlog RPM whose SOURCERPM names SRPM (no aarch64 build)."""
+    vr = subprocess.run(
+        ["rpm", "-qp", "--qf", "%{VERSION} %{RELEASE}", str(srpm)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    top = work / f"fake-{os.getpid()}-{len(list(work.iterdir()))}"
+    for d in ("SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS", "tmp"):
+        (top / d).mkdir(parents=True)
+    spec = top / "SPECS/cubie-a7a-fwlog.spec"
+    spec.write_text(
+        f"Name: cubie-a7a-fwlog\nVersion: {vr[0]}\nRelease: {vr[1]}\n"
+        "Summary: test\nLicense: GPL-2.0-only\nBuildArch: noarch\n"
+        "%description\ntest\n%install\nmkdir -p %{buildroot}/usr/bin\n"
+        "echo hi > %{buildroot}/usr/bin/a7a-fwlog\n%files\n/usr/bin/a7a-fwlog\n"
+    )
+    subprocess.run(
+        [
+            "rpmbuild",
+            "--define",
+            f"_topdir {top}",
+            "--define",
+            f"_tmppath {top}/tmp",
+            "-bb",
+            str(spec),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    built = next((top / "RPMS/noarch").glob("cubie-a7a-fwlog-*.rpm"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / built.name
+    shutil.copy2(built, dest)
+    return dest
+
+
 def test_rpm_manifests_bound_to_one_run():
-    """Should-fix 4a: noarch and aarch64 manifests share one run_id; stale/other-run refused."""
+    """Should-fix 4a / F6 B5: one run_id, the recorded SRPM and the noarch digest."""
     if not shutil.which("rpmbuild") or not shutil.which("dtc"):
         raise AssertionError("rpmbuild and dtc are required")
-    policy_script = repo_fedora / "devcard-policy.py"
     with tempfile.TemporaryDirectory(prefix="a7a-runid-") as td:
         root = Path(td)
         out = root / "rpmbuild"
-        # Build a valid fixture cubie-a7a-fwlog RPM to plant as a prior-run aarch64 output.
-        spec_dir = root / "fwlog-rpm"
+        fwrepo = _fwrepo(root)
+        env = {**os.environ, "FWREPO": str(fwrepo), "AIC8800_SRC": str(root / "no")}
+        # A prior run's aarch64 manifest is cleared by the next noarch run.
+        (out / "RPMS").mkdir(parents=True)
+        (out / "RPMS/checked-aarch64-rpms.json").write_text("{}\n")
+        r_bld = subprocess.run(
+            ["bash", str(repo_fedora / "build-rpms.sh"), str(out)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r_bld.returncode == 0, r_bld.stderr
+        assert not (out / "RPMS/checked-aarch64-rpms.json").exists()
+        import json
+
+        noarch = out / "RPMS/checked-rpms.json"
+        data = json.loads(noarch.read_text())
+        srpm = out / data["srpm"]["relpath"]
+        assert data["srpm"]["package"] == "cubie-a7a-fwlog" and srpm.is_file(), data
+        assert data["srpm"]["sha256"] == sha256(srpm)
+
+        # Missing aarch64 manifest for an FWREPO run is refused.
+        r = _policy("select-rpms", str(out / "RPMS"))
+        assert r.returncode != 0, "missing aarch64 manifest accepted"
+
+        staged = _policy("stage-srpm", str(noarch), str(root / "priv"))
+        assert staged.returncode == 0, staged.stderr
+        copy, msha = staged.stdout.strip().split("\t")
+        assert msha == sha256(noarch) and sha256(copy) == sha256(srpm)
+        fake = _fake_fwlog_binary(root, Path(copy), out / "RPMS/aarch64")
+        bind = [
+            "write-rpm-manifest",
+            str(out / "RPMS"),
+            str(out / "RPMS/checked-aarch64-rpms.json"),
+            "--kind",
+            "aarch64",
+            "--bind-noarch",
+            str(noarch),
+        ]
+        r = _policy(*bind, str(fake))
+        assert r.returncode != 0, "aarch64 manifest without --bind-noarch-sha256"
+        r = _policy(*bind, "--bind-noarch-sha256", "0" * 64, str(fake))
+        assert r.returncode != 0 and "changed during the run" in r.stderr, r.stderr
+        r = _policy(*bind, "--bind-noarch-sha256", msha, str(fake))
+        assert r.returncode == 0, r.stderr
+        r = _policy("select-rpms", str(out / "RPMS"))
+        assert r.returncode == 0 and "cubie-a7a-fwlog\t" in r.stdout, r.stderr
+
+        # A stale aarch64 manifest (other run_id) and a changed noarch manifest
+        # are refused by select-rpms (mkdevcard's consumer).
+        arch = out / "RPMS/checked-aarch64-rpms.json"
+        good = arch.read_text()
+        stale = json.loads(good)
+        stale["run_id"] = "a" * 32
+        arch.write_text(json.dumps(stale))
+        r = _policy("select-rpms", str(out / "RPMS"))
+        assert r.returncode != 0 and "does not match" in r.stderr, r.stderr
+        arch.write_text(good)
+        saved = noarch.read_text()
+        noarch.write_text(saved.replace("\n", "\n\n", 1))
+        r = _policy("select-rpms", str(out / "RPMS"))
+        assert r.returncode != 0 and "bound to a different" in r.stderr, r.stderr
+        noarch.write_text(saved)
+
+        # A binary RPM built from another SRPM is refused at write time.
+        renamed = out / "RPMS/aarch64/other.rpm"
+        spec_top = root / "other-src"
         for d in ("SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS", "tmp"):
-            (spec_dir / d).mkdir(parents=True)
-        spec_file = spec_dir / "SPECS/cubie-a7a-fwlog.spec"
-        spec_file.write_text(
-            "Name: cubie-a7a-fwlog\nVersion: 0.1\nRelease: 1\n"
-            "Summary: test\nLicense: GPL-2.0-only\nBuildArch: noarch\n"
-            "%description\ntest\n%install\nmkdir -p %{buildroot}/usr/bin\n"
-            "echo hi > %{buildroot}/usr/bin/a7a-fwlog\n"
-            "%files\n/usr/bin/a7a-fwlog\n"
+            (spec_top / d).mkdir(parents=True)
+        (spec_top / "SPECS/x.spec").write_text(
+            "Name: cubie-a7a-fwlog\nVersion: 9\nRelease: 9\nSummary: t\n"
+            "License: GPL-2.0-only\nBuildArch: noarch\n%description\nt\n"
+            "%files\n"
         )
         subprocess.run(
             [
                 "rpmbuild",
                 "--define",
-                f"_topdir {spec_dir}",
+                f"_topdir {spec_top}",
                 "--define",
-                f"_tmppath {spec_dir}/tmp",
+                f"_tmppath {spec_top}/tmp",
                 "-bb",
-                str(spec_file),
+                str(spec_top / "SPECS/x.spec"),
             ],
             check=True,
             capture_output=True,
         )
-        fwlog_rpm = next((spec_dir / "RPMS/noarch").glob("cubie-a7a-fwlog-*.rpm"))
-        (out / "RPMS/aarch64").mkdir(parents=True)
-        dst_fwlog = out / "RPMS/aarch64" / fwlog_rpm.name
-        shutil.copy2(fwlog_rpm, dst_fwlog)
-        old_run_id = "a" * 32
-        r_old = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(policy_script),
-                "write-rpm-manifest",
-                str(out / "RPMS"),
-                str(out / "RPMS/checked-aarch64-rpms.json"),
-                "--kind",
-                "aarch64",
-                "--run-id",
-                old_run_id,
-                str(dst_fwlog),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert r_old.returncode == 0, r_old.stderr
-        saved_old_manifest = (out / "RPMS/checked-aarch64-rpms.json").read_text()
+        shutil.copy2(next((spec_top / "RPMS/noarch").glob("*.rpm")), renamed)
+        r = _policy(*bind, "--bind-noarch-sha256", msha, str(renamed))
+        assert r.returncode != 0 and "not the bound" in r.stderr, r.stderr
+        renamed.unlink()
 
-        # Run build-rpms.sh WITH FWREPO set: prior checked-aarch64-rpms.json MUST be cleared.
-        fwrepo = root / "fwrepo"
-        (fwrepo / "tools/a7a-fwlog").mkdir(parents=True)
-        (fwrepo / "tools/a7a-fwlog/a7a-fwlog.c").write_text(
-            "int main(void){return 0;}\n"
-        )
-        (fwrepo / "docs").mkdir(parents=True)
-        (fwrepo / "docs/fwlog.md").write_text("# fwlog\n")
-        r_bld = subprocess.run(
-            ["bash", str(repo_fedora / "build-rpms.sh"), str(out)],
-            env={
-                **os.environ,
-                "FWREPO": str(fwrepo),
-                "AIC8800_SRC": str(root / "absent-aic"),
-            },
-            capture_output=True,
-            text=True,
-        )
-        assert r_bld.returncode == 0, r_bld.stderr
-        assert not (
-            out / "RPMS/checked-aarch64-rpms.json"
-        ).exists(), "build-rpms.sh left stale checked-aarch64-rpms.json when FWREPO set"
-
-        # Missing aarch64 manifest for FWREPO run MUST fail select-rpms.
-        r_miss = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(policy_script),
-                "select-rpms",
-                str(out / "RPMS"),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert (
-            r_miss.returncode != 0
-        ), "select-rpms must refuse missing aarch64 manifest for FWREPO run"
-
-        # Planting the prior run's checked-aarch64-rpms.json (different run_id) MUST fail.
-        (out / "RPMS/checked-aarch64-rpms.json").write_text(saved_old_manifest)
-        r_stale = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(policy_script),
-                "select-rpms",
-                str(out / "RPMS"),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert (
-            r_stale.returncode != 0 and "does not match" in r_stale.stderr
-        ), f"select-rpms accepted mismatched run_id: {r_stale.stdout}\n{r_stale.stderr}"
-
-        # Binding aarch64 manifest to this run's checked-rpms.json succeeds and shares run_id.
-        r_bind = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(policy_script),
-                "write-rpm-manifest",
-                str(out / "RPMS"),
-                str(out / "RPMS/checked-aarch64-rpms.json"),
-                "--kind",
-                "aarch64",
-                "--bind-noarch",
-                str(out / "RPMS/checked-rpms.json"),
-                str(dst_fwlog),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert r_bind.returncode == 0, r_bind.stderr
-        r_ok = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(policy_script),
-                "select-rpms",
-                str(out / "RPMS"),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert r_ok.returncode == 0 and "cubie-a7a-fwlog\t" in r_ok.stdout, (
-            r_ok.returncode,
-            r_ok.stdout,
-            r_ok.stderr,
-        )
-
-        # FWREPO=none run refuses any stray checked-aarch64-rpms.json.
+        # FWREPO=none: no srpm, and a stray aarch64 manifest is refused.
         r_none = subprocess.run(
             ["bash", str(repo_fedora / "build-rpms.sh"), str(out)],
-            env={
-                **os.environ,
-                "FWREPO": "none",
-                "AIC8800_SRC": str(root / "absent-aic"),
-            },
+            env={**env, "FWREPO": "none"},
             capture_output=True,
             text=True,
         )
         assert r_none.returncode == 0, r_none.stderr
-        (out / "RPMS/checked-aarch64-rpms.json").write_text(saved_old_manifest)
-        r_stray = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(policy_script),
-                "select-rpms",
-                str(out / "RPMS"),
-            ],
+        assert "srpm" not in json.loads(noarch.read_text())
+        arch.write_text(good)
+        r = _policy("select-rpms", str(out / "RPMS"))
+        assert r.returncode != 0, "stray aarch64 manifest accepted for FWREPO=none"
+
+
+def _aarch64_rebuild_fixture(root):
+    """build-rpms.sh output plus a stubbed build-aarch64-rpms.sh environment.
+
+    run-build-ns.sh runs its command directly; mount is a no-op; chroot
+    emulates `rpmbuild --rebuild /srpms/NAME` by logging NAME and producing
+    a binary RPM built from that SRPM (no aarch64 toolchain needed).  With
+    STUB_MUTATE set it rewrites checked-rpms.json mid-rebuild with a new
+    run_id, as a concurrent build-rpms.sh run would.
+    """
+    repo_fed = root / "repo/fedora"
+    shutil.copytree(
+        repo_fedora,
+        repo_fed,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (repo_fed / "run-build-ns.sh").write_text('#!/usr/bin/env bash\nshift\nexec "$@"\n')
+    out = root / "rpmbuild"
+    env = {
+        **os.environ,
+        "FWREPO": str(_fwrepo(root)),
+        "AIC8800_SRC": str(root / "no"),
+        "BUILDROOT": str(root / "br"),
+        "DNF_CACHE": str(root / "cache"),
+    }
+    r = subprocess.run(
+        ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    rpmbuild_stub = root / "br/usr/bin/rpmbuild"
+    rpmbuild_stub.parent.mkdir(parents=True)
+    rpmbuild_stub.write_text("#!/bin/sh\nexit 1\n")
+    rpmbuild_stub.chmod(0o755)
+    stubs = root / "stubs"
+    stubs.mkdir()
+    (stubs / "mount").write_text("#!/bin/sh\nexit 0\n")
+    log = root / "rebuilt.log"
+    (stubs / "chroot").write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, shutil, subprocess, sys\n"
+        "sys.dont_write_bytecode = True\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(here)!r})\n"
+        "br = Path(sys.argv[1])\n"
+        "name = Path(sys.argv[-1]).name\n"
+        f"open({str(log)!r}, 'a').write(name + '\\n')\n"
+        "if os.environ.get('STUB_MUTATE'):\n"
+        "    m = Path(os.environ['OUT']) / 'RPMS/checked-rpms.json'\n"
+        "    d = json.loads(m.read_text())\n"
+        "    d['run_id'] = 'b' * 32\n"
+        "    m.write_text(json.dumps(d, indent=2, sort_keys=True) + '\\n')\n"
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('t', {str(Path(__file__).resolve())!r})\n"
+        "t = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(t)\n"
+        "work = br / 'stubwork'\n"
+        "work.mkdir(exist_ok=True)\n"
+        "t._fake_fwlog_binary(work, br / 'srpms' / name, br / 'out/RPMS/aarch64')\n"
+    )
+    for s in stubs.iterdir():
+        s.chmod(0o755)
+    env["PATH"] = f"{stubs}:{os.environ['PATH']}"
+    return repo_fed, out, env, log
+
+
+def test_aarch64_rebuild_uses_only_the_bound_srpm():
+    """F6 B5: a stale SRPM in the shared SRPMS/ is never rebuilt or bound."""
+    if not os.path.exists("/proc/sys/fs/binfmt_misc/qemu-aarch64"):
+        raise AssertionError("build-aarch64-rpms.sh needs a qemu-aarch64 binfmt entry")
+    with tempfile.TemporaryDirectory(prefix="a7a-aarch64-") as td:
+        root = Path(td)
+        repo_fed, out, env, log = _aarch64_rebuild_fixture(root)
+        bound = next((out / "SRPMS").glob("cubie-a7a-fwlog-*.src.rpm"))
+        stale = out / "SRPMS/cubie-a7a-fwlog-0.0-0.src.rpm"
+        shutil.copy2(bound, stale)
+        r = subprocess.run(
+            ["bash", str(repo_fed / "build-aarch64-rpms.sh"), str(out)],
+            env=env,
             capture_output=True,
             text=True,
         )
-        assert (
-            r_stray.returncode != 0
-        ), "select-rpms must refuse stray aarch64 manifest when FWREPO=none"
+        rebuilt = log.read_text().split() if log.exists() else []
+        assert rebuilt == [bound.name], f"rebuilt {rebuilt}, bound {bound.name}"
+        assert r.returncode == 0, r.stderr
+        r = _policy("select-rpms", str(out / "RPMS"))
+        assert r.returncode == 0 and "cubie-a7a-fwlog\t" in r.stdout, r.stderr
+
+
+def test_aarch64_rebuild_refuses_run_change():
+    """F6 B5: a noarch run change during the aarch64 rebuild is refused."""
+    if not os.path.exists("/proc/sys/fs/binfmt_misc/qemu-aarch64"):
+        raise AssertionError("build-aarch64-rpms.sh needs a qemu-aarch64 binfmt entry")
+    with tempfile.TemporaryDirectory(prefix="a7a-aarch64-") as td:
+        root = Path(td)
+        repo_fed, out, env, log = _aarch64_rebuild_fixture(root)
+        r = subprocess.run(
+            ["bash", str(repo_fed / "build-aarch64-rpms.sh"), str(out)],
+            env={**env, "STUB_MUTATE": "1"},
+            capture_output=True,
+            text=True,
+        )
+        assert log.exists(), "the rebuild did not run"
+        assert r.returncode != 0, f"a mid-rebuild run change was bound:\n{r.stderr}"
+        assert not (out / "RPMS/checked-aarch64-rpms.json").exists()
 
 
 def main():
@@ -843,6 +940,14 @@ def main():
     case(
         "build-rpms: noarch and aarch64 manifests bound to one run_id (Should-fix 4a)",
         test_rpm_manifests_bound_to_one_run,
+    )
+    case(
+        "build-aarch64-rpms: only the bound SRPM is rebuilt (F6 B5)",
+        test_aarch64_rebuild_uses_only_the_bound_srpm,
+    )
+    case(
+        "build-aarch64-rpms: a mid-rebuild run change is refused (F6 B5)",
+        test_aarch64_rebuild_refuses_run_change,
     )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")

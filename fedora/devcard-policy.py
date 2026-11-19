@@ -59,6 +59,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -1599,7 +1600,60 @@ OPTIONAL_NOARCH_PACKAGES = (
 OPTIONAL_AARCH64_PACKAGES = ("cubie-a7a-fwlog",)
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32,64}$")
-RPM_MANIFEST_VERSION = 2
+RPM_MANIFEST_VERSION = 3
+FWLOG_SRPM_PACKAGE = "cubie-a7a-fwlog"
+
+
+def _srpm_record(rpms_dir, srpm_path):
+    """{package, relpath, sha256} of the fwlog SRPM, relpath from RPMS_DIR's parent."""
+    top = Path(rpms_dir).resolve().parent
+    path = Path(srpm_path).resolve()
+    if not path.is_file() or Path(srpm_path).is_symlink():
+        raise PolicyError(f"missing or non-regular SRPM: {srpm_path}")
+    try:
+        rel = path.relative_to(top).as_posix()
+    except ValueError as exc:
+        raise PolicyError(f"SRPM {path} is outside {top}") from exc
+    res = subprocess.run(
+        ["rpm", "-qp", "--qf", "%{NAME} %{SOURCERPM}", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0 or res.stdout.split(" ")[0] != FWLOG_SRPM_PACKAGE:
+        raise PolicyError(f"{path} is not a {FWLOG_SRPM_PACKAGE} SRPM")
+    if not path.name.endswith(".src.rpm") or res.stdout.split(" ", 1)[1] != "(none)":
+        raise PolicyError(f"{path} is not a source RPM")
+    return {
+        "package": FWLOG_SRPM_PACKAGE,
+        "relpath": rel,
+        "sha256": _file_digest(path, "sha256"),
+    }
+
+
+def _check_srpm_record(rpms_dir, record, mpath):
+    """Resolve and digest-check a recorded SRPM; return its path."""
+    if (
+        not isinstance(record, dict)
+        or record.get("package") != FWLOG_SRPM_PACKAGE
+        or not isinstance(record.get("relpath"), str)
+        or not isinstance(record.get("sha256"), str)
+        or not SHA256_HEX_RE.fullmatch(record["sha256"])
+    ):
+        raise PolicyError(f"{mpath}: invalid srpm record {record!r}")
+    top = Path(rpms_dir).resolve().parent
+    rel = Path(record["relpath"])
+    if rel.is_absolute() or ".." in rel.parts:
+        raise PolicyError(f"{mpath}: unsafe srpm relpath {record['relpath']!r}")
+    path = top / rel
+    if path.is_symlink() or not path.is_file():
+        raise PolicyError(f"{mpath}: missing or non-regular SRPM {rel}")
+    actual = _file_digest(path, "sha256")
+    if actual != record["sha256"]:
+        raise PolicyError(
+            f"{mpath}: sha256 mismatch for SRPM {rel} "
+            f"(actual {actual}, manifest {record['sha256']})"
+        )
+    return path
 
 
 def write_rpm_manifest(
@@ -1610,8 +1664,19 @@ def write_rpm_manifest(
     run_id=None,
     expect_aarch64=False,
     bind_noarch=None,
+    srpm=None,
+    bind_noarch_sha256=None,
 ):
-    """Write an atomic checked-RPM manifest bound to one run_id with sha256s."""
+    """Write an atomic checked-RPM manifest bound to one run_id with sha256s.
+
+    noarch: with EXPECT_AARCH64 the fwlog SRPM this run built (SRPM) is
+    recorded by path and sha256.  aarch64: bound to the noarch manifest
+    BIND_NOARCH, whose sha256 must still be BIND_NOARCH_SHA256 (the value
+    stage-srpm read at the start of the rebuild), and every RPM must have
+    been built from the recorded SRPM.
+    """
+    srpm_record = None
+    noarch_sha = None
     if kind not in ("noarch", "aarch64"):
         raise PolicyError(f"invalid rpm manifest kind: {kind!r}")
     if kind == "noarch":
@@ -1621,14 +1686,38 @@ def write_rpm_manifest(
             run_id = secrets.token_hex(16)
         if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
             raise PolicyError(f"invalid run_id: {run_id!r}")
+        if bind_noarch_sha256 is not None:
+            raise PolicyError("--bind-noarch-sha256 is only valid for kind='aarch64'")
+        if expect_aarch64:
+            if srpm is None:
+                raise PolicyError("--expect-aarch64 requires --srpm (the fwlog SRPM)")
+            srpm_record = _srpm_record(rpms_dir, srpm)
+        elif srpm is not None:
+            raise PolicyError("--srpm is only valid with --expect-aarch64")
     else:
+        if srpm is not None:
+            raise PolicyError("--srpm is only valid for kind='noarch'")
+        if bind_noarch is None or bind_noarch_sha256 is None:
+            raise PolicyError(
+                "aarch64 manifest requires --bind-noarch and --bind-noarch-sha256"
+            )
+        noarch_sha = _file_digest(bind_noarch, "sha256")
+        if noarch_sha != bind_noarch_sha256:
+            raise PolicyError(
+                f"{bind_noarch} changed during the run (sha256 {noarch_sha}, "
+                f"bound {bind_noarch_sha256}): refusing to bind"
+            )
         if bind_noarch is not None:
-            _, bound_run_id, bound_expect = _load_rpm_manifest(
+            _, bound_run_id, bound_expect, bound_data = _load_rpm_manifest(
                 rpms_dir,
                 bind_noarch,
                 "noarch",
                 set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES),
             )
+            if _file_digest(bind_noarch, "sha256") != bind_noarch_sha256:
+                raise PolicyError(
+                    f"{bind_noarch} changed during the run: refusing to bind"
+                )
             if not bound_expect:
                 raise PolicyError(
                     f"{bind_noarch}: noarch run did not expect aarch64 packages (FWREPO=none)"
@@ -1638,8 +1727,8 @@ def write_rpm_manifest(
                     f"run_id {run_id!r} disagrees with bound noarch manifest run_id {bound_run_id!r}"
                 )
             run_id = bound_run_id
-        elif run_id is None:
-            raise PolicyError("aarch64 manifest requires --bind-noarch or --run-id")
+            srpm_record = bound_data["srpm"]
+            srpm_path = _check_srpm_record(rpms_dir, srpm_record, bind_noarch)
         if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
             raise PolicyError(f"invalid run_id: {run_id!r}")
     allowed = (
@@ -1666,6 +1755,17 @@ def write_rpm_manifest(
         if res.returncode != 0 or not res.stdout.strip():
             raise PolicyError(f"cannot read RPM name from {path}: {res.stderr.strip()}")
         pkg = res.stdout.strip()
+        if kind == "aarch64":
+            src = subprocess.run(
+                ["rpm", "-qp", "--qf", "%{SOURCERPM}", str(path)],
+                capture_output=True,
+                text=True,
+            )
+            if src.returncode != 0 or src.stdout.strip() != srpm_path.name:
+                raise PolicyError(
+                    f"{path} was built from {src.stdout.strip()!r}, not the bound "
+                    f"SRPM {srpm_path.name}"
+                )
         if pkg not in allowed:
             raise PolicyError(f"unexpected {kind} board RPM package: {pkg}")
         if pkg in seen:
@@ -1685,6 +1785,11 @@ def write_rpm_manifest(
     }
     if kind == "noarch":
         payload["expect_aarch64"] = bool(expect_aarch64)
+        if srpm_record is not None:
+            payload["srpm"] = srpm_record
+    else:
+        payload["noarch_manifest_sha256"] = noarch_sha
+        payload["srpm"] = srpm_record
     out_path = Path(out_manifest)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -1732,6 +1837,15 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
             raise PolicyError(
                 f"invalid RPM manifest {mpath}: missing boolean expect_aarch64"
             )
+        if expect_aarch64:
+            _check_srpm_record(rpms_dir, data.get("srpm"), mpath)
+        elif "srpm" in data:
+            raise PolicyError(f"{mpath}: srpm recorded for an FWREPO=none run")
+    else:
+        _check_srpm_record(rpms_dir, data.get("srpm"), mpath)
+        nsha = data.get("noarch_manifest_sha256")
+        if not isinstance(nsha, str) or not SHA256_HEX_RE.fullmatch(nsha):
+            raise PolicyError(f"{mpath}: missing noarch_manifest_sha256")
     rpms = data.get("rpms")
     count = data.get("count")
     if (
@@ -1779,7 +1893,48 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
                 f"(actual {actual_sha}, manifest {expected_sha})"
             )
         selected[pkg] = target
-    return selected, run_id, expect_aarch64
+    return selected, run_id, expect_aarch64, data
+
+
+def stage_srpm(noarch_manifest, dest_dir):
+    """Copy only the fwlog SRPM NOARCH_MANIFEST records into new DEST_DIR.
+
+    Returns (copied path, sha256 of NOARCH_MANIFEST as read).  The manifest
+    is read once; its RPM and SRPM digests are verified, and the copy is
+    re-hashed.  build-aarch64-rpms.sh rebuilds from that copy only and binds
+    its manifest to the returned sha256.
+    """
+    mpath = Path(noarch_manifest)
+    try:
+        raw = mpath.read_bytes()
+    except OSError as exc:
+        raise PolicyError(f"cannot read {mpath}: {exc}") from exc
+    msha = hashlib.sha256(raw).hexdigest()
+    rpms_dir = mpath.parent
+    snap = Path(dest_dir) / ".noarch-manifest.json"
+    dest = Path(dest_dir)
+    try:
+        dest.mkdir()
+    except OSError as exc:
+        raise PolicyError(f"run-private directory {dest} must be new: {exc}") from exc
+    snap.write_bytes(raw)
+    try:
+        _sel, _run, expect, data = _load_rpm_manifest(
+            rpms_dir,
+            snap,
+            "noarch",
+            set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES),
+        )
+    finally:
+        snap.unlink()
+    if not expect:
+        raise PolicyError(f"{mpath}: noarch run did not expect aarch64 (FWREPO=none)")
+    src = _check_srpm_record(rpms_dir, data["srpm"], mpath)
+    copy = dest / src.name
+    shutil.copyfile(src, copy)
+    if _file_digest(copy, "sha256") != data["srpm"]["sha256"]:
+        raise PolicyError(f"{copy}: copy does not match the recorded SRPM digest")
+    return copy, msha
 
 
 def select_checked_rpms(rpms_dir):
@@ -1791,7 +1946,7 @@ def select_checked_rpms(rpms_dir):
     """
     base = Path(rpms_dir)
     noarch_manifest = base / "checked-rpms.json"
-    selected, noarch_run_id, expect_aarch64 = _load_rpm_manifest(
+    selected, noarch_run_id, expect_aarch64, noarch_data = _load_rpm_manifest(
         base,
         noarch_manifest,
         "noarch",
@@ -1807,13 +1962,24 @@ def select_checked_rpms(rpms_dir):
             raise PolicyError(
                 f"{aarch64_manifest}: unexpected aarch64 manifest (noarch run {noarch_run_id} built with FWREPO=none)"
             )
-        arch_selected, arch_run_id, _ = _load_rpm_manifest(
+        arch_selected, arch_run_id, _, arch_data = _load_rpm_manifest(
             base, aarch64_manifest, "aarch64", set(OPTIONAL_AARCH64_PACKAGES)
         )
         if arch_run_id != noarch_run_id:
             raise PolicyError(
                 f"{aarch64_manifest}: run_id {arch_run_id} does not match "
                 f"{noarch_manifest} run_id {noarch_run_id}"
+            )
+        noarch_sha = _file_digest(noarch_manifest, "sha256")
+        if arch_data["noarch_manifest_sha256"] != noarch_sha:
+            raise PolicyError(
+                f"{aarch64_manifest}: bound to a different {noarch_manifest} "
+                f"(sha256 {arch_data['noarch_manifest_sha256']}, now {noarch_sha})"
+            )
+        if arch_data["srpm"] != noarch_data["srpm"]:
+            raise PolicyError(
+                f"{aarch64_manifest}: built from a different SRPM than "
+                f"{noarch_manifest} records"
             )
         selected.update(arch_selected)
     elif expect_aarch64:
@@ -2297,7 +2463,12 @@ def main(argv=None):
     p.add_argument("--run-id")
     p.add_argument("--expect-aarch64", action="store_true")
     p.add_argument("--bind-noarch", type=Path)
+    p.add_argument("--bind-noarch-sha256")
+    p.add_argument("--srpm", type=Path)
     p.add_argument("rpms", nargs="+", type=Path)
+    p = sub.add_parser("stage-srpm")
+    p.add_argument("noarch_manifest", type=Path)
+    p.add_argument("dest_dir", type=Path)
     p = sub.add_parser("select-rpms")
     p.add_argument("rpms_dir", type=Path)
     p = sub.add_parser("verify-rpmdb-list")
@@ -2452,10 +2623,20 @@ def main(argv=None):
                 run_id=a.run_id,
                 expect_aarch64=a.expect_aarch64,
                 bind_noarch=a.bind_noarch,
+                srpm=a.srpm,
+                bind_noarch_sha256=a.bind_noarch_sha256,
             )
         except PolicyError as exc:
             print(f"write-rpm-manifest: {exc}", file=sys.stderr)
             return 1
+        return 0
+    if a.cmd == "stage-srpm":
+        try:
+            copy, msha = stage_srpm(a.noarch_manifest, a.dest_dir)
+        except PolicyError as exc:
+            print(f"stage-srpm: {exc}", file=sys.stderr)
+            return 1
+        print(f"{copy}\t{msha}")
         return 0
     if a.cmd == "select-rpms":
         try:
