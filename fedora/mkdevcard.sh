@@ -511,10 +511,28 @@ fi
 rm -rf "$ROOT"/var/cache/dnf/* "$ROOT"/var/lib/dnf/repos "$ROOT"/var/log/dnf* \
     "$ROOT"/var/lib/systemd/random-seed "$ROOT"/tmp/*
 
+# Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
+# package and match that package's recorded digest: provenance, not path.
+# Fedora's linux-firmware owns aic/aic8800d80 and passes; an unowned file
+# (overlay addition), a modified file (overlay replacement) or a non-Fedora
+# package fails (DECISIONS 2026-11-11; Dave 2026-11-19: the standard
+# linux-firmware package is fine).
+python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
+    --report "$W/aic-provenance.tsv" >/dev/null ||
+    { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
+
+# DNF scriptlets can create provisional images before provenance is available.
+# Rebuild the exact images we will ship from the verified firmware tree.
+while IFS= read -r k; do
+    chroot "$ROOT" dracut --force --kver "$k" "/boot/initramfs-$k.img"
+done <"$W/kernel.txt"
+python3 -I "$TOP/fedora/initramfs-policy.py" capture-digest "$ROOT" "$W/kernel.txt" "$W/initramfs-digests.json"
+
 # OVERLAY=<dir>: files for this card that are in no package (e.g. vendor AI
 # runtimes under /opt), copied over the root as root:root; systemd units in
 # it are enabled, and the dynamic linker cache is refreshed.
 if [ -n "$OVERLAY" ]; then
+    python3 -I "$TOP/fedora/initramfs-policy.py" overlay "$OVERLAY"
     # Refuse AIC8800 firmware paths and manifest-named AIC files before the
     # copy: only a Fedora package may put those files in an image (DECISIONS
     # 2026-11-11; Dave 2026-11-19: linux-firmware's own files are fine, ours
@@ -531,7 +549,6 @@ if [ -n "$OVERLAY" ]; then
         { echo "mkdevcard: cannot inspect OVERLAY's ESP entries" >&2; exit 1; }
     [ -z "$esp_overlay_hits" ] ||
         { echo "mkdevcard: OVERLAY writes the ESP (boot/efi): $esp_overlay_hits" >&2; exit 1; }
-    python3 -I "$TOP/fedora/initramfs-policy.py" overlay "$OVERLAY"
     cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/
     for u in "$OVERLAY"/usr/lib/systemd/system/*.service; do
         [ -e "$u" ] || continue
@@ -543,15 +560,6 @@ if [ -n "$OVERLAY" ]; then
     python3 -I "$TOP/fedora/devcard-policy.py" check-installed-rpms "$ROOT" "$RPM_RECORDS"
 fi
 
-# Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
-# package and match that package's recorded digest: provenance, not path.
-# Fedora's linux-firmware owns aic/aic8800d80 and passes; an unowned file
-# (overlay addition), a modified file (overlay replacement) or a non-Fedora
-# package fails (DECISIONS 2026-11-11; Dave 2026-11-19: the standard
-# linux-firmware package is fine).
-python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
-    --report "$W/aic-provenance.tsv" >/dev/null ||
-    { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
 
 while IFS= read -r k; do
     # Recheck root module ownership/depmod selection after overlays.
@@ -589,7 +597,7 @@ python3 -I "$TOP/fedora/staged-root-policy.py" staged "$ROOT" "${root_policy_arg
 STAGE1
 
 # zstd -t --check: stream integrity only; not newc validity, not content, not which initramfs boots.
-python3 -I "$TOP/fedora/initramfs-policy.py" set "$ROOT" "$W/kernel.txt"
+python3 -I "$TOP/fedora/initramfs-policy.py" verify-digest "$ROOT" "$W/kernel.txt" "$W/initramfs-digests.json"
 while IFS= read -r k; do
     zstd -t --check -- "$ROOT/boot/initramfs-$k.img"
 done <"$W/kernel.txt"
