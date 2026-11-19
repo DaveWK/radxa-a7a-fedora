@@ -71,9 +71,25 @@ def aic_empty_firmware_dir():
         assert policy.aic_find(root) == []
 
 
-def aic_path_pattern():
+def aic_linux_firmware_allowed():
+    # Fedora's standard linux-firmware package is fine (Dave 2026-11-19).
     with fixture() as root:
-        f = root / "usr/lib/firmware/aic/aic8800d80/fw.bin.xz"
+        write(root / "usr/share/cubie-a7a/aic8800-d80-usb.manifest", MANIFEST)
+        f = root / "usr/lib/firmware/aic/aic8800d80/fw_patch_table_8800d80_u02.bin.xz"
+        write(f, "")
+        assert policy.aic_find(root) == []
+
+
+def aic_override_dir_rejected():
+    with fixture() as root:
+        f = root / "usr/lib/firmware/aic8800_fw/USB/aic8800D80/fw.bin"
+        write(f, "")
+        assert [str(p) for p in policy.aic_find(root)] == [str(f)]
+
+
+def aic_stray_aic8800_path_rejected():
+    with fixture() as root:
+        f = root / "usr/lib/firmware/elsewhere/aic8800d80.bin"
         write(f, "")
         assert [str(p) for p in policy.aic_find(root)] == [str(f)]
 
@@ -199,7 +215,9 @@ def main():
     case("aic: clean root", aic_clean_root)
     case("aic: missing root", aic_missing_root)
     case("aic: empty firmware dir", aic_empty_firmware_dir)
-    case("aic: path pattern", aic_path_pattern)
+    case("aic: linux-firmware files allowed", aic_linux_firmware_allowed)
+    case("aic: override dir rejected", aic_override_dir_rejected)
+    case("aic: stray aic8800 path rejected", aic_stray_aic8800_path_rejected)
     case("aic: manifest name under another directory", aic_manifest_name_elsewhere)
     case("aic: missing manifest", aic_manifest_missing)
     case("aic: manifest name with .zst suffix", aic_manifest_suffixes)

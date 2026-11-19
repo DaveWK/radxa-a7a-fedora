@@ -1,7 +1,7 @@
 Name:           cubie-a7a-aic8800-usb
 Version:        0.4
-Release:        2%{?dist}
-Summary:        AIC8800D80 USB Wi-Fi driver and firmware loader for the Cubie A7A (firmware is a user opt-in)
+Release:        1%{?dist}
+Summary:        AIC8800D80 USB Wi-Fi driver and firmware loader for the Cubie A7A (firmware from linux-firmware)
 License:        GPL-2.0-only
 BuildArch:      noarch
 # DKMS version = package version-release: every build is a new DKMS version,
@@ -24,9 +24,11 @@ Requires:       kernel-devel
 # cubie-a7a-wifi-firmware: ar (a .deb), tar, xz/zstd (compressed files);
 # the udev helper: ip, logger.
 Requires:       binutils tar xz zstd coreutils iproute util-linux
-# No firmware dependency (DECISIONS 2026-11-11): the AIC8800D80 files are a
-# user opt-in. This package ships only the driver, the installer and the
-# name/size/SHA256 manifest; nothing here ships or downloads firmware.
+# Fedora's firmware: the AIC8800D80 firmware comes from
+# linux-firmware (aic/aic8800d80, LICENSE.aic); nothing here ships or downloads
+# firmware. A user-installed USB set (cubie-a7a-wifi-firmware) is an optional
+# override that takes precedence (WIFI-FIRMWARE.md).
+Requires:       linux-firmware
 # NetworkManager manages wlan0 only with its Wi-Fi plugin, which needs
 # wpa_supplicant or iwd; wpa_supplicant is named (Fedora Server's default).
 Recommends:     NetworkManager-wifi wpa_supplicant bluez iw wireless-regdb
@@ -40,16 +42,14 @@ the radxa-pkg/aic8800 and shenmintao/aic8800d80 forks are applied (scan
 use-after-free, command timeout, bounds checks on firmware-supplied data,
 unplug teardown).
 
-No firmware is included and there is no firmware dependency (DECISIONS
-2026-11-11: user opt-in only, no firmware file in any repository, package,
-image or bucket, and nothing downloads it). The image carries no AIC8800
-files; without the user's own files the driver logs one error and leaves the
-chip unbound in ROM mode. A user who wants Wi-Fi/Bluetooth obtains the USB
-files and installs them with cubie-a7a-wifi-firmware, which copies only files
-whose name, size and SHA256 match the pinned manifest into
-/lib/firmware/aic8800_fw/USB/aic8800D80/. The driver loads them through the
-kernel firmware loader; it never downloads anything. Read
-/usr/share/cubie-a7a/WIFI-FIRMWARE.md.
+No firmware is included: the driver loads Fedora's linux-firmware files
+(/lib/firmware/aic/aic8800d80/), which this package requires. Files a user
+installs with cubie-a7a-wifi-firmware (checked against the pinned manifest,
+names and SHA256) under /lib/firmware/aic8800_fw/USB/aic8800D80/ take
+precedence, file by file; that override is optional. It never downloads
+anything. linux-firmware 20261019's Wi-Fi image is the SDIO build, which the
+loader refuses for this USB chip, so until a USB build is there the chip stays
+unbound and the log says why. Read /usr/share/cubie-a7a/WIFI-FIRMWARE.md.
 
 Bluetooth runs on the kernel's own btusb, which binds the D80's standard
 Bluetooth interface once the firmware runs; the vendor aic_btusb is not built
@@ -110,14 +110,6 @@ install -Dpm0755 %{SOURCE6} %{buildroot}%{_libexecdir}/cubie-a7a/aic-udev
 %{_libexecdir}/cubie-a7a/aic-udev
 
 %changelog
-* Thu Nov 19 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.4-2
-- User opt-in only again (DECISIONS 2026-11-11): no Requires linux-firmware,
-  no firmware file in the image; cubie-a7a-wifi-firmware stays the
-  manifest-checked installer for the user's own files, and nothing downloads
-- The image build removes linux-firmware's aic/aic8800d80 and
-  verify-devcard.sh rejects any AIC8800 file by path pattern and by the
-  manifest's names
-
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.4-1
 - Bluetooth on the mainline btusb: aic_btusb is no longer built or shipped
   (aic_load_fw uploads the Bluetooth patch set itself); modprobe.d

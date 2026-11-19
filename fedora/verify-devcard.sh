@@ -207,12 +207,13 @@ for u in $units; do
 done
 check "no cockpit" bash -c "! grep -q '^cockpit' '$W/packages.txt'"
 check "CPU rendering: Mesa llvmpipe (libgallium), kms_swrast, EGL and GBM" bash -c "ls '$ROOT'/usr/lib64/libgallium-*.so '$ROOT'/usr/lib64/dri/kms_swrast_dri.so '$ROOT'/usr/lib64/libEGL_mesa.so.0 '$ROOT'/usr/lib64/libgbm.so.1 >/dev/null"
-# AIC8800D80 firmware is user opt-in only (DECISIONS 2026-11-11): no firmware
-# file in any image, whether from linux-firmware or an overlay.  The check is
-# by path pattern and by the driver package's manifest names
-# (fedora/devcard-policy.py).  A user installs the chip's files after the
-# build with cubie-a7a-wifi-firmware (WIFI-FIRMWARE.md).
-check "no AIC8800 firmware in the image (user opt-in only)" python3 -I "$TOP/fedora/devcard-policy.py" aic-find "$ROOT"
+# Our OVERLAY / AIC_OVERRIDE path must not copy AIC8800 firmware into the
+# image (DECISIONS 2026-11-11).  Fedora's standard linux-firmware files
+# (aic/aic8800d80) are fine (Dave 2026-11-19) and are not rejected; the
+# aic8800_fw override directory and any manifest-named copy outside
+# linux-firmware are (fedora/devcard-policy.py).  A user installs the chip's
+# files after the build with cubie-a7a-wifi-firmware (WIFI-FIRMWARE.md).
+check "no AIC8800 firmware from our OVERLAY path (aic8800_fw)" python3 -I "$TOP/fedora/devcard-policy.py" aic-find "$ROOT"
 if grep -q '^cubie-a7a-aic8800-usb-' "$W/packages.txt"; then
     for m in aic_load_fw aic8800_fdrv; do
         check "DKMS $m built for $kver" bash -c "ls '$ROOT/usr/lib/modules/$kver/extra/$m.ko'* >/dev/null"

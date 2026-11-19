@@ -64,9 +64,8 @@ interleavings, not a board test.
 - **AIC8800 Wi-Fi/Bluetooth driver source.** Most of the upstream driver
   files (radxa-pkg/aic8800) carry no licence grant, so they are not
   redistributed here. `build-rpms.sh` skips `cubie-a7a-aic8800-usb` unless
-  `AIC8800_SRC` names a local tree of the driver. The firmware is a user
-  opt-in: no AIC8800 file is in any image, and `cubie-a7a-wifi-firmware`
-  installs the user's own files (see `fedora/WIFI-FIRMWARE.md`).
+  `AIC8800_SRC` names a local tree of the driver. The firmware comes from
+  Fedora's `linux-firmware` (see `fedora/WIFI-FIRMWARE.md`).
 - **GPU firmware.** No PowerVR firmware, original or modified, is part of
   this repository. An image carries only the GPU firmware files that
   Fedora's `linux-firmware` packages install.

@@ -8,9 +8,12 @@ command prints a stable, shell-friendly result and exits nonzero on a policy
 violation, so a caller can use it directly as a check.
 
 Commands:
-  aic-find ROOT       AIC8800 firmware files in ROOT's firmware tree, by path
-                      pattern and by the driver package's manifest names
-                      (DECISIONS 2026-11-11: user opt-in only, never an image).
+  aic-find ROOT       AIC8800 firmware our own paths put in ROOT: anything
+                      under the user-override directory aic8800_fw (the
+                      OVERLAY / AIC_OVERRIDE path) and any manifest-named
+                      file outside Fedora's standard linux-firmware path
+                      aic/aic8800d80 (DECISIONS 2026-11-11; Dave 2026-11-19:
+                      the standard linux-firmware package is fine).
                       Prints one path per line; exit 1 when any is found.
   repart-root ROOT    every effective systemd-repart unit carries the
                       --discard=no drop-in; exit 1 with a diagnostic otherwise.
@@ -27,6 +30,11 @@ from pathlib import Path
 AIC_PATTERN = re.compile(r"aic8800", re.IGNORECASE)
 MANIFEST = "usr/share/cubie-a7a/aic8800-d80-usb.manifest"
 FIRMWARE = "usr/lib/firmware"
+# Fedora's standard linux-firmware package installs the D80 files here; Dave
+# 2026-11-19: that package is fine and must not be rejected.  Our own
+# OVERLAY / AIC_OVERRIDE path is aic8800_fw, which the image must not carry.
+LINUX_FIRMWARE_AIC = "aic/aic8800d80"
+OVERRIDE_DIR = "aic8800_fw"
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
 REPART_DROPIN = "10-cubie-a7a-no-discard.conf"
 REPART_REPARTD = ("etc/repart.d", "usr/lib/repart.d", "usr/local/lib/repart.d")
@@ -55,19 +63,29 @@ def _under_firmware(root):
     return [p for p in fw.rglob("*") if p.is_file() or p.is_symlink()]
 
 
-def aic_find(root):
-    """Every AIC8800 file in the image's firmware tree.
+def _from_linux_firmware(rel):
+    return rel == LINUX_FIRMWARE_AIC or rel.startswith(LINUX_FIRMWARE_AIC + "/")
 
-    Two independent tests, as the decision requires: the path pattern
-    (``aic8800`` anywhere under /usr/lib/firmware, which catches both
-    linux-firmware's aic/aic8800d80 and an overlay's aic8800_fw) and each
-    manifest name with its optional .xz/.zst suffix (which catches a copy
-    under an unrelated directory).
+
+def aic_find(root):
+    """Every AIC8800 file our own paths put in the image's firmware tree.
+
+    Fedora's standard linux-firmware files (aic/aic8800d80) are allowed.
+    Two tests catch ours: anything under the user-override directory
+    aic8800_fw (what OVERLAY / AIC_OVERRIDE would populate) and any other
+    path naming aic8800, plus each manifest name with its optional
+    .xz/.zst suffix outside linux-firmware's directory (a copy under an
+    unrelated directory).
     """
     fw = Path(root) / FIRMWARE
     hits = []
     for path in _under_firmware(root):
-        if AIC_PATTERN.search(str(path.relative_to(fw))):
+        rel = str(path.relative_to(fw))
+        if _from_linux_firmware(rel):
+            continue
+        if rel == OVERRIDE_DIR or rel.startswith(OVERRIDE_DIR + "/"):
+            hits.append(str(path))
+        elif AIC_PATTERN.search(rel):
             hits.append(str(path))
     names = aic_manifest_names(root)
     if names:
@@ -75,6 +93,9 @@ def aic_find(root):
         for name in names:
             wanted.update((name, name + ".xz", name + ".zst"))
         for path in _under_firmware(root):
+            rel = str(path.relative_to(fw))
+            if _from_linux_firmware(rel):
+                continue
             if path.name in wanted and str(path) not in hits:
                 hits.append(str(path))
     return sorted(hits)
