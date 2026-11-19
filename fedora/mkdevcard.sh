@@ -550,6 +550,18 @@ fi
 python3 -I "$TOP/fedora/devcard-policy.py" aic-find "$ROOT" >/dev/null ||
     { echo "mkdevcard: AIC8800 firmware in the image (user opt-in only)" >&2; exit 1; }
 
+# The no-discard drop-ins were written before the overlay.  Re-check the final
+# root and the final initramfs, so an overlay cannot drop a drop-in or replace
+# an initramfs with one that runs systemd-repart without --discard=no (the
+# unpartitioned gap in front of the first partition holds the boot firmware).
+python3 -I "$TOP/fedora/devcard-policy.py" repart-root "$ROOT" >/dev/null ||
+    { echo "mkdevcard: a systemd-repart unit lacks the --discard=no protection" >&2; exit 1; }
+for k in $(cat "$W/kernel.txt"); do
+    chroot "$ROOT" lsinitrd "/boot/initramfs-$k.img" 2>/dev/null |
+        python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs-listing >/dev/null ||
+        { echo "mkdevcard: initramfs-$k.img runs systemd-repart without --discard=no" >&2; exit 1; }
+done
+
 # Firmware audit, a report only (never fails the build, removes nothing):
 # which firmware files in the root and initramfs are closed blobs, Realtek's
 # named separately; fedora/image-firmware.allow lists the reviewed open

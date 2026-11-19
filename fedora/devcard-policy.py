@@ -12,6 +12,11 @@ Commands:
                       pattern and by the driver package's manifest names
                       (DECISIONS 2026-11-11: user opt-in only, never an image).
                       Prints one path per line; exit 1 when any is found.
+  repart-root ROOT    every effective systemd-repart unit carries the
+                      --discard=no drop-in; exit 1 with a diagnostic otherwise.
+  repart-initramfs-listing
+                      stdin is an lsinitrd listing: no systemd-repart, or one
+                      with the --discard=no drop-in; exit 1 otherwise.
 """
 
 import argparse
@@ -22,6 +27,9 @@ from pathlib import Path
 AIC_PATTERN = re.compile(r"aic8800", re.IGNORECASE)
 MANIFEST = "usr/share/cubie-a7a/aic8800-d80-usb.manifest"
 FIRMWARE = "usr/lib/firmware"
+REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
+REPART_DROPIN = "10-cubie-a7a-no-discard.conf"
+REPART_REPARTD = ("etc/repart.d", "usr/lib/repart.d", "usr/local/lib/repart.d")
 
 
 def aic_manifest_names(root):
@@ -72,17 +80,122 @@ def aic_find(root):
     return sorted(hits)
 
 
+def _exec_start_lines(path):
+    if not path.is_file():
+        return []
+    return [
+        line[len("ExecStart=") :]
+        for line in path.read_text().splitlines()
+        if line.startswith("ExecStart=")
+    ]
+
+
+def repart_unit_ok(root, unit):
+    """True when UNIT carries the no-discard protection.
+
+    The drop-in repeats the unit's own ExecStart with --discard=no, no other
+    drop-in sets ExecStart, and /etc does not replace the unit with a regular
+    file.  A masked unit (a /dev/null symlink) is left alone: it cannot run.
+    """
+    root = Path(root)
+    lib = root / "usr/lib/systemd/system" / unit
+    etc = root / "etc/systemd/system" / unit
+    if etc.is_symlink():
+        try:
+            if etc.resolve() == Path("/dev/null"):
+                return True
+        except OSError:
+            pass
+    if etc.exists() and not etc.is_symlink():
+        return False
+    if not lib.is_file():
+        return False
+    stock = _exec_start_lines(lib)
+    if len(stock) != 1 or not stock[0]:
+        return False
+    dropin = root / "etc/systemd/system" / (unit + ".d") / REPART_DROPIN
+    if not dropin.is_file():
+        return False
+    lines = [
+        line
+        for line in dropin.read_text().splitlines()
+        if line and not line.startswith("#")
+    ]
+    if lines != ["[Service]", "ExecStart=", f"ExecStart={stock[0]} --discard=no"]:
+        return False
+    for directory in (dropin.parent, lib.parent / (unit + ".d")):
+        if not directory.is_dir():
+            continue
+        for conf in sorted(directory.glob("*.conf")):
+            if conf == dropin:
+                continue
+            if any(
+                line.startswith("ExecStart") for line in conf.read_text().splitlines()
+            ):
+                return False
+    return True
+
+
+def repart_root_ok(root):
+    """Every effective systemd-repart unit carries the protection."""
+    root = Path(root)
+    problems = []
+    for unit in REPART_UNITS:
+        lib = root / "usr/lib/systemd/system" / unit
+        etc = root / "etc/systemd/system" / unit
+        if not lib.exists() and not etc.exists() and not etc.is_symlink():
+            continue
+        if not repart_unit_ok(root, unit):
+            problems.append(f"{unit} lacks the --discard=no drop-in")
+    configs = []
+    for rel in REPART_REPARTD:
+        directory = root / rel
+        if directory.is_dir():
+            configs += [c for c in directory.glob("*.conf") if c.is_file()]
+    if (
+        configs
+        and not (root / "usr/lib/systemd/system/systemd-repart.service").is_file()
+    ):
+        problems.append("repart.d configuration without systemd-repart.service")
+    return (not problems, problems)
+
+
+def repart_initramfs_ok(listing):
+    """An initramfs listing: no systemd-repart, or one with the drop-in."""
+    if "systemd-repart" not in listing:
+        return True, ""
+    if f"systemd-repart.service.d/{REPART_DROPIN}" not in listing:
+        return (
+            False,
+            "initramfs carries systemd-repart without the --discard=no drop-in",
+        )
+    return True, ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("aic-find")
     p.add_argument("root", type=Path)
+    p = sub.add_parser("repart-root")
+    p.add_argument("root", type=Path)
+    p = sub.add_parser("repart-initramfs-listing")
     a = ap.parse_args(argv)
     if a.cmd == "aic-find":
         hits = aic_find(a.root)
         for hit in hits:
             print(hit)
         return 1 if hits else 0
+    if a.cmd == "repart-root":
+        ok, problems = repart_root_ok(a.root)
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 0 if ok else 1
+    if a.cmd == "repart-initramfs-listing":
+        ok, problem = repart_initramfs_ok(sys.stdin.read())
+        if problem:
+            print(problem, file=sys.stderr)
+        return 0 if ok else 1
     return 2
 
 

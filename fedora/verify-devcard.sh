@@ -276,10 +276,12 @@ ExecStart=$stock --discard=no" ] || return 1
     [ -z "$others" ] || return 1
     [ ! -f "$ROOT/etc/systemd/system/$u" ] || [ -L "$ROOT/etc/systemd/system/$u" ]
 }
-initramfs_repart_no_discard() { # an initramfs that carries systemd-repart carries the drop-in too
-    local f
-    for f in "$W"/initramfs-*.txt; do
-        ! grep -q 'systemd-repart' "$f" || grep -q 'systemd-repart\.service\.d/10-cubie-a7a-no-discard\.conf' "$f" || return 1
+initramfs_repart_no_discard() { # the final initramfs: no systemd-repart, or one with the drop-in
+    local img
+    for img in "$ROOT"/boot/initramfs-*.img; do
+        [ -f "$img" ] || continue
+        "$TOP/fedora/run-build-ns.sh" user lsinitrd "$img" 2>/dev/null |
+            python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs-listing >/dev/null || return 1
     done
 }
 for u in systemd-repart.service systemd-repart@.service; do

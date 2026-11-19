@@ -102,6 +102,99 @@ def aic_manifest_suffixes():
         assert [str(p) for p in policy.aic_find(root)] == [str(f)]
 
 
+REPART_UNIT = "usr/lib/systemd/system/systemd-repart.service"
+REPART_DROPIN = (
+    "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
+)
+GOOD_DROPIN = "[Service]\nExecStart=\nExecStart=systemd-repart --discard=no\n"
+
+
+def build_repart_root(root, dropin=GOOD_DROPIN, etc_unit=None):
+    write(root / REPART_UNIT, "[Service]\nExecStart=systemd-repart\n")
+    if dropin is not None:
+        write(root / REPART_DROPIN, dropin)
+    if etc_unit is not None:
+        p = root / "etc/systemd/system/systemd-repart.service"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if etc_unit == "/dev/null":
+            p.symlink_to("/dev/null")
+        else:
+            p.write_text(etc_unit)
+
+
+def repart_good_root():
+    with fixture() as root:
+        build_repart_root(root)
+        ok, problems = policy.repart_root_ok(root)
+        assert ok, problems
+
+
+def repart_overlay_drops_dropin():
+    # The fixture overlay scenario: the unit is there, the drop-in is gone.
+    with fixture() as root:
+        build_repart_root(root, dropin=None)
+        ok, problems = policy.repart_root_ok(root)
+        assert not ok, "a missing no-discard drop-in must fail the build check"
+        assert any("systemd-repart.service" in p for p in problems), problems
+
+
+def repart_overlay_replaces_dropin():
+    with fixture() as root:
+        build_repart_root(
+            root,
+            dropin="[Service]\nExecStart=\nExecStart=systemd-repart --discard=yes\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "a --discard=yes drop-in must fail"
+
+
+def repart_other_dropin_sets_execstart():
+    with fixture() as root:
+        build_repart_root(root)
+        write(
+            root / "etc/systemd/system/systemd-repart.service.d/20-evil.conf",
+            "[Service]\nExecStart=systemd-repart --discard=yes\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "another drop-in setting ExecStart must fail"
+
+
+def repart_etc_unit_override():
+    with fixture() as root:
+        build_repart_root(root, etc_unit="[Service]\nExecStart=systemd-repart\n")
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "a regular-file /etc unit override must fail"
+
+
+def repart_masked_unit_ok():
+    with fixture() as root:
+        build_repart_root(root, etc_unit="/dev/null")
+        ok, problems = policy.repart_root_ok(root)
+        assert ok, problems
+
+
+def repart_conf_without_unit():
+    with fixture() as root:
+        write(root / "etc/repart.d/50-root.conf", "[Partition]\nType=root\n")
+        ok, problems = policy.repart_root_ok(root)
+        assert not ok, "repart.d without systemd-repart.service must fail"
+
+
+def repart_initramfs_cases():
+    ok, _ = policy.repart_initramfs_ok("usr/lib/modules/x\n")
+    assert ok, "an initramfs without systemd-repart is fine"
+    ok, _ = policy.repart_initramfs_ok(
+        "usr/lib/systemd/system/systemd-repart.service\n"
+        "usr/lib/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf\n"
+    )
+    assert ok, "an initramfs with the drop-in is fine"
+    ok, problem = policy.repart_initramfs_ok(
+        "usr/lib/systemd/system/systemd-repart.service\n"
+    )
+    assert not ok, "an initramfs with systemd-repart and no drop-in must fail"
+    assert "drop-in" in problem
+
+
 def main():
     case("aic: clean root", aic_clean_root)
     case("aic: missing root", aic_missing_root)
@@ -110,6 +203,14 @@ def main():
     case("aic: manifest name under another directory", aic_manifest_name_elsewhere)
     case("aic: missing manifest", aic_manifest_missing)
     case("aic: manifest name with .zst suffix", aic_manifest_suffixes)
+    case("repart: good root", repart_good_root)
+    case("repart: overlay drops the drop-in", repart_overlay_drops_dropin)
+    case("repart: overlay replaces the drop-in", repart_overlay_replaces_dropin)
+    case("repart: another drop-in sets ExecStart", repart_other_dropin_sets_execstart)
+    case("repart: /etc unit override", repart_etc_unit_override)
+    case("repart: masked unit", repart_masked_unit_ok)
+    case("repart: repart.d without the unit", repart_conf_without_unit)
+    case("repart: initramfs listings", repart_initramfs_cases)
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")
         return 1
