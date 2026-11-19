@@ -8,8 +8,8 @@ systemd drop-in precedence, ext4 and FAT listings) were removed when verify
 moved to an exact build manifest; their tests were removed with them. What
 remains, and is exercised here: the AIC8800 firmware provenance, the
 RPM-bound ESP admission, the dnf
-repository parser, and the small parsers (dumpe2fs, BLS loader, shadow,
-passwd, rpmdb-list cross-check, absence).  Run: python3 -I fedora/tests/devcard-policy.py
+repository parser, and the small parsers (dumpe2fs, shadow and passwd).
+Run: python3 -I fedora/tests/devcard-policy.py
 """
 
 import hashlib
@@ -466,32 +466,6 @@ def dumpe2fs_cases():
     assert policy.format_dumpe2fs("") == "0.00 GiB, 0.00 GiB free"
 
 
-def loader_entry_cases():
-    with fixture() as root:
-        entry = root / "entry.conf"
-        write(
-            entry,
-            "title Fedora\nversion 7.3.4\nlinux /vmlinuz\n"
-            "initrd /initramfs.img\noptions root=UUID=x ro\n",
-        )
-        assert policy.loader_field(entry, "linux") == "/vmlinuz"
-        assert policy.loader_field(entry, "initrd") == "/initramfs.img"
-        assert policy.loader_field(entry, "options") == "root=UUID=x ro"
-        assert policy.loader_field(entry, "missing") == ""
-        assert policy.loader_field(root / "nope.conf", "linux") == ""
-
-
-def loader_entry_empty_and_ws():
-    with fixture() as root:
-        entry = root / "entry.conf"
-        write(entry, "")
-        assert policy.loader_field(entry, "options") == ""
-        write(entry, "options\n")
-        assert policy.loader_field(entry, "options") == ""
-        write(entry, "options   a=b\tc d\n")
-        assert policy.loader_field(entry, "options") == "a=b c d"
-
-
 def shadow_cases():
     text = (
         "root:$6$salt$hash:19000:0:99999:7:::\n"
@@ -546,119 +520,6 @@ def passwd_malformed_ids_fail():
         assert policy.main(["passwd-sole-root", str(p)]) == 1
         write(p, "root:x:0:0:root:/root:/bin/bash\n")
         assert policy.main(["passwd-sole-root", str(p)]) == 0
-
-
-def verify_rpmdb_list_cases():
-    """S0-8: verify-rpmdb-list rejects silently truncated `rpm -qa` output."""
-    import rpm
-
-    with fixture() as work:
-        unsigned = _build_test_aic_rpm(work)
-        ts = rpm.TransactionSet(str(work))
-        with unsigned.open("rb") as f:
-            hdr = ts.hdrFromFdno(f.fileno())
-        root = _rpmdb_fixture(work, [(hdr.unload(),)])
-        keys = sorted(
-            Path("/usr/share/pki/rpm-gpg").glob("RPM-GPG-KEY-fedora-*-primary")
-        ) or sorted(Path("/etc/pki/rpm-gpg").glob("RPM-GPG-KEY-fedora-*-primary"))
-        assert keys, "need Fedora GPG key for fixture rpmdb"
-        subprocess.run(
-            ["rpmkeys", "--root", str(root), "--import", str(keys[0])],
-            check=True,
-            capture_output=True,
-        )
-        res = subprocess.run(
-            [
-                "rpm",
-                "--root",
-                str(root),
-                "-qa",
-                "--qf",
-                "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}\n",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        lines = sorted(res.stdout.splitlines())
-        assert len(lines) >= 2, lines
-        full_file = work / "packages-full.txt"
-        full_file.write_text("\n".join(lines) + "\n")
-        assert policy.verify_rpmdb_list(root, full_file) == len(lines)
-
-        trunc_file = work / "packages-trunc.txt"
-        trunc_file.write_text(lines[0] + "\n")
-        try:
-            policy.verify_rpmdb_list(root, trunc_file)
-            raise AssertionError("verify_rpmdb_list accepted truncated rpm -qa list")
-        except policy.PolicyError as exc:
-            assert "mismatch" in str(exc), exc
-
-
-def absence_check_cases():
-    """S0-10: absence-check detects matches and fails closed on unreadable dirs."""
-    with fixture() as root:
-        ok, problems = policy.check_absence(
-            root, "no-entries", ["home", "work", "data"]
-        )
-        assert ok, problems
-        ok, problems = policy.check_absence(root, "no-regular-files", ["dev"])
-        assert ok, problems
-        ok, problems = policy.check_absence(
-            root, "no-glob", ["etc/repart.d"], pattern="*.conf", recursive=True
-        )
-        assert ok, problems
-
-        write(root / "home/stray", "x")
-        ok, _ = policy.check_absence(root, "no-entries", ["home", "work", "data"])
-        assert not ok
-        write(root / "dev/kmsg", "oops")
-        ok, _ = policy.check_absence(root, "no-regular-files", ["dev"])
-        assert not ok
-        write(root / "etc/repart.d/50-root.conf", "[Partition]\n")
-        ok, _ = policy.check_absence(
-            root, "no-glob", ["etc/repart.d"], pattern="*.conf", recursive=True
-        )
-        assert not ok
-        write(
-            root / "usr/lib/udev/rules.d/85-nm-unmanaged.rules",
-            'ENV{NM_UNMANAGED}="1"\n',
-        )
-        ok, problems = policy.check_absence(
-            root,
-            "no-text",
-            ["etc/udev/rules.d", "usr/lib/udev/rules.d"],
-            pattern=r"NM_UNMANAGED",
-            allow_basenames=["85-nm-unmanaged.rules"],
-        )
-        assert ok, problems
-        write(root / "etc/udev/rules.d/99-bad.rules", 'ENV{NM_UNMANAGED}="1"\n')
-        ok, _ = policy.check_absence(
-            root,
-            "no-text",
-            ["etc/udev/rules.d", "usr/lib/udev/rules.d"],
-            pattern=r"NM_UNMANAGED",
-            allow_basenames=["85-nm-unmanaged.rules"],
-        )
-        assert not ok
-
-        if os.geteuid() != 0:
-            locked = root / "etc/ssh"
-            write(locked / "ssh_host_ed25519_key", "secret")
-            locked.chmod(0o000)
-            try:
-                try:
-                    policy.check_absence(
-                        root, "no-glob", ["etc/ssh"], pattern="ssh_host_*"
-                    )
-                    raise AssertionError("unreadable etc/ssh must raise PolicyError")
-                except policy.PolicyError:
-                    pass
-            finally:
-                locked.chmod(0o755)
-
-
-# --- build-time systemd checks ------------------------------------------------
 
 
 def _build_test_dtb_rpm(work, dtb_bytes, override=False, version=True):
@@ -894,6 +755,19 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def removed_verifier_commands():
+    commands = ("loader-entry", "absence-check", "verify-rpmdb-list", "shadow")
+    for command in commands:
+        result = subprocess.run(
+            [sys.executable, "-I", str(here.parent / "devcard-policy.py"), command],
+            input="root:synthetic-not-for-output:1:0:99999:7:::\n",
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2 and "invalid choice" in result.stderr, result
+        assert not result.stdout
+
+
 def main():
     case("aic-overlay: refuses firmware paths", aic_overlay_refuses_firmware_paths)
     case("aic-overlay: refuses symlink", aic_overlay_refuses_symlink)
@@ -940,16 +814,13 @@ def main():
     case("enabled repos: populated and missing dirs", enabled_repos_cases)
     case("enabled repos: empty and missing", enabled_repos_empty)
     case("dumpe2fs: sizes and empty", dumpe2fs_cases)
-    case("loader entry: fields, missing file", loader_entry_cases)
-    case("loader entry: empty and whitespace", loader_entry_empty_and_ws)
     case("shadow: root, others, empty", shadow_cases)
+    case(
+        "retired verifier commands reject invocation without stdout",
+        removed_verifier_commands,
+    )
     case("passwd: sole root policy", passwd_sole_root_cases)
     case("passwd: malformed uid/gid fails", passwd_malformed_ids_fail)
-    case(
-        "verify-rpmdb-list: silent rpm -qa truncation fails closed",
-        verify_rpmdb_list_cases,
-    )
-    case("absence-check: matches and unreadable dirs fail closed", absence_check_cases)
     case("esp-staged: the RPM-bound ESP admission (green/red)", esp_staged_cases)
     case(
         "esp-staged: root DTB and override ownership in both branches",

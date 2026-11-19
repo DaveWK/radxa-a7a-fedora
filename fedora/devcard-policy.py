@@ -26,9 +26,6 @@ trees and real tool output, so a format is never re-derived from packed bytes:
   enabled-repos DIR [DIR...]
                       enabled dnf repository ids, sorted.
   dumpe2fs IMG        "X GiB, Y GiB free" from dumpe2fs -h.
-  loader-entry FILE FIELD
-                      linux, initrd or options of a BLS entry file.
-  shadow              stdin is /etc/shadow: "salt<TAB>root-hash<TAB>others".
   passwd-sole-root FILE
                       exactly one uid 0 named root and no other human user.
   new-rpm-run BUILDROOT
@@ -40,8 +37,6 @@ trees and real tool output, so a format is never re-derived from packed bytes:
                       compare the staged root rpmdb with the retained snapshot.
   write-rpm-manifest, stage-srpm, select-rpms
                       private provenance checks for the optional aarch64 stage.
-  verify-rpmdb-list, absence-check
-                      installed package and filesystem absence checks.
 
 The exact build manifest and its verify live in fedora/devcard-manifest.py.
 """
@@ -49,7 +44,6 @@ The exact build manifest and its verify live in fedora/devcard-manifest.py.
 import argparse
 import base64
 import errno
-import fnmatch
 import hashlib
 import json
 import os
@@ -546,23 +540,6 @@ def format_dumpe2fs(text):
         number("Block size"),
     )
     return f"{blocks * size / 2**30:.2f} GiB, {free * size / 2**30:.2f} GiB free"
-
-
-def loader_field(path, field):
-    """One field of a BLS entry: linux, initrd or options."""
-    entry = Path(path)
-    if not entry.is_file():
-        return ""
-    values = []
-    for line in entry.read_text().splitlines():
-        parts = line.split()
-        if not parts or parts[0] != field:
-            continue
-        if field == "options":
-            values.append(" ".join(parts[1:]))
-        else:
-            values.append(parts[1] if len(parts) > 1 else "")
-    return "\n".join(values)
 
 
 def shadow_fields(text):
@@ -1528,118 +1505,6 @@ def select_checked_rpms(rpms_dir, checks_dir):
     return [(pkg, selected[pkg]) for pkg in order if pkg in selected]
 
 
-def verify_rpmdb_list(root, packages_file):
-    """Cross-check a captured `rpm --root ROOT -qa` listing against librpm."""
-    root = Path(root)
-    if not any((root / cand).is_file() for cand in RPMDB_CANDIDATES):
-        raise PolicyError(f"no rpm database found under {root}")
-    try:
-        import rpm
-    except ImportError as exc:
-        raise PolicyError(f"python3-rpm is unavailable: {exc}") from exc
-    try:
-        ts = rpm.TransactionSet(str(root))
-        expected = sorted(
-            hdr.format(
-                "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}"
-            )
-            for hdr in ts.dbMatch()
-        )
-    except Exception as exc:
-        raise PolicyError(f"cannot read the rpm database under {root}: {exc}") from exc
-    if not expected:
-        raise PolicyError(f"no installed packages found under {root}")
-    try:
-        actual = sorted(Path(packages_file).read_text().splitlines())
-    except OSError as exc:
-        raise PolicyError(f"cannot read package list {packages_file}: {exc}") from exc
-    if actual != expected:
-        raise PolicyError(
-            f"rpm package listing mismatch: file has {len(actual)} rows, "
-            f"rpmdb has {len(expected)}"
-        )
-    return len(expected)
-
-
-def check_absence(
-    root,
-    mode,
-    rel_paths,
-    pattern=None,
-    ignore_case=False,
-    allow_basenames=(),
-    recursive=False,
-):
-    """Fail-closed filesystem absence check using os.scandir / os.walk(onerror=...)."""
-    root = Path(root)
-    problems = []
-    allowed = set(allow_basenames)
-    flags = re.MULTILINE | (re.IGNORECASE if ignore_case else 0)
-    for rel in rel_paths:
-        target = root / rel.lstrip("/")
-        if mode == "no-entries":
-            for entry in _scandir_if_exists(target):
-                problems.append(
-                    f"unexpected entry: {entry.relative_to(root).as_posix()}"
-                )
-        elif mode == "no-regular-files":
-            if target.exists() and not target.is_symlink() and target.is_dir():
-                for entry in _walk_entries(target):
-                    if not entry.is_symlink() and entry.is_file():
-                        problems.append(
-                            f"unexpected regular file: {entry.relative_to(root).as_posix()}"
-                        )
-        elif mode == "no-glob":
-            if not pattern:
-                raise PolicyError("no-glob requires --pattern")
-            if recursive:
-                if target.exists() and not target.is_symlink() and target.is_dir():
-                    entries = list(_walk_entries(target))
-                else:
-                    entries = []
-            else:
-                entries = _scandir_if_exists(target)
-            for entry in entries:
-                if fnmatch.fnmatchcase(entry.name, pattern):
-                    problems.append(
-                        f"unexpected match for {pattern}: "
-                        f"{entry.relative_to(root).as_posix()}"
-                    )
-        elif mode == "no-text":
-            if not pattern:
-                raise PolicyError("no-text requires --pattern")
-            if target.exists() and not target.is_symlink() and target.is_dir():
-                for entry in _walk_entries(target):
-                    if (
-                        entry.name in allowed
-                        or entry.is_symlink()
-                        or not entry.is_file()
-                    ):
-                        continue
-                    try:
-                        text = entry.read_text(encoding="utf-8", errors="replace")
-                    except OSError as exc:
-                        raise PolicyError(f"cannot read {entry}: {exc}") from exc
-                    if re.search(pattern, text, flags):
-                        problems.append(
-                            f"forbidden match {pattern!r} in "
-                            f"{entry.relative_to(root).as_posix()}"
-                        )
-            elif target.is_file():
-                try:
-                    text = target.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    raise PolicyError(f"cannot read {target}: {exc}") from exc
-                if re.search(pattern, text, flags):
-                    problems.append(
-                        f"forbidden match {pattern!r} in "
-                        f"{target.relative_to(root).as_posix()}"
-                    )
-        else:
-            raise PolicyError(f"unknown absence mode: {mode!r}")
-    return (not problems, problems)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1661,10 +1526,6 @@ def main(argv=None):
     p.add_argument("dirs", nargs="+", type=Path)
     p = sub.add_parser("dumpe2fs")
     p.add_argument("img", type=Path)
-    p = sub.add_parser("loader-entry")
-    p.add_argument("path", type=Path)
-    p.add_argument("field", choices=("linux", "initrd", "options"))
-    p = sub.add_parser("shadow")
     p = sub.add_parser("passwd-sole-root")
     p.add_argument("path", type=Path)
     p = sub.add_parser("write-rpm-manifest")
@@ -1692,21 +1553,6 @@ def main(argv=None):
     p = sub.add_parser("check-installed-rpms")
     p.add_argument("root", type=Path)
     p.add_argument("records")
-    p = sub.add_parser("verify-rpmdb-list")
-    p.add_argument("root", type=Path)
-    p.add_argument("packages_file", type=Path)
-    p = sub.add_parser("absence-check")
-    p.add_argument("root", type=Path)
-    p.add_argument(
-        "--mode",
-        choices=("no-entries", "no-regular-files", "no-glob", "no-text"),
-        required=True,
-    )
-    p.add_argument("--pattern")
-    p.add_argument("--ignore-case", action="store_true")
-    p.add_argument("--allow-basename", action="append", default=[])
-    p.add_argument("--recursive", action="store_true")
-    p.add_argument("paths", nargs="+")
     a = ap.parse_args(argv)
     if a.cmd == "aic-overlay":
         try:
@@ -1765,13 +1611,6 @@ def main(argv=None):
             ["dumpe2fs", "-h", str(a.img)], capture_output=True, text=True
         )
         print(format_dumpe2fs(r.stdout))
-        return 0
-    if a.cmd == "loader-entry":
-        sys.stdout.write(loader_field(a.path, a.field))
-        return 0
-    if a.cmd == "shadow":
-        salt, root_hash, others = shadow_fields(sys.stdin.read())
-        print(f"{salt}\t{root_hash}\t{' '.join(others)}")
         return 0
     if a.cmd == "passwd-sole-root":
         try:
@@ -1834,30 +1673,6 @@ def main(argv=None):
             print(f"{a.cmd}: {exc}", file=sys.stderr)
             return 1
         return 0
-    if a.cmd == "verify-rpmdb-list":
-        try:
-            verify_rpmdb_list(a.root, a.packages_file)
-        except PolicyError as exc:
-            print(f"verify-rpmdb-list: {exc}", file=sys.stderr)
-            return 1
-        return 0
-    if a.cmd == "absence-check":
-        try:
-            ok, problems = check_absence(
-                a.root,
-                a.mode,
-                a.paths,
-                pattern=a.pattern,
-                ignore_case=a.ignore_case,
-                allow_basenames=a.allow_basename,
-                recursive=a.recursive,
-            )
-        except PolicyError as exc:
-            print(f"absence-check: {exc}", file=sys.stderr)
-            return 1
-        for problem in problems:
-            print(problem, file=sys.stderr)
-        return 0 if ok else 1
     return 2
 
 
