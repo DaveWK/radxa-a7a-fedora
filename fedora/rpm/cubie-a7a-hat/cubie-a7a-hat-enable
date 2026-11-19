@@ -69,7 +69,15 @@ blocked() {
         return 0
         ;;
     esac
-    cmd=$(printf '%s\n' "$mpconf" | awk -v m="$n" '$1 == "install" { x = $2; gsub("-", "_", x); if (x == m) { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit } }')
+    cmd=$(printf '%s\n' "$mpconf" | python3 -I -c '
+import sys
+want = sys.argv[1]
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) >= 2 and parts[0] == "install" and parts[1].replace("-", "_") == want:
+        print(" ".join(parts[2:]))
+        break
+' "$n")
     case ${cmd%% *} in
     false | true | */false | */true)
         echo "blocked in modprobe.d: install $n $cmd"
@@ -79,7 +87,16 @@ blocked() {
     for d in $admin_dirs; do
         for f in "$d"/*.conf; do
             [ -f "$f" ] || continue
-            if awk -v m="$n" '$1 == "blacklist" { x = $2; gsub("-", "_", x); if (x == m) b = 1 } END { exit !b }' "$f"; then
+            if python3 -I - "$n" "$f" <<'PY'; then
+import sys
+want, path = sys.argv[1], sys.argv[2]
+found = False
+for line in open(path):
+    parts = line.split()
+    if len(parts) >= 2 and parts[0] == "blacklist" and parts[1].replace("-", "_") == want:
+        found = True
+sys.exit(0 if found else 1)
+PY
                 echo "blocked in modprobe.d: blacklist $n in $f"
                 return 0
             fi

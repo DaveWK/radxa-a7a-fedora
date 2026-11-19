@@ -117,9 +117,9 @@ boot_kmods=$(cubie_boot_kmods "$kver")
 pinctrl_builtin=no
 case " ${boot_kmods%% -- *} " in *" pinctrl-sun60i-a733 "*) ;; *) pinctrl_builtin=yes ;; esac
 for e in "$ROOT"/boot/loader/entries/*.conf; do
-    linux=$(awk '$1=="linux"{print $2}' "$e")
-    initrd=$(awk '$1=="initrd"{print $2}' "$e")
-    opts=$(awk '$1=="options"{$1="";print}' "$e")
+    linux=$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$e" linux)
+    initrd=$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$e" initrd)
+    opts=$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$e" options)
     check "$(basename "$e"): linux $linux exists" test -f "$ROOT$linux"
     check "$(basename "$e"): initrd $initrd exists" test -f "$ROOT$initrd"
     check "$(basename "$e"): root=UUID=$uuid" grep -q "root=UUID=$uuid" <<<"$opts"
@@ -186,9 +186,13 @@ check "thermal: five zones on the A733 THS, fan cooling device" bash -c "[ \"\$(
 
 echo "== policy"
 shadow=$("$TOP/fedora/run-build-ns.sh" user cat "$ROOT/etc/shadow")
-salt=$(awk -F: '$1=="root"{split($2,a,"$"); print a[3]}' <<<"$shadow")
-if [ "$(awk -F: '$1=="root"{print $2}' <<<"$shadow")" = "$(openssl passwd -6 -salt "$salt" Fedora123)" ]; then ok "root password is Fedora123"; else bad "root password is Fedora123"; fi
-if awk -F: '$2 ~ /^\$/ && $1 != "root"' <<<"$shadow" | grep -q .; then bad "only root has a password"; else ok "only root has a password"; fi
+shadow_fields=$(python3 -I "$TOP/fedora/devcard-policy.py" shadow <<<"$shadow")
+salt=${shadow_fields%%$'\t'*}
+rest=${shadow_fields#*$'\t'}
+root_hash=${rest%%$'\t'*}
+others=${rest#*$'\t'}
+if [ "$root_hash" = "$(openssl passwd -6 -salt "$salt" Fedora123)" ]; then ok "root password is Fedora123"; else bad "root password is Fedora123"; fi
+if [ -n "$others" ]; then bad "only root has a password"; else ok "only root has a password"; fi
 check "sshd: PermitRootLogin yes" grep -q '^PermitRootLogin yes' "$ROOT/etc/ssh/sshd_config.d/00-public-image.conf"
 check "no SSH host keys" bash -c "! ls '$ROOT'/etc/ssh/ssh_host_* >/dev/null 2>&1"
 check "no authorized_keys" bash -c "! ls '$ROOT'/root/.ssh/authorized_keys* >/dev/null 2>&1"

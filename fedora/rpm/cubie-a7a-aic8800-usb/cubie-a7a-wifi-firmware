@@ -47,7 +47,26 @@ EOF
 # name size sha256 role, one manifest entry per line.
 entries() {
     [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing"
-    awk '!/^[[:space:]]*(#|$)/ { print $1, $2, $3, $4 }' "$MANIFEST"
+    python3 -I - "$MANIFEST" <<'PY'
+import sys
+for line in open(sys.argv[1]):
+    if line.strip() and not line.lstrip().startswith("#"):
+        parts = line.split()
+        print(" ".join((parts + ["", "", "", ""])[:4]))
+PY
+}
+
+# The first required file's name (the source-directory probe).
+first_required() {
+    [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing"
+    python3 -I - "$MANIFEST" <<'PY'
+import sys
+for line in open(sys.argv[1]):
+    parts = line.split()
+    if len(parts) >= 4 and parts[3] == "required":
+        print(parts[0])
+        break
+PY
 }
 
 # The file for NAME in DIR: NAME, NAME.xz or NAME.zst (regular files only).
@@ -217,7 +236,7 @@ source_dir() {
     [ -d "$src" ] || die "$src: no such directory or file"
     for c in "$src" "$src/aic8800D80" "$src/USB/aic8800D80" "$src/aic8800_fw/USB/aic8800D80" \
         "$src/lib/firmware/aic8800_fw/USB/aic8800D80" "$src/usr/lib/firmware/aic8800_fw/USB/aic8800D80"; do
-        if [ -d "$c" ] && locate "$c" "$(entries | awk '$4=="required"{print $1; exit}')" >/dev/null; then
+        if [ -d "$c" ] && locate "$c" "$(first_required)" >/dev/null; then
             printf '%s\n' "$c"
             return 0
         fi

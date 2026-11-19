@@ -7,6 +7,7 @@ set -euo pipefail
     echo 'run via fedora/private-build.sh' >&2
     exit 1
 }
+TOP=$(cd "$(dirname "$0")/.." && pwd)
 ROOT=$(realpath "${1:?ROOT}")
 REPORT=${2:?REPORT}
 [ "$ROOT" != / ] && [ -d "$ROOT/etc/ssh" ]
@@ -46,5 +47,5 @@ for address in 127.0.0.1 192.0.2.10; do
         grep -qixF "$expected" "$target_report"
     done
 done
-awk -F: '$3==0 { if ($1!="root") exit 1; roots++ } $3>=1000 && $3<60000 && $1!="root" { exit 1 } END { if (roots!=1) exit 1 }' "$ROOT/etc/passwd"
+python3 -I "$TOP/fedora/devcard-policy.py" passwd-sole-root "$ROOT/etc/passwd"
 echo 'PASS target sshd effective sole-human root/password-enabled policy (loopback and documentation remote address)'

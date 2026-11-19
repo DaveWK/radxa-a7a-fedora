@@ -180,10 +180,34 @@ decode() { # clip codec decoder output
 
 dims() { # clip -> "W H" of the first video stream
     gst-discoverer-1.0 "$1" 2>/dev/null |
-        awk '/Width:/ {w=$2} /Height:/ {h=$2} END {if (w && h) print w, h}'
+        python3 -I -c '
+import sys
+w = h = ""
+for line in sys.stdin:
+    if "Width:" in line:
+        parts = line.split()
+        w = parts[1] if len(parts) >= 2 else ""
+    if "Height:" in line:
+        parts = line.split()
+        h = parts[1] if len(parts) >= 2 else ""
+if w and h:
+    print(w, h)
+'
 }
 
-irqs() { awk '/a733-cedrus|1c0e000/ {for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) s += $i} END {print s + 0}' /proc/interrupts; }
+irqs() {
+    python3 -I -c '
+import re
+total = 0
+for line in open("/proc/interrupts"):
+    if "a733-cedrus" in line or "1c0e000" in line:
+        for field in line.split()[1:]:
+            if not re.fullmatch(r"[0-9]+", field):
+                break
+            total += int(field)
+print(total)
+'
+}
 
 compare() { # sw hw w h mode
     python3 -I - "$@" <<'PY'
@@ -225,7 +249,10 @@ for c in "$@"; do
     clip=$(clipfor "$c")
     [ -n "$clip" ] || { say "$c: SKIP no clip and no encoder here (give one with -c)"; continue; }
     ref=
-    [ -f "$clip.md5" ] && ref=$(awk '{print $1; exit}' "$clip.md5")
+    [ -f "$clip.md5" ] && ref=$(python3 -I -c 'import sys
+with open(sys.argv[1]) as f:
+    parts = f.readline().split()
+print(parts[0] if parts else "")' "$clip.md5")
     sw=
     [ -n "$ref" ] || sw=$(swdec "$c")
     [ -n "$ref$sw" ] || { say "$c: SKIP no software decoder and no $clip.md5"; continue; }
@@ -242,7 +269,7 @@ for c in "$@"; do
     t1=$(date +%s.%N)
     i1=$(irqs)
     dmesg 2>/dev/null | tail -n +"$((d0 + 1))" >"$OUT/$c-dmesg.txt"
-    info="$hw, $(basename "$clip"), $((i1 - i0)) interrupts, $(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.2f s", b - a}')"
+    info="$hw, $(basename "$clip"), $((i1 - i0)) interrupts, $(python3 -I -c 'import sys; print(f"{float(sys.argv[2]) - float(sys.argv[1]):.2f} s")' "$t0" "$t1")"
     if [ $hrc -ne 0 ]; then
         say "$c: FAIL hardware decode exited $hrc ($info; $OUT/$c.log, $OUT/$c-dmesg.txt)"
         rc=1

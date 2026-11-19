@@ -173,6 +173,35 @@ def loader_entry_empty_and_ws():
         assert policy.loader_field(entry, "options") == "a=b c d"
 
 
+def shadow_cases():
+    text = (
+        "root:$6$salt$hash:19000:0:99999:7:::\n"
+        "bin:*:19000:0:99999:7:::\n"
+        "bob:$6$x$y:19000:0:99999:7:::\n"
+    )
+    salt, root_hash, others = policy.shadow_fields(text)
+    assert salt == "salt", salt
+    assert root_hash == "$6$salt$hash", root_hash
+    assert others == ["bob"], others
+    assert policy.shadow_fields("") == ("", "", [])
+    assert policy.shadow_fields("root:*:1:0:99999:7:::\n") == ("", "*", [])
+
+
+def passwd_sole_root_cases():
+    good = "root:x:0:0:root:/root:/bin/bash\nbin:x:1:1:bin:/bin:/sbin/nologin\n"
+    assert policy.passwd_sole_root(good)
+    assert not policy.passwd_sole_root("")
+    assert not policy.passwd_sole_root(
+        "root:x:0:0:root:/root:/bin/bash\nadmin:x:0:0::/root:/bin/sh\n"
+    )
+    assert not policy.passwd_sole_root(
+        "root:x:0:0:root:/root:/bin/bash\ndave:x:1000:1000::/home/dave:/bin/bash\n"
+    )
+    assert policy.passwd_sole_root(
+        "root:x:0:0:root:/root:/bin/bash\ndave:x:500:500::/home/dave:/bin/sh\n"
+    )
+
+
 REPART_UNIT = "usr/lib/systemd/system/systemd-repart.service"
 REPART_DROPIN = (
     "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
@@ -281,6 +310,8 @@ def main():
     case("dumpe2fs: sizes and empty", dumpe2fs_cases)
     case("loader entry: fields, missing file", loader_entry_cases)
     case("loader entry: empty and whitespace", loader_entry_empty_and_ws)
+    case("shadow: root, others, empty", shadow_cases)
+    case("passwd: sole root policy", passwd_sole_root_cases)
     case("repart: good root", repart_good_root)
     case("repart: overlay drops the drop-in", repart_overlay_drops_dropin)
     case("repart: overlay replaces the drop-in", repart_overlay_replaces_dropin)

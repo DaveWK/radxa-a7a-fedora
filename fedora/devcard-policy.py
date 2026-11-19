@@ -26,6 +26,9 @@ Commands:
   dumpe2fs IMG        "X GiB, Y GiB free" from dumpe2fs -h.
   loader-entry FILE FIELD
                       linux, initrd or options of a BLS entry file.
+  shadow              stdin is /etc/shadow: "salt<TAB>root-hash<TAB>others".
+  passwd-sole-root FILE
+                      exactly one uid 0 named root and no other human user.
 """
 
 import argparse
@@ -185,6 +188,52 @@ def loader_field(path, field):
     return "\n".join(values)
 
 
+def shadow_fields(text):
+    """(root salt, root hash, non-root users with a password) of /etc/shadow.
+
+    Mirrors ``awk -F:``: the root hash's third $-separated field is the
+    salt, and any other user whose password starts with $ has a password.
+    """
+    salt, root_hash, others = "", "", []
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        user, password = parts[0], parts[1]
+        if user == "root":
+            root_hash = password
+            fields = password.split("$")
+            if len(fields) >= 3:
+                salt = fields[2]
+        elif password.startswith("$"):
+            others.append(user)
+    return salt, root_hash, others
+
+
+def passwd_sole_root(text):
+    """Exactly one uid 0, named root, and no other human (1000-59999) user.
+
+    Mirrors the check-sshd awk over /etc/passwd.
+    """
+    roots = 0
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) < 3:
+            continue
+        user, uid = parts[0], parts[2]
+        try:
+            uid = int(uid)
+        except ValueError:
+            uid = 0
+        if uid == 0:
+            if user != "root":
+                return False
+            roots += 1
+        elif 1000 <= uid < 60000 and user != "root":
+            return False
+    return roots == 1
+
+
 def _exec_start_lines(path):
     if not path.is_file():
         return []
@@ -292,6 +341,9 @@ def main(argv=None):
     p = sub.add_parser("loader-entry")
     p.add_argument("path", type=Path)
     p.add_argument("field", choices=("linux", "initrd", "options"))
+    p = sub.add_parser("shadow")
+    p = sub.add_parser("passwd-sole-root")
+    p.add_argument("path", type=Path)
     a = ap.parse_args(argv)
     if a.cmd == "aic-find":
         hits = aic_find(a.root)
@@ -319,6 +371,18 @@ def main(argv=None):
         return 0
     if a.cmd == "loader-entry":
         sys.stdout.write(loader_field(a.path, a.field))
+        return 0
+    if a.cmd == "shadow":
+        salt, root_hash, others = shadow_fields(sys.stdin.read())
+        print(f"{salt}\t{root_hash}\t{' '.join(others)}")
+        return 0
+    if a.cmd == "passwd-sole-root":
+        if not passwd_sole_root(Path(a.path).read_text()):
+            print(
+                f"{a.path}: not exactly one root login and no other human user",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     return 2
 
