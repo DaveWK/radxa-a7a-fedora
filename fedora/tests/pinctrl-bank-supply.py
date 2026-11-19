@@ -109,11 +109,13 @@ with tempfile.TemporaryDirectory(prefix="a7a-pinctrl-supply-") as td:
         assert r.returncode in (0, 1), r
         races += r.returncode
         last = r.stdout if r.returncode or not last else last
-        if a.fail_disable:
+        if a.fail_disable and not a.expect_race:
             failed = re.search(r"^disable returned error +(\d+)$", r.stdout, re.M)
             logged = re.search(r"^driver dev_err calls +(\d+)$", r.stdout, re.M)
+            put_after = re.search(r"^put after failed disable +(\d+)$", r.stdout, re.M)
             assert failed and int(failed.group(1)) == a.fail_disable, r.stdout
             assert logged and int(logged.group(1)) == a.fail_disable, r.stdout
+            assert put_after and int(put_after.group(1)) == a.fail_disable, r.stdout
 print(last, end="")
 kind = "with the bank lock" if locked else "without a bank lock"
 if a.fail_disable:

@@ -35,7 +35,8 @@
 /* ---- counters ---------------------------------------------------------- */
 static atomic_long ev_underflow, ev_add_on_zero, ev_null_handle, ev_stale_handle,
 	ev_put_enabled, ev_unbalanced_disable, ev_supply_off_in_use;
-static atomic_long ev_dev_err, ev_disable_failed;
+static atomic_long ev_dev_err, ev_disable_failed, ev_put_after_failed_disable,
+	ev_duplicate_disable, ev_put_before_log;
 static atomic_long live_handles, rdev_use_count;
 
 /* ---- kernel shims ------------------------------------------------------ */
@@ -121,6 +122,8 @@ static inline void mutex_guard_exit(struct mutex **lock)
 struct regulator {
 	atomic_uint magic;
 	atomic_int enable_count;
+	atomic_int disable_failed;
+	atomic_int disable_calls;
 };
 
 static unsigned int jitter_us;
@@ -173,26 +176,38 @@ static int regulator_enable(struct regulator *reg)
 	return 0;
 }
 
-static int fail_disable;	/* balanced disables that report an error */
+static atomic_int fail_disable;	/* regulator_disable calls that fail with -EIO */
 
 static int regulator_disable(struct regulator *reg)
 {
+	int left;
+
 	if (!reg_usable(reg))
 		return -EINVAL;
+	if (atomic_fetch_add(&reg->disable_calls, 1) > 0)
+		atomic_fetch_add(&ev_duplicate_disable, 1);
+	if (atomic_load(&reg->enable_count) <= 0) {
+		atomic_fetch_add(&ev_unbalanced_disable, 1);
+		return -EIO;
+	}
+	/* Inject the failure at the regulator_disable() call itself, before
+	 * decrementing enable_count or rdev_use_count: the regulator remains
+	 * enabled on error, matching the kernel regulator core and testing
+	 * the driver's real ordering (disable -> log -> put -> clear). */
+	left = atomic_load(&fail_disable);
+	while (left > 0) {
+		if (atomic_compare_exchange_weak(&fail_disable, &left, left - 1)) {
+			atomic_store(&reg->disable_failed, 1);
+			atomic_fetch_add(&ev_disable_failed, 1);
+			return -EIO;
+		}
+	}
 	if (atomic_fetch_sub(&reg->enable_count, 1) <= 0) {
 		atomic_fetch_add(&reg->enable_count, 1);
 		atomic_fetch_add(&ev_unbalanced_disable, 1);
 		return -EIO;
 	}
 	atomic_fetch_sub(&rdev_use_count, 1);
-	if (fail_disable > 0) {
-		/* The use count is dropped (the regulator is off) but the call
-		 * reports an error, so the test exercises the driver's error
-		 * path without conflating it with a hardware leak. */
-		fail_disable--;
-		atomic_fetch_add(&ev_disable_failed, 1);
-		return -EIO;
-	}
 	return 0;
 }
 
@@ -200,8 +215,17 @@ static void regulator_put(struct regulator *reg)
 {
 	if (!reg_usable(reg))
 		return;
-	if (atomic_load(&reg->enable_count))
-		atomic_fetch_add(&ev_put_enabled, 1);
+	if (atomic_load(&reg->enable_count)) {
+		if (atomic_load(&reg->disable_failed) &&
+		    atomic_load(&reg->enable_count) == 1) {
+			atomic_fetch_add(&ev_put_after_failed_disable, 1);
+			if (atomic_load(&ev_dev_err) <
+			    atomic_load(&ev_disable_failed))
+				atomic_fetch_add(&ev_put_before_log, 1);
+		} else {
+			atomic_fetch_add(&ev_put_enabled, 1);
+		}
+	}
 	/* Kept allocated on purpose: a later use is counted, not a crash. */
 	atomic_store(&reg->magic, REG_PUT);
 	atomic_fetch_sub(&live_handles, 1);
@@ -270,11 +294,13 @@ static void *user_thread(void *arg)
 			if (u->gpio)
 				pthread_mutex_unlock(&pctldev_mutex);
 		}
-		/* This user holds pins of the bank: its supply must be on. */
-		if (atomic_load(&rdev_use_count) <= 0)
+		/* This user holds pins of the bank: its supply must be on.
+		 * Subtract failed-disable leftovers so an active supply drop
+		 * is still caught after an earlier injected disable error. */
+		if (atomic_load(&rdev_use_count) - atomic_load(&ev_disable_failed) <= 0)
 			atomic_fetch_add(&ev_supply_off_in_use, 1);
 		jitter();
-		if (atomic_load(&rdev_use_count) <= 0)
+		if (atomic_load(&rdev_use_count) - atomic_load(&ev_disable_failed) <= 0)
 			atomic_fetch_add(&ev_supply_off_in_use, 1);
 		pthread_mutex_lock(u->gpio ? &pctldev_mutex : &pinctrl_list_mutex);
 		for (i = 0; i < u->npins; i++)
@@ -299,7 +325,7 @@ int main(int argc, char **argv)
 
 	rounds = argc > 1 ? atoi(argv[1]) : 20000;
 	jitter_us = argc > 2 ? (unsigned int)atoi(argv[2]) : 3;
-	fail_disable = argc > 3 ? atoi(argv[3]) : 0;
+	atomic_store(&fail_disable, argc > 3 ? atoi(argv[3]) : 0);
 @INIT_LOCKS@
 	pthread_barrier_init(&start, NULL, ARRAY_SIZE(users));
 	for (i = 0; i < ARRAY_SIZE(users); i++)
@@ -307,8 +333,11 @@ int main(int argc, char **argv)
 	for (i = 0; i < ARRAY_SIZE(users); i++)
 		pthread_join(users[i].thread, NULL);
 
-	/* Every pin is free again: nothing may be left behind. */
+	/* Every pin is free again: nothing may be left behind except the
+	 * regulator enables that failed to disable at regulator_disable(). */
 	leaked = atomic_load(&live_handles);
+	long disable_failed = atomic_load(&ev_disable_failed);
+	long extra_enables = atomic_load(&rdev_use_count) - disable_failed;
 	printf("rounds=%d users=%zu\n", rounds, ARRAY_SIZE(users));
 	printf("refcount underflow            %ld\n", atomic_load(&ev_underflow));
 	printf("refcount addition on 0        %ld\n", atomic_load(&ev_add_on_zero));
@@ -317,17 +346,23 @@ int main(int argc, char **argv)
 	printf("put handle used again         %ld\n", atomic_load(&ev_stale_handle));
 	printf("put while still enabled       %ld\n", atomic_load(&ev_put_enabled));
 	printf("unbalanced disable            %ld\n", atomic_load(&ev_unbalanced_disable));
-	printf("disable returned error        %ld\n", atomic_load(&ev_disable_failed));
+	printf("duplicate disable on handle   %ld\n", atomic_load(&ev_duplicate_disable));
+	printf("put before dev_err on fail    %ld\n", atomic_load(&ev_put_before_log));
+	printf("disable returned error        %ld\n", disable_failed);
+	printf("put after failed disable      %ld\n", atomic_load(&ev_put_after_failed_disable));
 	printf("driver dev_err calls          %ld\n", atomic_load(&ev_dev_err));
 	printf("handles leaked at the end     %ld\n", leaked);
 	printf("supply enables left           %ld\n", atomic_load(&rdev_use_count));
+	printf("unaccounted enables left      %ld\n", extra_enables);
 	printf("bank handle pointer at end    %s\n", s_reg->regulator ? "set" : "NULL");
 	bad = atomic_load(&ev_underflow) + atomic_load(&ev_add_on_zero) +
 	      atomic_load(&ev_supply_off_in_use) + atomic_load(&ev_null_handle) +
 	      atomic_load(&ev_stale_handle) + atomic_load(&ev_put_enabled) +
-	      atomic_load(&ev_unbalanced_disable) + leaked +
-	      atomic_load(&rdev_use_count) + (s_reg->regulator ? 1 : 0) +
-	      (atomic_load(&ev_dev_err) != atomic_load(&ev_disable_failed) ? 1 : 0);
+	      atomic_load(&ev_unbalanced_disable) + atomic_load(&ev_duplicate_disable) +
+	      atomic_load(&ev_put_before_log) + leaked +
+	      (extra_enables != 0 ? 1 : 0) + (s_reg->regulator ? 1 : 0) +
+	      (atomic_load(&ev_put_after_failed_disable) != disable_failed ? 1 : 0) +
+	      (atomic_load(&ev_dev_err) != disable_failed ? 1 : 0);
 	printf("%s\n", bad ? "RACE" : "CLEAN");
 	return bad ? 1 : 0;
 }
