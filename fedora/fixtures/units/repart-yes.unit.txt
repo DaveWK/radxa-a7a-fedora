@@ -1,4 +1,0 @@
-Unit Load State: loaded
-Fragment Path: /usr/lib/systemd/system/systemd-repart.service
-DropIn Path: /etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf
-Command Line: systemd-repart --dry-run=no --discard=no

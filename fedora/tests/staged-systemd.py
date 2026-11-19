@@ -3,6 +3,7 @@
 """Real loader tests and reproducible seed fixture construction."""
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -57,19 +58,20 @@ def fixture(root, mode):
     )
 
 
-def run(root, mode, prefix=()):
+def run(root, mode, prefix=(), pins=None, extra=()):
     return subprocess.run(
         [
             *prefix,
             *CHECK,
             "check",
             str(root),
-            str(PINS),
+            str(pins or root.parent / "pins"),
             mode,
             "--root-uuid",
             ROOT_UUID,
             "--esp-uuid",
             ESP_UUID,
+            *extra,
         ],
         text=True,
         capture_output=True,
@@ -84,9 +86,19 @@ def require(result, rc, diagnostic=None):
 
 def tests(work, base):
     ctx = ["unshare", "--map-auto", "--map-root-user", "--"]
+    pins = work / "pins"
+    pins.mkdir()
     for mode in ("yes", "no", "initramfs"):
         root = work / f"good-{mode}"
         fixture(root, mode)
+        require(
+            subprocess.run(
+                [*CHECK, "capture", str(root), str(pins), mode],
+                capture_output=True,
+                text=True,
+            ),
+            0,
+        )
         require(run(root, mode), 0)
         if mode == "yes":
             require(run(root, mode, ctx), 0)
@@ -163,7 +175,7 @@ def tests(work, base):
         *CHECK,
         "check",
         str(root),
-        str(PINS),
+        str(pins),
         "yes",
         "--root-uuid",
         ROOT_UUID,
@@ -191,6 +203,79 @@ def tests(work, base):
     fixture(root, "yes")
     write(root, "run/repart.d/unexpected.conf", "[Partition]\n")
     require(run(root, "yes"), 1, "repart.d inventory")
+    root = work / "changed"
+    fixture(root, "yes")
+    drop = root / ADMIN / f"{TEMPLATE}.d/10-cubie-a7a-no-discard.conf"
+    with drop.open("a") as stream:
+        stream.write("# changed\n")
+    require(run(root, "yes"), 1, str(drop.relative_to(root)))
+    root = work / "alias-and-mask"
+    fixture(root, "yes")
+    alias = root / ADMIN / "repart-alias.service"
+    alias.symlink_to(f"/{UNIT_DIR}/{UNIT}")
+    require(run(root, "yes"), 1, alias.name)
+    alias.unlink()
+    mask = root / ADMIN / TEMPLATE
+    mask.symlink_to("/dev/null")
+    require(run(root, "yes"), 1, str(mask.relative_to(root)))
+    mask.unlink()
+    want = root / ADMIN / "multi-user.target.wants"
+    want.mkdir()
+    (want / "ignored.service").symlink_to(f"/{UNIT_DIR}/{UNIT}")
+    require(run(root, "yes"), 0)
+    missing = work / "missing-pins"
+    missing.mkdir()
+    require(
+        run(root, "yes", pins=missing), 1, "missing complete pinned systemd fixtures"
+    )
+    output = work / "captured.inventory"
+    output.mkdir()
+    require(
+        run(
+            root,
+            "yes",
+            pins=missing,
+            extra=("--capture-dir", str(output), "--label", "root"),
+        ),
+        0,
+    )
+    require(
+        run(
+            work / "good-initramfs",
+            "initramfs",
+            pins=missing,
+            extra=("--capture-dir", str(output), "--label", "initramfs-fixture"),
+        ),
+        0,
+    )
+    assert sorted(path.name for path in output.iterdir()) == [
+        "inventory-initramfs-fixture.json",
+        "inventory-root.json",
+        "loader-initramfs-fixture-sysinit.target.txt",
+        "loader-root-sysinit.target.txt",
+        "loader-root-systemd-repart.service.txt",
+        "unit-initramfs-fixture.txt",
+        "unit-root.txt",
+    ]
+    assert json.loads((output / "inventory-root.json").read_text())["schema"] == 1
+    stage = (FEDORA / "mkdevcard.sh").read_text()
+    stop = '[ "$capture" = 0 ] || die "inventory captured in $OUT.inventory; pin it and rebuild"'
+    assert stage.index(stop) < stage.index("mkfs.ext4 -q")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'die() { printf "%s\\n" "$*" >&2; exit 1; }; capture=1; OUT=$1; '
+            + stop
+            + '; touch "$OUT"',
+            "bash",
+            str(work / "captured"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    require(result, 1, "inventory captured")
+    assert not (work / "captured").exists()
     print(
         "real manager, identity, complete drop-ins, activation, fstab and repart policy passed"
     )

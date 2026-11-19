@@ -581,8 +581,18 @@ STAGE1
 # systemd's own resolution and dracut's own reader; a deviation fails the build.
 # There is no fallback when a tool is missing (devcard-policy.py fails closed).
 UNITS_FIXTURES=$TOP/fedora/fixtures/units
+capture=${DEVCARD_INVENTORY_CAPTURE:-0}
+capture_args=()
+case $capture in
+0) ;;
+1)
+    mkdir -- "$OUT.inventory"
+    capture_args=(--capture-dir "$OUT.inventory")
+    ;;
+*) die "DEVCARD_INVENTORY_CAPTURE must be 0 or 1" ;;
+esac
 python3 -I "$TOP/fedora/staged-systemd.py" check "$ROOT" "$UNITS_FIXTURES" "$GROW_ROOT" \
-    --root-uuid "$ROOT_UUID" --esp-uuid "$ESP_UUID"
+    --root-uuid "$ROOT_UUID" --esp-uuid "$ESP_UUID" "${capture_args[@]}" --label root
 
 # Validate exactly the build's final images and audit those same native trees.
 python3 -I "$TOP/fedora/initramfs-policy.py" set "$ROOT" "$W/kernel.txt"
@@ -596,7 +606,8 @@ while IFS= read -r k; do
     module_args=(--board "${boot%% -- *}" --stock "${boot##* -- }")
     [ "$BOOT_MODES" != protective ] || module_args+=(--protective)
     python3 -I "$TOP/fedora/initramfs-policy.py" modules "$unpack" "$k" "${module_args[@]}"
-    python3 -I "$TOP/fedora/staged-systemd.py" check "$unpack" "$UNITS_FIXTURES" initramfs
+    python3 -I "$TOP/fedora/staged-systemd.py" check "$unpack" "$UNITS_FIXTURES" initramfs \
+        "${capture_args[@]}" --label "initramfs-$k"
     audit_roots+=(--root "$unpack")
     unpacked+=("$unpack")
 done <"$W/kernel.txt"
@@ -604,6 +615,7 @@ python3 -I "$TOP/fedora/image-firmware.py" audit "${audit_roots[@]}" --quiet \
     --allow "$TOP/fedora/image-firmware.allow" --json "$W/firmware-audit.json" \
     >"$W/firmware-audit.txt" 2>&1 || echo "mkdevcard: firmware audit did not run (report only)" >&2
 rm -rf -- "${unpacked[@]}"
+[ "$capture" = 0 ] || die "inventory captured in $OUT.inventory; pin it and rebuild"
 
 # The ESP, on the staged tree before mtools, bound to the built cubie-a7a-dtb
 # RPM's own file list (stamps first; DTB, VERSION and esp-override from rpm -qp
@@ -702,7 +714,7 @@ EOF
 MANIFEST_PATH="$OUT.devcard-manifest.json"
 manifest_sha=$(python3 -I "$TOP/fedora/devcard-manifest.py" write "$OUT" "$ROOT" \
     "$RPM_RECORDS" "$TOP/fedora/fixtures/units" "$MANIFEST_PATH" \
-    --esp-model "$W/esp-model.json") ||
+    --esp-model "$W/esp-model.json" --grow-root "$GROW_ROOT") ||
     die "cannot write the build manifest"
 cat >>"$W/manifest.txt" <<EOF
 manifest    $MANIFEST_PATH sha256 $manifest_sha

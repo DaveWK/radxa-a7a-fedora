@@ -29,6 +29,8 @@ SYSINIT = "sysinit.target"
 UNIT_BLOCK = re.compile(r"^\s*→ Unit ([^\s:]+):")
 FIELDS = ("Unit Load State:", "Fragment Path:", "DropIn Path:", "Command Line:")
 REPART_DIRS = ("etc", "run", "usr/local/lib", "usr/lib")
+REPART_NAMES = re.compile(r"systemd-repart(?:@[^/]*)?\.service")
+ENABLE_DIRS = (".wants", ".requires", ".upholds")
 
 
 class PolicyError(RuntimeError):
@@ -89,7 +91,7 @@ def unit_paths(root):
             yield current
 
 
-def loader(root, unit, whole=False):
+def loader(root, unit, whole=False, dumps=None):
     path = ":".join(str(root / part) for part in UNIT_DIRS)
     result = subprocess.run(
         [
@@ -118,7 +120,10 @@ def loader(root, unit, whole=False):
         raise PolicyError(
             f"nested systemd loader for {unit}: exit {result.returncode}: {result.stderr.strip()}"
         )
-    return parse_dump(root, result.stdout)
+    blocks = parse_dump(root, result.stdout)
+    if dumps is not None:
+        dumps[unit] = result.stdout
+    return blocks
 
 
 def parse_dump(root, dump):
@@ -154,24 +159,36 @@ def inventory(root):
     for path in unit_paths(root):
         for entry in walk(path):
             rel = entry.relative_to(root)
+            parts = entry.relative_to(path).parts
+            if not parts or any(p.endswith(ENABLE_DIRS) for p in parts[:-1]):
+                continue
+            dropin = any(p.endswith(".d") for p in parts[:-1])
+            named = REPART_NAMES.fullmatch(entry.name)
             if entry.is_symlink():
-                records[rel.as_posix()] = {"link": os.readlink(entry)}
-            elif any(p.endswith(".d") for p in rel.parts[:-1]) or entry.name in (
-                REPART,
-                TEMPLATE,
-            ):
+                raw = os.readlink(entry)
+                target = resolve(root, rel, masks=True)
+                if entry.name.endswith(".d") or (dropin and target and target.is_dir()):
+                    raise PolicyError(
+                        f"cannot inventory symlinked drop-in directory: {rel}"
+                    )
+                if dropin or named or (target and REPART_NAMES.fullmatch(target.name)):
+                    records[rel.as_posix()] = {"type": "symlink", "target": raw}
+            elif dropin or named:
                 if entry.is_dir():
+                    if named:
+                        raise PolicyError(f"unexpected repart directory: {rel}")
                     continue
                 if not entry.is_file():
                     raise PolicyError(f"unexpected unit inventory entry: {rel}")
                 records[rel.as_posix()] = {
-                    "sha256": hashlib.sha256(entry.read_bytes()).hexdigest()
+                    "type": "file",
+                    "sha256": hashlib.sha256(entry.read_bytes()).hexdigest(),
                 }
-    return records
+    return {"schema": 1, "entries": records}
 
 
-def configuration(root, mode):
-    blocks = loader(root, SYSINIT, whole=mode == "initramfs")
+def configuration(root, mode, dumps=None):
+    blocks = loader(root, SYSINIT, whole=mode == "initramfs", dumps=dumps)
     if mode == "initramfs":
         for name in (REPART, TEMPLATE):
             if any(os.path.lexists(root / sub / name) for sub in UNIT_DIRS):
@@ -197,7 +214,7 @@ def configuration(root, mode):
                 f"no persistent {SYSINIT}.wants/{REPART} link to its staged fragment"
             )
         print("persistent repart activation:", ", ".join(links), file=sys.stderr)
-        blocks = loader(root, REPART)
+        blocks = loader(root, REPART, dumps=dumps)
         state = "loaded"
     else:
         for name in (REPART, TEMPLATE):
@@ -266,21 +283,51 @@ def repart_files(root, mode, root_uuid=None, esp_uuid=None):
         )
 
 
-def check(root, fixtures, mode, root_uuid=None, esp_uuid=None):
-    expected_units = (fixtures / f"repart-{mode}.unit.txt").read_text()
-    expected = json.loads((fixtures / f"repart-{mode}.inventory.json").read_text())
-    actual_units = configuration(root, mode)
-    actual = inventory(root)
-    for name in sorted(expected.keys() | actual.keys()):
-        if actual.get(name) != expected.get(name):
-            raise PolicyError(
-                f"unit inventory mismatch at {name}: expected {expected.get(name)}, got {actual.get(name)}"
-            )
-    if actual_units != expected_units:
+def check(
+    root, fixtures, mode, root_uuid=None, esp_uuid=None, capture=None, label=None
+):
+    pins = (
+        fixtures / f"repart-{mode}.unit.txt",
+        fixtures / f"repart-{mode}.inventory.json",
+    )
+    present = [os.path.lexists(path) for path in pins]
+    if any(present) != all(present) or not (all(present) or capture):
         raise PolicyError(
-            f"effective {REPART}, mode {mode}: expected {expected_units!r}, got {actual_units!r}"
+            f"missing complete pinned systemd fixtures for {mode}: {pins}"
         )
+    dumps = {} if capture else None
+    actual_units = configuration(root, mode, dumps)
+    actual = inventory(root)
+    if all(present):
+        expected_units = pins[0].read_text()
+        expected = json.loads(pins[1].read_text())
+        if (
+            not isinstance(expected, dict)
+            or expected.get("schema") != 1
+            or not isinstance(expected.get("entries"), dict)
+            or set(expected) != set(actual)
+        ):
+            raise PolicyError(f"{pins[1]}: invalid inventory schema")
+        before, after = expected["entries"], actual["entries"]
+        for name in sorted(before.keys() | after.keys()):
+            if before.get(name) != after.get(name):
+                raise PolicyError(
+                    f"unit inventory mismatch at {name}: expected {before.get(name)}, got {after.get(name)}"
+                )
+        if actual_units != expected_units:
+            raise PolicyError(
+                f"effective {REPART}, mode {mode}: expected {expected_units!r}, got {actual_units!r}"
+            )
     repart_files(root, mode, root_uuid, esp_uuid)
+    if capture is not None:
+        if not label or not re.fullmatch(r"(?:root|initramfs-[A-Za-z0-9_.+-]+)", label):
+            raise PolicyError(f"invalid capture label: {label!r}")
+        (capture / f"inventory-{label}.json").write_text(
+            json.dumps(actual, sort_keys=True, indent=2) + "\n"
+        )
+        (capture / f"unit-{label}.txt").write_text(actual_units)
+        for unit, dump in dumps.items():
+            (capture / f"loader-{label}-{unit}.txt").write_text(dump)
 
 
 def main():
@@ -298,6 +345,8 @@ def main():
         if name == "check":
             cli.add_argument("--root-uuid")
             cli.add_argument("--esp-uuid")
+            cli.add_argument("--capture-dir", type=Path)
+            cli.add_argument("--label")
     args = parser.parse_args()
     try:
         root = args.root.resolve(strict=True)
@@ -325,7 +374,15 @@ def main():
                 json.dumps(inventory(root), sort_keys=True, indent=2) + "\n"
             )
         else:
-            check(root, args.fixtures, args.mode, args.root_uuid, args.esp_uuid)
+            check(
+                root,
+                args.fixtures,
+                args.mode,
+                args.root_uuid,
+                args.esp_uuid,
+                args.capture_dir,
+                args.label,
+            )
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"staged-systemd: {exc}", file=sys.stderr)

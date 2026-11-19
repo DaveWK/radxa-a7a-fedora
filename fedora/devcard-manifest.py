@@ -52,7 +52,6 @@ FIRMWARE_GAP_LBA = 256
 ESP_DTB = "dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
 FW_DTB_STAMP = "var/lib/cubie-a7a/firmware-dtb-version"
 PKG_DTB_VERSION = "usr/lib/cubie-a7a/dtb/VERSION"
-PINNED_UNIT_MODES = ("yes", "no", "initramfs")
 
 
 class ManifestError(RuntimeError):
@@ -229,10 +228,10 @@ def _initramfs_model(root):
     return files
 
 
-def _pinned_units_model(fixtures_dir):
+def _pinned_units_model(fixtures_dir, grow_root):
     base = Path(fixtures_dir)
     units = {}
-    for mode in PINNED_UNIT_MODES:
+    for mode in (grow_root, "initramfs"):
         for suffix in ("unit.txt", "inventory.json"):
             name = f"repart-{mode}.{suffix}"
             path = base / name
@@ -263,7 +262,9 @@ def _rpm_model(records):
     return sorted(entries, key=lambda e: e["nevra"])
 
 
-def write_manifest(img, root, esp_files, rpm_records, fixtures_dir, manifest):
+def write_manifest(
+    img, root, esp_files, rpm_records, fixtures_dir, manifest, grow_root="yes"
+):
     img = Path(img)
     root = Path(root)
     payload = {
@@ -281,7 +282,7 @@ def write_manifest(img, root, esp_files, rpm_records, fixtures_dir, manifest):
             "firmware_stamp_sha256": _sha256_path(root / FW_DTB_STAMP),
             "package_stamp_sha256": _sha256_path(root / PKG_DTB_VERSION),
         },
-        "pinned_units": _pinned_units_model(fixtures_dir),
+        "pinned_units": _pinned_units_model(fixtures_dir, grow_root),
         "rpms": _rpm_model(rpm_records),
         "image_sha256": _sha256_path(img),
     }
@@ -462,6 +463,7 @@ def main(argv=None):
     p.add_argument("rpm_records")
     p.add_argument("fixtures_dir", type=Path)
     p.add_argument("manifest", type=Path)
+    p.add_argument("--grow-root", choices=("yes", "no"), default="yes")
     esp = p.add_mutually_exclusive_group(required=True)
     esp.add_argument("--esp-dir", type=Path)
     esp.add_argument("--esp-model", type=Path)
@@ -502,7 +504,13 @@ def main(argv=None):
             except json.JSONDecodeError as exc:
                 raise ManifestError(f"cannot read retained RPM records: {exc}") from exc
             payload = write_manifest(
-                a.img, a.root, esp_files, rpm_records, a.fixtures_dir, a.manifest
+                a.img,
+                a.root,
+                esp_files,
+                rpm_records,
+                a.fixtures_dir,
+                a.manifest,
+                a.grow_root,
             )
             print(_sha256_path(a.manifest))
         else:

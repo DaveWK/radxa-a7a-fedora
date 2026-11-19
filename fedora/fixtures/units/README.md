@@ -1,23 +1,19 @@
-# Staged systemd fixture regeneration
+# Staged systemd inventory capture
 
-`repart-yes`, `repart-no`, and `repart-initramfs` each pin the real manager
-result and the complete unit inventory. From an owned staged fixture tree:
+No production pins are supplied yet. The separately gated task-000147
+capture uses `DEVCARD_INVENTORY_CAPTURE=1`. It saves inventories, normalized
+unit results and raw manager dumps under `$OUT.inventory/` and exits nonzero
+before packing.
 
-```sh
-python3 -I fedora/staged-systemd.py capture "$root" "$candidate_fixtures" yes
-python3 -I fedora/staged-systemd.py capture "$no_grow_root" "$candidate_fixtures" no
-python3 -I fedora/staged-systemd.py capture "$unpacked_initramfs" "$candidate_fixtures" initramfs
-```
+After independent review, pin each selected mode as
+`repart-{yes,no,initramfs}.unit.txt` and `repart-{yes,no,initramfs}.inventory.json`.
+For example, for `GROW_ROOT=yes`, review `unit-root.txt` and
+`inventory-root.json` and pin them under `repart-yes`. If initramfs inventories
+differ across supported profiles, do not silently bless or union them.
+A normal build requires both pins for each checked mode and exact equality.
 
-Generate into a separate existing directory. Review the effective commands
-and every inventory difference before updating the pin; never capture a failed
-overlay or automatically refresh pins during an image build.
-
-The initial pins are seed fixtures made by
-`python3 -I fedora/tests/staged-systemd.py --seed-pins "$candidate_fixtures"`.
-They exercise the real loader against the stock repart fragment, its drop-ins,
-the vendor wants link, both masks, and the no-repart initramfs case. They do
-not attest to a real Fedora image's full symlink and drop-in inventory.
+The synthetic `fedora/tests/staged-systemd.py` fixtures exercise the real
+loader but are not deployment pins.
 
 The older `*.cat-config` outputs are retained as source for the seed fixture
 and for regression comparison with the former resolver.
