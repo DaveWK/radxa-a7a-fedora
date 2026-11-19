@@ -65,7 +65,9 @@ python3 -I "$TOP/fedora/image-extract.py" extract-partition "$IMG" "$VERIFY_ROOT
     echo "verify-devcard: cannot extract the root partition from $IMG" >&2
     exit 1
 }
-python3 -I "$TOP/fedora/image-extract.py" extract-root "$VERIFY_ROOT_IMG" "$VERIFY_ROOT" || {
+# rdump preserves filesystem ownership; map the same IDs as the image builder
+# rather than ignoring chown errors on a rootless workstation.
+"$TOP/fedora/run-build-ns.sh" user python3 -I "$TOP/fedora/image-extract.py" extract-root "$VERIFY_ROOT_IMG" "$VERIFY_ROOT" || {
     echo "verify-devcard: cannot read the root filesystem in $IMG" >&2
     exit 1
 }
