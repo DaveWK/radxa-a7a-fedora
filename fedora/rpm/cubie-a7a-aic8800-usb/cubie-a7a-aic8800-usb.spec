@@ -24,7 +24,7 @@ Requires:       dkms gcc make kmod
 Requires:       kernel-devel
 # cubie-a7a-wifi-firmware: ar (a .deb), tar, xz/zstd (compressed files);
 # the udev helper: ip, logger.
-Requires:       binutils tar xz zstd coreutils iproute util-linux
+Requires:       binutils tar xz zstd coreutils iproute util-linux python3
 # Fedora's firmware: the AIC8800D80 firmware comes from
 # linux-firmware (aic/aic8800d80, LICENSE.aic); nothing here ships or downloads
 # firmware. A user-installed USB set (cubie-a7a-wifi-firmware) is an optional

@@ -92,6 +92,13 @@ expect_manifest_error "malformed manifest (bad sha256)" "$tmp/malformed-sha.mani
 printf 'a.bin 1 %s bogus\n' "$sha_a" >"$tmp/malformed-role.manifest"
 expect_manifest_error "malformed manifest (bad role)" "$tmp/malformed-role.manifest" "bad role"
 
+for name in 'sub/fw.bin' 'x..y.bin'; do
+    printf '%s 1 %s required\n' "$name" "$sha_a" >"$tmp/path.manifest"
+    expect_manifest_error "unsafe name $name" "$tmp/path.manifest" "unsafe basename"
+done
+printf 'fw.bin 1 %s required\nfw.bin 1 %s optional\n' "$sha_a" "$sha_b" >"$tmp/repeated.manifest"
+expect_manifest_error "duplicate basename" "$tmp/repeated.manifest" "duplicate name"
+
 # No required entry (only optional).
 printf 'a.bin 1 %s optional\nb.bin 1 %s optional\n' "$sha_a" "$sha_b" >"$tmp/no-required.manifest"
 expect_manifest_error "manifest without a required entry" "$tmp/no-required.manifest" "required"
