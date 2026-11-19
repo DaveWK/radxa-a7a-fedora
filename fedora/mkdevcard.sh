@@ -684,7 +684,7 @@ python3 -I "$TOP/fedora/image-firmware.py" audit --root "$ROOT" --quiet \
 # The ESP, on the staged tree before mtools, bound to the built cubie-a7a-dtb
 # RPM's own file list (stamps first; DTB, VERSION and esp-override from rpm -qp
 # --dump; the exact entry set with types). The manifest records these bytes.
-python3 -I "$TOP/fedora/devcard-policy.py" esp-staged --root "$ROOT" \
+python3 -I "$TOP/fedora/devcard-policy.py" esp-staged "$ROOT" \
     --esp-dir "$ROOT/boot/efi" --dtb-rpm "$DTB_RPM" --dtb-rpm-sha256 "$DTB_RPM_SHA" ||
     {
         echo "mkdevcard: the ESP (boot/efi) is not our build's (RPM-bound)" >&2
