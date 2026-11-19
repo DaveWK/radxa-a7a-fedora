@@ -489,7 +489,15 @@ chroot "$ROOT" grub2-editenv /boot/grub2/grubenv create
 chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set boot_success=0
 if [ "$BOOT_MODES" = protective ]; then
     # GRUB boots saved_entry: the newest kernel's protective entry.
-    def=$(cd "$ROOT/boot/loader/entries" && ls -- *.conf | grep -v '~' | sed 's/\.conf$//' | sort -V | tail -1)
+    def=$(
+        cd "$ROOT/boot/loader/entries" || exit 1
+        for entry in *.conf; do
+            if [[ -f $entry && $entry != *~* ]]; then
+                printf '%s\n' "${entry%.conf}"
+            fi
+        done | sort -V | tail -1
+    )
+    [ -n "$def" ] || { echo "mkdevcard: no protective BLS default" >&2; exit 1; }
     chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "saved_entry=$def"
     # FIRST_BOOT=maintenance: GRUB boots this once and clears it (grub.cfg).
     if [ "$FIRST_BOOT" = maintenance ]; then
