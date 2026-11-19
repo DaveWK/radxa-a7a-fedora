@@ -11,7 +11,10 @@ free again.
 
 --expect-race inverts the result: it is for showing that a source without the
 bank lock (--source, for example the file from before the fix) loses the race
-in this model. A host model, not a board test.
+in this model. --fail-disable N makes N balanced regulator_disable calls
+report an error: the driver must log each one with dev_err and still put and
+clear the handle, so a later request gets a fresh regulator instead of
+disabling the same one twice. A host model, not a board test.
 """
 
 import argparse, re, subprocess, tempfile
@@ -26,6 +29,13 @@ p.add_argument("--source", type=Path, default=kmod / "pinctrl-sunxi.c")
 p.add_argument("--header", type=Path, default=kmod / "pinctrl-sunxi.h")
 p.add_argument("--rounds", type=int, default=20000)
 p.add_argument("--runs", type=int, default=5)
+p.add_argument(
+    "--fail-disable",
+    type=int,
+    default=0,
+    help="make this many balanced regulator_disable calls report an error "
+    "(the driver must log each and keep the bookkeeping consistent)",
+)
 p.add_argument("--expect-race", action="store_true")
 a = p.parse_args()
 source, header = a.source.read_text(), a.header.read_text()
@@ -92,17 +102,22 @@ with tempfile.TemporaryDirectory(prefix="a7a-pinctrl-supply-") as td:
     races, last = 0, ""
     for run in range(a.runs):
         # Two timings: tight (no sleeps in the regulator calls) and with jitter.
-        r = subprocess.run(
-            [str(td / "host"), str(a.rounds), str(0 if run % 2 else 3)],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        argv = [str(td / "host"), str(a.rounds), str(0 if run % 2 else 3)]
+        if a.fail_disable:
+            argv.append(str(a.fail_disable))
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=600)
         assert r.returncode in (0, 1), r
         races += r.returncode
         last = r.stdout if r.returncode or not last else last
+        if a.fail_disable:
+            failed = re.search(r"^disable returned error +(\d+)$", r.stdout, re.M)
+            logged = re.search(r"^driver dev_err calls +(\d+)$", r.stdout, re.M)
+            assert failed and int(failed.group(1)) == a.fail_disable, r.stdout
+            assert logged and int(logged.group(1)) == a.fail_disable, r.stdout
 print(last, end="")
 kind = "with the bank lock" if locked else "without a bank lock"
+if a.fail_disable:
+    kind += f", {a.fail_disable} disable failure(s) per run"
 if a.expect_race:
     assert races, f"{a.source}: expected the race, {a.runs} runs were clean"
     print(

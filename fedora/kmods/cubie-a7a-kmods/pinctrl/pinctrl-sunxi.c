@@ -957,13 +957,20 @@ static int sunxi_pmx_free(struct pinctrl_dev *pctldev, unsigned offset)
 	unsigned short bank_offset = bank - pctl->desc->pin_base /
 					    PINS_PER_BANK;
 	struct sunxi_pinctrl_regulator *s_reg = &pctl->regulators[bank_offset];
+	int ret;
 
 	guard(mutex)(&s_reg->lock);
 
 	if (!refcount_dec_and_test(&s_reg->refcount))
 		return 0;
 
-	regulator_disable(s_reg->regulator);
+	ret = regulator_disable(s_reg->regulator);
+	if (ret)
+		dev_err(pctl->dev,
+			"Couldn't disable bank P%c regulator\n", 'A' + bank);
+	/* Put and clear whatever the disable returned: the bank has no users
+	 * left, and a later request must get and enable a fresh regulator
+	 * rather than reuse this one and disable it a second time. */
 	regulator_put(s_reg->regulator);
 	s_reg->regulator = NULL;
 

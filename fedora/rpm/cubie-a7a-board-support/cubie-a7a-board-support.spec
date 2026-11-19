@@ -1,6 +1,6 @@
 Name:           cubie-a7a-board-support
 Version:        0.16
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -160,6 +160,15 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Thu Nov 19 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-4
+- pinctrl-sun60i-a733: sunxi_pmx_free() handles a regulator_disable
+  failure on the last-user path like the driver's other error paths: it
+  logs with dev_err and still puts and clears the handle, so the bank has
+  no stale regulator and a later request gets a fresh one instead of
+  disabling the same regulator twice.  Host model extended with
+  --fail-disable (fedora/tests/pinctrl-bank-supply.py).  Board check
+  pending (row B / task-000057)
+
 * Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-3
 - pinctrl-sun60i-a733 (built for 7.2 and 7.3 kernels): backport of
   "pinctrl: sunxi: a733: do not switch the mux to read IRQ lines" (Vinicius

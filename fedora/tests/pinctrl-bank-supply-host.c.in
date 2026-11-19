@@ -35,6 +35,7 @@
 /* ---- counters ---------------------------------------------------------- */
 static atomic_long ev_underflow, ev_add_on_zero, ev_null_handle, ev_stale_handle,
 	ev_put_enabled, ev_unbalanced_disable, ev_supply_off_in_use;
+static atomic_long ev_dev_err, ev_disable_failed;
 static atomic_long live_handles, rdev_use_count;
 
 /* ---- kernel shims ------------------------------------------------------ */
@@ -43,7 +44,8 @@ static atomic_long live_handles, rdev_use_count;
 #define WARN_ON_ONCE(c) (c)
 #define IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095)
 #define PTR_ERR(p) ((long)(p))
-#define dev_err(dev, ...) ((void)(dev))
+/* Count the driver's log calls: a disable failure it ignores would show. */
+#define dev_err(dev, ...) (atomic_fetch_add(&ev_dev_err, 1), (void)(dev))
 #define dev_err_probe(dev, err, ...) ((void)(dev), (int)(err))
 
 struct device { int unused; };
@@ -171,6 +173,8 @@ static int regulator_enable(struct regulator *reg)
 	return 0;
 }
 
+static int fail_disable;	/* balanced disables that report an error */
+
 static int regulator_disable(struct regulator *reg)
 {
 	if (!reg_usable(reg))
@@ -181,6 +185,14 @@ static int regulator_disable(struct regulator *reg)
 		return -EIO;
 	}
 	atomic_fetch_sub(&rdev_use_count, 1);
+	if (fail_disable > 0) {
+		/* The use count is dropped (the regulator is off) but the call
+		 * reports an error, so the test exercises the driver's error
+		 * path without conflating it with a hardware leak. */
+		fail_disable--;
+		atomic_fetch_add(&ev_disable_failed, 1);
+		return -EIO;
+	}
 	return 0;
 }
 
@@ -287,6 +299,7 @@ int main(int argc, char **argv)
 
 	rounds = argc > 1 ? atoi(argv[1]) : 20000;
 	jitter_us = argc > 2 ? (unsigned int)atoi(argv[2]) : 3;
+	fail_disable = argc > 3 ? atoi(argv[3]) : 0;
 @INIT_LOCKS@
 	pthread_barrier_init(&start, NULL, ARRAY_SIZE(users));
 	for (i = 0; i < ARRAY_SIZE(users); i++)
@@ -304,6 +317,8 @@ int main(int argc, char **argv)
 	printf("put handle used again         %ld\n", atomic_load(&ev_stale_handle));
 	printf("put while still enabled       %ld\n", atomic_load(&ev_put_enabled));
 	printf("unbalanced disable            %ld\n", atomic_load(&ev_unbalanced_disable));
+	printf("disable returned error        %ld\n", atomic_load(&ev_disable_failed));
+	printf("driver dev_err calls          %ld\n", atomic_load(&ev_dev_err));
 	printf("handles leaked at the end     %ld\n", leaked);
 	printf("supply enables left           %ld\n", atomic_load(&rdev_use_count));
 	printf("bank handle pointer at end    %s\n", s_reg->regulator ? "set" : "NULL");
@@ -311,7 +326,8 @@ int main(int argc, char **argv)
 	      atomic_load(&ev_supply_off_in_use) + atomic_load(&ev_null_handle) +
 	      atomic_load(&ev_stale_handle) + atomic_load(&ev_put_enabled) +
 	      atomic_load(&ev_unbalanced_disable) + leaked +
-	      atomic_load(&rdev_use_count) + (s_reg->regulator ? 1 : 0);
+	      atomic_load(&rdev_use_count) + (s_reg->regulator ? 1 : 0) +
+	      (atomic_load(&ev_dev_err) != atomic_load(&ev_disable_failed) ? 1 : 0);
 	printf("%s\n", bad ? "RACE" : "CLEAN");
 	return bad ? 1 : 0;
 }
