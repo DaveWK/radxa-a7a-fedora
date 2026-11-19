@@ -40,7 +40,7 @@
 #              7.4.0-0.rc3.26.fc46) instead of the newest kernel in the
 #              repositories, and fail if another one lands. For Rawhide,
 #              whose kernel changes daily; Fedora 45 follows updates.
-#   EXTRA_PACKAGES="a b"   more Fedora packages (e.g. perf memtester)
+#   EXTRA_PACKAGES="a b"   more Fedora packages by name or NEVRA (no paths/globs)
 #   BOOT_MODES=protective  three GRUB entries per kernel (fedora/bootmodes/):
 #     default: root read-only under a RAM overlay, HAT stack off, nothing
 #              on the card written (/etc/kernel/cmdline carries it, so
@@ -171,7 +171,18 @@ RADIO_PACKAGES=(NetworkManager-wifi wpa_supplicant iw bluez wireless-regdb)
 BOARD_UNITS+=(bluetooth.service)
 OVERLAY=${OVERLAY:-}
 EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
-read -ra EXTRA_PKGS <<<"$EXTRA_PACKAGES"
+# DNF treats RPM filenames, URLs and some option tokens differently from
+# repository package specs. Board RPMs may only come from the checked list.
+case "$EXTRA_PACKAGES" in
+*$'\n'* | *$'\r'*) die "EXTRA_PACKAGES: use one line of Fedora package names or NEVRAs" ;;
+esac
+IFS=$' \t' read -ra EXTRA_PKGS <<<"$EXTRA_PACKAGES"
+extra_spec='^[A-Za-z0-9_+][A-Za-z0-9_.+-]*(-([0-9]+:)?[A-Za-z0-9_.+~^-]+)?$'
+for pkg in "${EXTRA_PKGS[@]}"; do
+    if [[ ! $pkg =~ $extra_spec || ${pkg,,} == *.rpm || -e $pkg || -L $pkg ]]; then
+        die "EXTRA_PACKAGES: not a Fedora package name or NEVRA: $pkg"
+    fi
+done
 BOOT_MODES=${BOOT_MODES:-}
 case "$BOOT_MODES" in '' | protective) ;; *)
     echo "invalid BOOT_MODES" >&2

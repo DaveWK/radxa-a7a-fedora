@@ -586,19 +586,22 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
         )
         stub.chmod(0o755)
 
-        def run_mkdevcard(tag):
+        def run_mkdevcard(tag, extra=""):
             recorded.unlink(missing_ok=True)
             env = env_without.copy()
             env["WORK"] = str(repo_top / "build" / f"work-{tag}")
             env["OUT"] = str(repo_top / "build" / f"img-{tag}.img")
+            env["EXTRA_PACKAGES"] = extra
             return subprocess.run(
                 ["bash", str(repo_fed / "mkdevcard.sh"), "none", str(second)],
                 env=env,
+                cwd=repo_top,
                 capture_output=True,
                 text=True,
             )
 
-        res = run_mkdevcard("clean")
+        valid_specs = ["perf", "kernel-core-0:7.3.3-300.fc45.aarch64"]
+        res = run_mkdevcard("clean", "\t".join(valid_specs))
         assert res.returncode == 42, f"mkdevcard did not reach STAGE1:\n{res.stderr}"
         selected = recorded.read_text().splitlines()
         assert str(real_dtb.resolve()) in selected, selected
@@ -608,12 +611,38 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
         ), "board RPM directory is still a DNF source"
         check = 'check-installed-rpms "$ROOT" "$RPM_RECORDS"'
         assert stage.index("dnf5 -y install") < stage.index(check)
+        assert all(spec in selected for spec in valid_specs), selected
         assert not any(
             "cubie-a7a-aic8800-usb" in arg for arg in selected
         ), f"mkdevcard selected stale AIC RPM after skip: {selected}"
         assert (
             str(stale_dtb) not in selected
         ), f"mkdevcard selected stale DTB RPM: {selected}"
+
+        violations = []
+        (repo_top / "existing-file").touch()
+        for index, extra in enumerate(
+            (
+                str(stale_aic[0]),
+                "./existing-file",
+                "existing-file",
+                "bare.rpm",
+                "https://example.invalid/board.rpm",
+                "existing-*",
+                "--disable-gpgcheck",
+                "perf\n--disable-gpgcheck",
+            )
+        ):
+            denied = run_mkdevcard(f"extra-{index}", extra)
+            if denied.returncode != 1 or "EXTRA_PACKAGES:" not in denied.stderr:
+                forwarded = (
+                    recorded.read_text().splitlines() if recorded.exists() else []
+                )
+                violations.append(
+                    f"EXTRA_PACKAGES accepted {extra!r} (exit {denied.returncode}, "
+                    f"forwarded={extra in forwarded})"
+                )
+        assert not violations, "; ".join(violations)
 
         # Step 3: truncated RPM snapshot fails closed.
         manifest = second / "rpm-snapshot.json"

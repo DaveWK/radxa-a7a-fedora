@@ -964,6 +964,10 @@ OPTIONAL_NOARCH_PACKAGES = (
     "cubie-a7a-aic8800-usb",
 )
 OPTIONAL_AARCH64_PACKAGES = ("cubie-a7a-fwlog",)
+# Use the same explicit names as the build allowlists (including AIC8800).
+KNOWN_BOARD_PACKAGES = frozenset(
+    REQUIRED_BOARD_PACKAGES + OPTIONAL_NOARCH_PACKAGES + OPTIONAL_AARCH64_PACKAGES
+)
 RUN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
 RPM_MANIFEST_VERSION = 3
 FWLOG_SRPM_PACKAGE = "cubie-a7a-fwlog"
@@ -1215,7 +1219,7 @@ def load_rpm_run(run):
 
 
 def check_installed_rpms(root, records):
-    """Require exactly one installed match for every RPM selected for DNF."""
+    """Require the installed board RPM set to match the selected snapshot."""
     if not isinstance(records, list) or not records:
         raise PolicyError("no selected RPM snapshot records")
     wanted = {}
@@ -1244,6 +1248,10 @@ def check_installed_rpms(root, records):
         actual = tuple(line.split("\t"))
         name = actual[0]
         if name not in wanted:
+            if name in KNOWN_BOARD_PACKAGES:
+                raise PolicyError(
+                    f"{root}: installed board RPM absent from snapshot: {name}"
+                )
             continue
         if name in found:
             raise PolicyError(f"{root}: multiple installed RPMs named {name}")

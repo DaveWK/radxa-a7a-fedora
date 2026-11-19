@@ -6,7 +6,8 @@ Runs real RPM tools, createrepo_c and offline DNF in a network namespace; no
 image, hardware or external repository. Set CREATEREPO_C to an absolute
 path to a runnable createrepo_c wrapper when not in PATH. --base-fedora
 selects extracted F7 source for the original red; --pre-rpmdb-fedora selects
-extracted F8a round-one source for the wrong installed RPM red.
+extracted F8a round-one source for the wrong installed RPM red. --probe-fedora
+runs the current checks against another source directory (base or test mutant).
 """
 
 import argparse
@@ -196,6 +197,60 @@ def reject_substituted_install(work, root, env, policy, manifest, records, pre_r
     print("higher same-name repository RPM refused by staged rpmdb check")
 
 
+def reject_same_nevra_payload(work, root, env, policy, records):
+    package = "cubie-a7a-hat"
+    alternate = build_fixtures(work, "alternate", packages=(package,))[package]
+    expected = next(rec for rec in records if rec["package"] == package)
+    dnf(work, "alternate", root, env, "reinstall", str(alternate))
+    installed = command(
+        "rpm",
+        "--root",
+        str(root),
+        "-q",
+        "--qf",
+        r"%{NAME}\t%{NEVRA}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{ARCH}\t%{PAYLOADSHA256}",
+        package,
+    ).split("\t")
+    assert installed[:-1] == [
+        expected[key] for key in ("package", "nevra", "evr", "arch")
+    ], installed
+    assert re.fullmatch(r"[0-9a-f]{64}", installed[-1]), installed
+    assert installed[-1] != expected["payload_sha256"], installed
+    result = subprocess.run(
+        [*policy, "check-installed-rpms", str(root), json.dumps(records)],
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        result.returncode == 1
+        and f"installed {package} differs from snapshot" in result.stderr
+        and installed[-1] in result.stderr
+        and expected["payload_sha256"] in result.stderr
+    ), f"same-NEVRA different payload was not refused: exit {result.returncode}, {result.stderr}"
+    print(f"same-NEVRA {installed[1]} refused on PAYLOADSHA256 alone")
+
+
+def reject_stale_aic(work, env, policy, paths, records):
+    package = "cubie-a7a-aic8800-usb"
+    assert all(rec["package"] != package for rec in records)
+    stale = build_fixtures(work, "stale", packages=(package,))[package]
+    root = work / "installed-stale-aic"
+    root.mkdir()
+    dnf(work, "stale-aic", root, env, "install", *paths, str(stale))
+    installed = command("rpm", "--root", str(root), "-q", "--qf", "%{NEVRA}", package)
+    assert installed == "cubie-a7a-aic8800-usb-1-1.noarch", installed
+    result = subprocess.run(
+        [*policy, "check-installed-rpms", str(root), json.dumps(records)],
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        result.returncode == 1
+        and f"installed board RPM absent from snapshot: {package}" in result.stderr
+    ), f"installed {installed} absent from snapshot was not refused: exit {result.returncode}, {result.stderr}"
+    print(f"stale optional {installed} absent from snapshot refused")
+
+
 def exercise(work, code, legacy, pre_rpmdb=False):
     manifest = load_module(code / "devcard-manifest.py")
     policy = [sys.executable, "-I", str(code / "devcard-policy.py")]
@@ -274,6 +329,9 @@ def exercise(work, code, legacy, pre_rpmdb=False):
                 reject_substituted_install(
                     work, root, env, policy, manifest, records, pre_rpmdb
                 )
+            elif not pre_rpmdb:
+                reject_same_nevra_payload(work, root, env, policy, records)
+                reject_stale_aic(work, env, policy, paths, records)
             path = Path(paths[0])
             path.chmod(0o644)
             with path.open("ab") as stream:
@@ -293,11 +351,12 @@ def main():
     bases = parser.add_mutually_exclusive_group()
     bases.add_argument("--base-fedora", type=Path)
     bases.add_argument("--pre-rpmdb-fedora", type=Path)
+    bases.add_argument("--probe-fedora", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="a7a-rpm-run-") as tmp:
         exercise(
             Path(tmp),
-            args.base_fedora or args.pre_rpmdb_fedora or FEDORA,
+            args.base_fedora or args.pre_rpmdb_fedora or args.probe_fedora or FEDORA,
             args.base_fedora is not None,
             args.pre_rpmdb_fedora is not None,
         )
