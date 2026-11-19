@@ -45,6 +45,7 @@ Commands:
 
 import argparse
 import base64
+import errno
 import hashlib
 import os
 import re
@@ -76,21 +77,41 @@ FEDORA_CERTIFICATES = {
 # non-Fedora file under an AIC firmware path is ours and forbidden
 # (DECISIONS 2026-11-11).
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
-REPART_REPARTD = ("etc/repart.d", "usr/lib/repart.d", "usr/local/lib/repart.d")
-# systemd unit search path, highest precedence first.
+REPART_REPARTD = (
+    "etc/repart.d",
+    "run/repart.d",
+    "usr/lib/repart.d",
+    "usr/local/lib/repart.d",
+)
+# systemd unit search path, highest precedence first (systemd-262.1-1.fc45,
+# derived from `systemd-analyze unit-paths` and verified offline with
+# `systemd-analyze --root= --generators=no verify`).
 SYSTEMD_UNIT_DIRS = (
+    "etc/systemd/system.control",
+    "run/systemd/system.control",
     "etc/systemd/system",
+    "etc/systemd/system.attached",
     "run/systemd/system",
+    "run/systemd/system.attached",
     "usr/local/lib/systemd/system",
     "usr/lib/systemd/system",
     "lib/systemd/system",
 )
 DISCARD_FLAG = "--discard=no"
-REPART_NAME = r"systemd-repart(?:-[A-Za-z0-9_:.\\-]+)?(?:@[A-Za-z0-9_:.\\-]*)?\.service"
+UNIT_CHAR = r"[A-Za-z0-9_:.\\-]"
+REPART_NAME = rf"systemd-repart(?:-{UNIT_CHAR}+)?(?:@{UNIT_CHAR}*)?\.service"
+REPART_DASHED_DROPIN = (
+    rf"systemd-(?:repart-(?:{UNIT_CHAR}+-)?)?(?:@{UNIT_CHAR}*)?\.service"
+)
+UNIT_DIR_RE = (
+    r"(?:(?:etc|run)/systemd/system(?:\.(?:control|attached))?"
+    r"|(?:usr/local/lib|usr/lib|lib)/systemd/system)"
+)
 INITRAMFS_REPART_RE = re.compile(
-    r"^(?:etc|run|usr/local/lib|usr/lib|lib)/systemd/system/"
-    rf"(?:(?:[^/]+\.(?:wants|requires)/)?{REPART_NAME}|(?:{REPART_NAME}|systemd-(?:repart-)?\.service|service)\.d/[^/]+\.conf)$"
-    r"|^(?:etc|usr/lib|usr/local/lib)/repart\.d/[^/]+\.conf$"
+    rf"^{UNIT_DIR_RE}/"
+    rf"(?:(?:[^/]+\.(?:wants|requires)/)?{REPART_NAME}"
+    rf"|(?:{REPART_NAME}|{REPART_DASHED_DROPIN}|service)\.d/[^/]+\.conf)$"
+    r"|^(?:etc|run|usr/lib|usr/local/lib)/repart\.d/[^/]+\.conf$"
 )
 # rpm's PGPHASHALGO values (rpm/rpmpgp.h).
 RPM_ALGO = {1: "md5", 2: "sha1", 3: "sha224", 8: "sha256", 9: "sha384", 10: "sha512"}
@@ -104,6 +125,41 @@ RPMDB_CANDIDATES = (
 
 class PolicyError(RuntimeError):
     """A policy check could not be performed; callers must fail closed."""
+
+
+def _scandir_if_exists(path):
+    """Return sorted Path entries of directory PATH, failing closed on I/O errors.
+
+    Returns [] only when PATH does not exist or is not a directory (ENOENT/ENOTDIR).
+    Raises PolicyError on EACCES or any other OSError so an unreadable directory
+    cannot silently appear empty.
+    """
+    try:
+        with os.scandir(path) as it:
+            return sorted((Path(entry.path) for entry in it), key=lambda p: p.name)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return []
+        raise PolicyError(f"cannot read directory {path}: {exc}") from exc
+
+
+def _walk_entries(base):
+    """Yield every regular file and symlink under BASE, failing closed on errors."""
+
+    def on_error(exc):
+        raise PolicyError(f"cannot traverse {exc.filename or base}: {exc}") from exc
+
+    for dirpath, dirnames, filenames in os.walk(base, onerror=on_error):
+        dirnames.sort()
+        cur = Path(dirpath)
+        for dname in dirnames:
+            dpath = cur / dname
+            if dpath.is_symlink():
+                yield dpath
+        for fname in sorted(filenames):
+            fpath = cur / fname
+            if fpath.is_symlink() or fpath.is_file():
+                yield fpath
 
 
 def _read_manifest_file(path):
@@ -181,9 +237,7 @@ def aic_overlay_inputs(overlay, manifest=None):
     if not base.is_dir():
         return hits
     wanted = _wanted_manifest_names(root=base, extra_manifest=manifest)
-    for path in base.rglob("*"):
-        if not (path.is_file() or path.is_symlink()):
-            continue
+    for path in _walk_entries(base):
         rel = path.relative_to(base).as_posix()
         fw_rel = _firmware_rel(rel)
         if (fw_rel is not None and _aic_overlay_rel(fw_rel)) or path.name in wanted:
@@ -218,9 +272,7 @@ def aic_root_files(root):
     wanted = _wanted_manifest_names(root=root)
     out = []
     for fw in _firmware_dirs(root):
-        for path in fw.rglob("*"):
-            if not (path.is_file() or path.is_symlink()):
-                continue
+        for path in _walk_entries(fw):
             fw_rel = path.relative_to(fw).as_posix()
             if _aic_root_rel(fw_rel) or path.name in wanted:
                 out.append(path)
@@ -503,21 +555,21 @@ def aic_problems(root, ownership=None):
 def enabled_repo_ids(dirs):
     """Ids of the enabled repositories in dnf's .repo files, sorted.
 
-    Mirrors the awk repo-file parse (a section header names the id, an
+    Mirrors the repo-file parse (a section header names the id, an
     ``enabled = 1`` line prints it) over every *.repo in every directory,
-    then ``sort -u``.  A missing directory is skipped (find's error is
-    suppressed upstream).
+    then ``sort -u``.  A missing directory is skipped; unreadable directories
+    or .repo files fail closed with PolicyError.
     """
     ids = set()
     for directory in dirs:
         path = Path(directory)
-        if not path.is_dir():
-            continue
-        for repo in sorted(path.glob("*.repo")):
+        for repo in _scandir_if_exists(path):
+            if not repo.name.endswith(".repo"):
+                continue
             try:
                 text = repo.read_text()
-            except OSError:
-                continue
+            except OSError as exc:
+                raise PolicyError(f"cannot read repo file {repo}: {exc}") from exc
             ident = None
             for line in text.splitlines():
                 if line.startswith("["):
@@ -698,24 +750,94 @@ def _active_unit_dirs(root):
 
 def _repart_units(root):
     names = set(REPART_UNITS)
+    dashed_instances = []
     for directory in _active_unit_dirs(root):
         path = root / directory
-        for pattern in (
-            "systemd-repart*",
-            "*.wants/systemd-repart*",
-            "*.requires/systemd-repart*",
-        ):
-            for candidate in path.glob(pattern):
-                name = candidate.name.removesuffix(".d")
-                if re.fullmatch(REPART_NAME, name):
-                    names.add(name)
+        for entry in _scandir_if_exists(path):
+            raw = entry.name
+            stem = raw.removesuffix(".d")
+            if re.fullmatch(REPART_NAME, stem):
+                names.add(stem)
+            if raw.endswith(".d") and re.fullmatch(REPART_DASHED_DROPIN, stem):
+                base_stem = stem.removesuffix(".service")
+                if "@" in base_stem:
+                    dash_prefix, inst = base_stem.split("@", 1)
+                    if inst:
+                        dashed_instances.append((dash_prefix, inst))
+            if raw.endswith((".wants", ".requires")) and entry.is_dir():
+                for child in _scandir_if_exists(entry):
+                    if re.fullmatch(REPART_NAME, child.name):
+                        names.add(child.name)
+    # Any dashed-prefix instance drop-in (e.g. systemd-@demo.service.d) applies
+    # to every repart template unit sharing that dashed prefix (e.g.
+    # systemd-repart@.service instantiated as systemd-repart@demo.service).
+    for unit in list(names):
+        if not unit.endswith("@.service"):
+            continue
+        tpl_prefix = unit.removesuffix("@.service")
+        for dash_prefix, inst in dashed_instances:
+            if tpl_prefix.startswith(dash_prefix):
+                names.add(f"{tpl_prefix}@{inst}.service")
     return sorted(names)
 
 
+def _unit_dropin_scopes(unit):
+    """Return systemd's name-based drop-in scopes for UNIT, highest precedence first.
+
+    Matches systemd-262.1-1.fc45 (`systemd-analyze --root= --generators=no verify`):
+      1. exact unit (e.g. systemd-a-b@demo.service)
+      2. template (e.g. systemd-a-b@.service), when instantiated
+      3. dashed prefixes without '@' (e.g. systemd-a-.service, systemd-.service)
+      4. for template/instantiated units, dashed prefixes retaining '@<inst>' and '@'
+         (e.g. systemd-a-@demo.service, systemd-a-@.service,
+          systemd-@demo.service, systemd-@.service)
+    Type-wide 'service.d' is searched separately after all load-path directories.
+    """
+    stem = unit.removesuffix(".service")
+    if "@" in stem:
+        prefix, instance = stem.split("@", 1)
+    else:
+        prefix, instance = stem, None
+    scopes = [unit]
+    if instance:
+        scopes.append(f"{prefix}@.service")
+    dashed = []
+    cur = prefix
+    while "-" in cur:
+        cur = cur.rsplit("-", 1)[0]
+        dashed.append(cur + "-")
+    for dash_prefix in dashed:
+        scopes.append(f"{dash_prefix}.service")
+    if instance is not None:
+        for dash_prefix in dashed:
+            if instance:
+                scopes.append(f"{dash_prefix}@{instance}.service")
+            scopes.append(f"{dash_prefix}@.service")
+    return scopes
+
+
+def _scan_dropin_dir(dropin_dir, root, by_name):
+    for conf in _scandir_if_exists(dropin_dir):
+        if not conf.name.endswith(".conf"):
+            continue
+        if conf.name not in by_name:
+            if _masked(conf):
+                by_name[conf.name] = None
+            else:
+                resolved = _resolve_within(root, conf)
+                if resolved is None:
+                    raise PolicyError(f"cannot resolve drop-in {conf}")
+                by_name[conf.name] = resolved
+
+
 def _unit_files(root, unit):
-    """Apply systemd.unit(5): instance before template, progressively shorter
-    dashed prefixes, then type-wide defaults. Resolve each basename once;
-    apply the winners in global filename order, not per-directory order.
+    """Resolve UNIT and its effective drop-ins in systemd's exact search order.
+
+    Load-path directories come first (/etc before /run before /usr/lib); within
+    each directory, unit -> template -> dashed scopes (including dashed scopes
+    retaining the instance); type-wide service.d defaults come last across all
+    load-path directories. For each basename, the first match wins; winners are
+    applied in global sorted basename order.
     """
     root = Path(root)
     unit_dirs = _active_unit_dirs(root)
@@ -737,24 +859,13 @@ def _unit_files(root, unit):
             break
     if base is None:
         return []
-    prefix = unit.removesuffix(".service").split("@", 1)[0]
-    scopes = list(bases)
-    while "-" in prefix:
-        prefix = prefix.rsplit("-", 1)[0]
-        scopes.append(prefix + "-.service")
-    scopes.append("service")
+    name_scopes = _unit_dropin_scopes(unit)
     by_name = {}
-    for scope in scopes:
-        for directory in unit_dirs:
-            for conf in (root / directory / (scope + ".d")).glob("*.conf"):
-                if conf.name not in by_name:
-                    if _masked(conf):
-                        by_name[conf.name] = None
-                    else:
-                        resolved = _resolve_within(root, conf)
-                        if resolved is None:
-                            raise PolicyError(f"cannot resolve drop-in {conf}")
-                        by_name[conf.name] = resolved
+    for directory in unit_dirs:
+        for scope in name_scopes:
+            _scan_dropin_dir(root / directory / (scope + ".d"), root, by_name)
+    for directory in unit_dirs:
+        _scan_dropin_dir(root / directory / "service.d", root, by_name)
     return [base] + [by_name[n] for n in sorted(by_name) if by_name[n] is not None]
 
 
@@ -828,9 +939,9 @@ def repart_root_ok(root):
             problems.append(f"{unit} runs {commands!r} without {DISCARD_FLAG}")
     configs = []
     for rel in REPART_REPARTD:
-        directory = root / rel
-        if directory.is_dir():
-            configs += [c for c in directory.glob("*.conf") if c.is_file()]
+        for entry in _scandir_if_exists(root / rel):
+            if entry.name.endswith(".conf") and entry.is_file():
+                configs.append(entry)
     if configs and not repart_service_seen:
         problems.append("repart.d configuration without systemd-repart.service")
     return (not problems, problems)
@@ -917,8 +1028,10 @@ def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
                 if files:
                     problems.append(f"initramfs contains active {unit}")
             for rel_dir in REPART_REPARTD:
-                dpath = tree / rel_dir
-                if dpath.is_dir() and any(dpath.glob("*.conf")):
+                if any(
+                    entry.name.endswith(".conf")
+                    for entry in _scandir_if_exists(tree / rel_dir)
+                ):
                     problems.append(f"initramfs contains repart.d config in {rel_dir}")
             return (not problems, problems)
         return repart_root_ok(tree)
@@ -976,7 +1089,11 @@ def main(argv=None):
                     fh.write(f"{pkg}\t{rel}\t{digest}\t{algo}\t{linkto}\n")
         return 1 if problems else 0
     if a.cmd == "repart-root":
-        ok, problems = repart_root_ok(a.root)
+        try:
+            ok, problems = repart_root_ok(a.root)
+        except PolicyError as exc:
+            print(f"repart-root: {exc}", file=sys.stderr)
+            return 1
         for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
@@ -986,14 +1103,23 @@ def main(argv=None):
             lsinitrd_cmd = ["chroot", str(a.chroot), "lsinitrd"]
         elif a.run_build_ns:
             lsinitrd_cmd = [str(a.run_build_ns), "user", "lsinitrd"]
-        ok, problems = repart_initramfs_ok(
-            a.img, lsinitrd_cmd=lsinitrd_cmd, forbid_repart=a.forbid_repart
-        )
+        try:
+            ok, problems = repart_initramfs_ok(
+                a.img, lsinitrd_cmd=lsinitrd_cmd, forbid_repart=a.forbid_repart
+            )
+        except PolicyError as exc:
+            print(f"repart-initramfs: {exc}", file=sys.stderr)
+            return 1
         for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
     if a.cmd == "enabled-repos":
-        sys.stdout.write("".join(i + " " for i in enabled_repo_ids(a.dirs)))
+        try:
+            ids = enabled_repo_ids(a.dirs)
+        except PolicyError as exc:
+            print(f"enabled-repos: {exc}", file=sys.stderr)
+            return 1
+        sys.stdout.write("".join(i + " " for i in ids))
         return 0
     if a.cmd == "dumpe2fs":
         r = subprocess.run(
