@@ -109,10 +109,23 @@ write_variant() { # main-file suffix title-suffix options
     local src=$1 suffix=$2 tsuf=$3 opts=$4 dst tmp
     dst="${src%.conf}~$suffix.conf"
     tmp="$dst.tmp"
-    awk -v t="$tsuf" -v o="$opts" '
-        /^title[ \t]/ { sub(/[ \t]+\(protective: ro overlay, hat=0\)$/, ""); print $0 " " t; next }
-        /^options[ \t]/ { print "options " o; next }
-        { print }' "$src" >"$tmp"
+    python3 -I - "$src" "$tmp" "$tsuf" "$opts" <<'PY'
+import re, sys
+src, dst, title, opts = sys.argv[1:5]
+out = []
+with open(src) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if re.match(r"^title[ \t]", line):
+            line = re.sub(r"[ \t]+\(protective: ro overlay, hat=0\)$", "", line, count=1)
+            out.append(line + " " + title)
+        elif re.match(r"^options[ \t]", line):
+            out.append("options " + opts)
+        else:
+            out.append(line)
+with open(dst, "w") as f:
+    f.write("\n".join(out) + "\n")
+PY
     if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
         rm -f "$tmp"
     else

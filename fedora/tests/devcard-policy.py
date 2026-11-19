@@ -118,6 +118,61 @@ def aic_manifest_suffixes():
         assert [str(p) for p in policy.aic_find(root)] == [str(f)]
 
 
+def enabled_repos_cases():
+    with fixture() as root:
+        d = root / "yum.repos.d"
+        write(
+            d / "fedora.repo",
+            "[fedora]\nname=Fedora\nenabled=1\n[gcc]\nenabled=0\n",
+        )
+        write(d / "updates.repo", "[updates]\nenabled = 1\n[rawhide]\nenabled=0\n")
+        write(d / "empty.repo", "")
+        ids = policy.enabled_repo_ids([d, root / "missing"])
+        assert ids == ["fedora", "updates"], ids
+
+
+def enabled_repos_empty():
+    with fixture() as root:
+        d = root / "yum.repos.d"
+        d.mkdir(parents=True)
+        assert policy.enabled_repo_ids([d]) == []
+        assert policy.enabled_repo_ids([root / "missing"]) == []
+
+
+def dumpe2fs_cases():
+    text = (
+        "Block count:       123456\nFree blocks:       1000\nBlock size:        4096\n"
+    )
+    assert policy.format_dumpe2fs(text) == "0.47 GiB, 0.00 GiB free"
+    assert policy.format_dumpe2fs("") == "0.00 GiB, 0.00 GiB free"
+
+
+def loader_entry_cases():
+    with fixture() as root:
+        entry = root / "entry.conf"
+        write(
+            entry,
+            "title Fedora\nversion 7.3.4\nlinux /vmlinuz\n"
+            "initrd /initramfs.img\noptions root=UUID=x ro\n",
+        )
+        assert policy.loader_field(entry, "linux") == "/vmlinuz"
+        assert policy.loader_field(entry, "initrd") == "/initramfs.img"
+        assert policy.loader_field(entry, "options") == "root=UUID=x ro"
+        assert policy.loader_field(entry, "missing") == ""
+        assert policy.loader_field(root / "nope.conf", "linux") == ""
+
+
+def loader_entry_empty_and_ws():
+    with fixture() as root:
+        entry = root / "entry.conf"
+        write(entry, "")
+        assert policy.loader_field(entry, "options") == ""
+        write(entry, "options\n")
+        assert policy.loader_field(entry, "options") == ""
+        write(entry, "options   a=b\tc d\n")
+        assert policy.loader_field(entry, "options") == "a=b c d"
+
+
 REPART_UNIT = "usr/lib/systemd/system/systemd-repart.service"
 REPART_DROPIN = (
     "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
@@ -221,6 +276,11 @@ def main():
     case("aic: manifest name under another directory", aic_manifest_name_elsewhere)
     case("aic: missing manifest", aic_manifest_missing)
     case("aic: manifest name with .zst suffix", aic_manifest_suffixes)
+    case("enabled repos: populated and missing dirs", enabled_repos_cases)
+    case("enabled repos: empty and missing", enabled_repos_empty)
+    case("dumpe2fs: sizes and empty", dumpe2fs_cases)
+    case("loader entry: fields, missing file", loader_entry_cases)
+    case("loader entry: empty and whitespace", loader_entry_empty_and_ws)
     case("repart: good root", repart_good_root)
     case("repart: overlay drops the drop-in", repart_overlay_drops_dropin)
     case("repart: overlay replaces the drop-in", repart_overlay_replaces_dropin)

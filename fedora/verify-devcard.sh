@@ -101,8 +101,8 @@ echo "  os-release: VERSION_ID=$(osrel_get VERSION_ID) VARIANT_ID=$(osrel_get VA
 check "os-release VERSION_ID is $RELEASE_NUM" test "$(osrel_get VERSION_ID)" = "$RELEASE_NUM"
 enabled_repos() { # ids of the enabled repositories in the image's repository files
     # dnf5 reads both directories; either may be empty.
-    find "$ROOT/etc/yum.repos.d" "$ROOT/usr/share/dnf5/repos.d" -maxdepth 1 -name '*.repo' \
-        -exec awk '/^\[/{id=substr($0,2,length($0)-2)} /^enabled[ ]*=[ ]*1/{print id}' {} + 2>/dev/null | sort -u | tr '\n' ' '
+    python3 -I "$TOP/fedora/devcard-policy.py" enabled-repos \
+        "$ROOT/etc/yum.repos.d" "$ROOT/usr/share/dnf5/repos.d"
 }
 echo "  enabled repositories in the image: $(enabled_repos)"
 if [ "$FEDORA_RELEASE" = rawhide ]; then
@@ -306,7 +306,7 @@ else
         check "$u mask labelled in the image ($lbl)" bash -c "[[ '$lbl' == system_u:object_r:*_t:s0 ]]"
     done
 fi
-echo "  info  root filesystem: $(dumpe2fs -h "$W/root.img" 2>/dev/null | awk -F: '/^Block count/{c=$2}/^Free blocks/{f=$2}/^Block size/{b=$2}END{printf "%.2f GiB, %.2f GiB free", c*b/2^30, f*b/2^30}'); image $(stat -c %s "$IMG") bytes"
+echo "  info  root filesystem: $(python3 -I "$TOP/fedora/devcard-policy.py" dumpe2fs "$W/root.img"); image $(stat -c %s "$IMG") bytes"
 
 if [ "$BOOT_MODES" = protective ]; then
     echo "== boot modes (protective default, maintenance, full)"
@@ -349,11 +349,11 @@ if [ "$BOOT_MODES" = protective ]; then
         case "$(basename "$e")" in *~*) continue ;; esac
         nmain=$((nmain + 1))
         id=$(basename "$e" .conf)
-        o=$(awk '$1=="options"{$1="";sub(/^ /,"");print}' "$e")
+        o=$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$e" options)
         mt=${e%.conf}~maintenance.conf
         fu=${e%.conf}~full.conf
-        mo=$(awk '$1=="options"{$1="";sub(/^ /,"");print}' "$mt" 2>/dev/null)
-        fo=$(awk '$1=="options"{$1="";sub(/^ /,"");print}' "$fu" 2>/dev/null)
+        mo=$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$mt" options)
+        fo=$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$fu" options)
         echo "  $id"
         echo "    default:     $o"
         echo "    maintenance: $mo"
@@ -380,7 +380,7 @@ if [ "$BOOT_MODES" = protective ]; then
     check "grub.cfg: next_entry honoured, and its only save_env clears it (GRUB writes nothing on a default boot)" bash -c "c=\$('$TOP/fedora/run-build-ns.sh' user cat '$ROOT/boot/grub2/grub.cfg'); grep -q 'set default=\"\\\${next_entry}\"' <<<\"\$c\" && [ \"\$(grep -c save_env <<<\"\$c\")\" = 1 ] && grep -q '^ *save_env next_entry\$' <<<\"\$c\""
     for e in "$ROOT"/boot/loader/entries/*.conf; do
         case "$(basename "$e")" in *~*) continue ;; esac
-        rd=$ROOT$(awk '$1=="initrd"{print $2}' "$e")
+        rd=$ROOT$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$e" initrd)
         check "$(basename "$e" .conf): initramfs has systemd-volatile-root and overlay.ko" bash -c "l=\$('$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null); grep -q 'systemd/systemd-volatile-root\$' <<<\"\$l\" && grep -q 'systemd-volatile-root.service\$' <<<\"\$l\" && grep -q '/overlay.ko' <<<\"\$l\""
     done
 fi

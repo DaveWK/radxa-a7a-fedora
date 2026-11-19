@@ -20,10 +20,17 @@ Commands:
   repart-initramfs-listing
                       stdin is an lsinitrd listing: no systemd-repart, or one
                       with the --discard=no drop-in; exit 1 otherwise.
+  enabled-repos DIR [DIR...]
+                      enabled dnf repository ids, sorted, each followed by a
+                      space (the awk's sort -u | tr '\n' ' ').
+  dumpe2fs IMG        "X GiB, Y GiB free" from dumpe2fs -h.
+  loader-entry FILE FIELD
+                      linux, initrd or options of a BLS entry file.
 """
 
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -99,6 +106,83 @@ def aic_find(root):
             if path.name in wanted and str(path) not in hits:
                 hits.append(str(path))
     return sorted(hits)
+
+
+def enabled_repo_ids(dirs):
+    """Ids of the enabled repositories in dnf's .repo files, sorted.
+
+    Mirrors the awk repo-file parse (a section header names the id, an
+    ``enabled = 1`` line prints it) over every *.repo in every directory,
+    then ``sort -u``.  A missing directory is skipped (find's error is
+    suppressed upstream).
+    """
+    ids = set()
+    for directory in dirs:
+        path = Path(directory)
+        if not path.is_dir():
+            continue
+        for repo in sorted(path.glob("*.repo")):
+            try:
+                text = repo.read_text()
+            except OSError:
+                continue
+            ident = None
+            for line in text.splitlines():
+                if line.startswith("["):
+                    ident = line[1:-1]
+                elif ident is not None and re.match(r"enabled *= *1", line):
+                    ids.add(ident)
+    return sorted(ids)
+
+
+def parse_dumpe2fs(text):
+    """The ``key: value`` pairs of ``dumpe2fs -h``."""
+    values = {}
+    for line in text.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def format_dumpe2fs(text):
+    """The root-filesystem size line, as the awk replacement prints it."""
+
+    def number(key):
+        try:
+            return int(parse_dumpe2fs(text).get(key, "") or 0)
+        except ValueError:
+            return 0
+
+    blocks, free, size = (
+        number("Block count"),
+        number("Free blocks"),
+        number("Block size"),
+    )
+    return f"{blocks * size / 2**30:.2f} GiB, {free * size / 2**30:.2f} GiB free"
+
+
+def loader_field(path, field):
+    """One field of a BLS entry: linux, initrd or options.
+
+    Matches ``awk '$1=="FIELD"{...}'``: the first whitespace-separated field
+    must be exactly FIELD.  options is the remaining fields joined by single
+    spaces (awk rebuilds the record after $1=""), with one line per match;
+    a missing or unreadable file yields the empty string, as the awk did.
+    """
+    entry = Path(path)
+    if not entry.is_file():
+        return ""
+    values = []
+    for line in entry.read_text().splitlines():
+        parts = line.split()
+        if not parts or parts[0] != field:
+            continue
+        if field == "options":
+            values.append(" ".join(parts[1:]))
+        else:
+            values.append(parts[1] if len(parts) > 1 else "")
+    return "\n".join(values)
 
 
 def _exec_start_lines(path):
@@ -201,6 +285,13 @@ def main(argv=None):
     p = sub.add_parser("repart-root")
     p.add_argument("root", type=Path)
     p = sub.add_parser("repart-initramfs-listing")
+    p = sub.add_parser("enabled-repos")
+    p.add_argument("dirs", nargs="+", type=Path)
+    p = sub.add_parser("dumpe2fs")
+    p.add_argument("img", type=Path)
+    p = sub.add_parser("loader-entry")
+    p.add_argument("path", type=Path)
+    p.add_argument("field", choices=("linux", "initrd", "options"))
     a = ap.parse_args(argv)
     if a.cmd == "aic-find":
         hits = aic_find(a.root)
@@ -217,6 +308,18 @@ def main(argv=None):
         if problem:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
+    if a.cmd == "enabled-repos":
+        sys.stdout.write("".join(i + " " for i in enabled_repo_ids(a.dirs)))
+        return 0
+    if a.cmd == "dumpe2fs":
+        r = subprocess.run(
+            ["dumpe2fs", "-h", str(a.img)], capture_output=True, text=True
+        )
+        print(format_dumpe2fs(r.stdout))
+        return 0
+    if a.cmd == "loader-entry":
+        sys.stdout.write(loader_field(a.path, a.field))
+        return 0
     return 2
 
 
