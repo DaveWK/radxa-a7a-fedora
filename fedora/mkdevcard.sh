@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Build the Fedora dev card (FEDORA_RELEASE, default 45) for the Radxa Cubie A7A, rootless:
+# Build the Fedora dev card for the Radxa Cubie A7A, rootless:
 #   build/image/a7a-fedora-dev.img (sparse raw) and .img.xz
+#
+# FEDORA_RELEASE (fedora/release.sh) selects the release:
+#   45 (default)  Fedora 45, repositories fedora + updates
+#   rawhide       Fedora Rawhide, repository rawhide; the default work
+#                 directory and image are build/fedora/devcard-rawhide and
+#                 build/image/a7a-fedora-rawhide-dev.img, the dnf cache
+#                 build/fedora/dnf/cache-ns-rawhide, so the two releases
+#                 share no directory and each has its own packages.txt
 #
 #   0x00000000  protective MBR + GPT
 #   0x00020000  firmware.bin (oreboot bt0 at 128 KiB, layout table, main, EDK2)
@@ -26,6 +34,10 @@
 # Usage: fedora/mkdevcard.sh FIRMWARE_BIN RPMS_DIR   (rpmbuild RPMS/: noarch/ and aarch64/)
 #
 # Optional (unset: the image as before):
+#   KERNEL_VERSION=V-R     install exactly kernel-V-R (e.g.
+#              7.4.0-0.rc3.26.fc46) instead of the newest kernel in the
+#              repositories, and fail if another one lands. For Rawhide,
+#              whose kernel changes daily; Fedora 45 follows updates.
 #   EXTRA_PACKAGES="a b"   more Fedora packages (e.g. perf memtester)
 #   BOOT_MODES=protective  three GRUB entries per kernel (fedora/bootmodes/):
 #     default: root read-only under a RAM overlay, HAT stack off, nothing
@@ -56,14 +68,24 @@ set -euo pipefail
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 FIRMWARE=${1:?firmware.bin}
 RPMDIR=${2:?rpmbuild RPMS directory with noarch/ and aarch64/ cubie-a7a packages}
-W=${WORK:-$TOP/build/fedora/devcard}
-OUT=${OUT:-$TOP/build/image/a7a-fedora-dev.img}
+# shellcheck source=fedora/release.sh
+. "$TOP/fedora/release.sh"
+W=${WORK:-$TOP/build/fedora/devcard$RELEASE_SUFFIX}
+OUT=${OUT:-$TOP/build/image/a7a-fedora$RELEASE_SUFFIX-dev.img}
 ROOT_PASSWORD=${ROOT_PASSWORD:-Fedora123}
-RELEASEVER=${FEDORA_RELEASE:-45}
-# Fedora's own kernel: whatever the fedora + updates repositories carry at
-# build time (recorded in the manifest, never pinned or rebuilt). The board
-# kmods follow it through DKMS (cubie-a7a-board-support).
-KERNEL_PACKAGES=(kernel kernel-core kernel-modules-core kernel-modules kernel-devel)
+# Fedora's own kernel: whatever the release's repositories carry at build
+# time (recorded in the manifest, never rebuilt). The board kmods follow it
+# through DKMS (cubie-a7a-board-support). KERNEL_VERSION names one exact
+# build instead (Rawhide).
+KERNEL_VERSION=${KERNEL_VERSION:-}
+[[ $KERNEL_VERSION =~ ^([0-9][0-9A-Za-z._~+-]*)?$ ]] || {
+    echo "invalid KERNEL_VERSION" >&2
+    exit 2
+}
+KERNEL_PACKAGES=()
+for p in kernel kernel-core kernel-modules-core kernel-modules kernel-devel; do
+    KERNEL_PACKAGES+=("$p${KERNEL_VERSION:+-$KERNEL_VERSION}")
+done
 BUILD_JOBS=${BUILD_JOBS:-2}
 [[ $BUILD_JOBS =~ ^[1-9][0-9]*$ ]] || {
     echo "invalid BUILD_JOBS" >&2
@@ -170,7 +192,7 @@ ESP_UUID="${ESP_ID:0:4}-${ESP_ID:4:4}"
 PW_HASH=$(openssl passwd -6 "$ROOT_PASSWORD")
 
 PACKAGES=(
-    fedora-release-server fedora-repos bash coreutils util-linux systemd systemd-udev
+    fedora-release-server fedora-repos "${RELEASE_PACKAGES[@]}" bash coreutils util-linux systemd systemd-udev
     passwd shadow-utils openssh-server openssh-clients NetworkManager chrony firewalld
     iproute iputils less vim-minimal dnf5 rpm sudo
     selinux-policy-targeted policycoreutils e2fsprogs dosfstools
@@ -208,10 +230,10 @@ ROOT=$W/root
 echo "mkdevcard: root UUID $ROOT_UUID, ESP $ESP_UUID"
 
 # --- stage 1: root filesystem (user namespace) -------------------------------
-# Fedora's own repository files: /usr/share/dnf5/repos.d on a Fedora 45 host,
-# /etc/yum.repos.d before that.
-REPOSDIR=${REPOSDIR:-$([ -f /usr/share/dnf5/repos.d/fedora.repo ] && echo /usr/share/dnf5/repos.d || echo /etc/yum.repos.d)}
-export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH RELEASEVER FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT
+# REPOSDIR and the repository names come from fedora/release.sh.
+DNF_CACHE=${DNF_CACHE:-$W/../dnf/cache-ns$RELEASE_SUFFIX}
+RELEASE_REPO_ARGS=${RELEASE_REPOS[*]}
+export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH FEDORA_RELEASE FEDORA_RAWHIDE_VERSION RELEASEVER RELEASE_LABEL RELEASE_REPO_ARGS DNF_CACHE KERNEL_VERSION FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT
 "$TOP/fedora/run-build-ns.sh" mount bash -s \
     "${PACKAGES[@]}" -- "${EXCLUDES[@]}" <<'STAGE1'
 set -euo pipefail
@@ -274,11 +296,11 @@ echo '%_install_langs en_US' >"$W/rpm-home/.rpmmacros"
 # persistdir is relative to the installroot (a host path would be recreated
 # inside the image).
 HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --forcearch=aarch64 --releasever="$RELEASEVER" \
-    --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$W/../dnf/cache-ns" \
+    --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$DNF_CACHE" \
     --setopt=persistdir=/var/lib/dnf --setopt=countme=False \
     --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
     --setopt=keepcache=True --setopt=gpgcheck=True --setopt=localpkg_gpgcheck=False \
-    --exclude="$exclude" --repo=fedora --repo=updates "${pkgs[@]}"
+    --exclude="$exclude" $RELEASE_REPO_ARGS "${pkgs[@]}"
 
 # BOOT_MODES=protective: every kernel's maintenance and full entries, with
 # the arguments the board package added to all entries after the kernel's
@@ -293,6 +315,10 @@ fi
 # no devicetree line (the DTB comes from the firmware's EFI table).
 kernels=$(ls "$ROOT/usr/lib/modules")
 [ "$(wc -w <<<"$kernels")" = 1 ] || { echo "mkdevcard: expected one kernel, got: $kernels" >&2; exit 1; }
+[ -z "$KERNEL_VERSION" ] || [ "$kernels" = "$KERNEL_VERSION.aarch64" ] ||
+    { echo "mkdevcard: kernel $kernels installed, KERNEL_VERSION asked for $KERNEL_VERSION" >&2; exit 1; }
+# shellcheck source=fedora/release.sh
+. "$TOP/fedora/release.sh"
 for k in $kernels; do
     # The board package's own guard: every boot kmod built (and selected
     # by depmod) for this kernel and present in its initramfs.
@@ -303,7 +329,14 @@ for k in $kernels; do
             { echo "mkdevcard: staged module $m.ko missing for $k" >&2; exit 1; }
     done
     chroot "$ROOT" lsinitrd "/boot/initramfs-$k.img" >"$W/initramfs-$k.txt"
-    for m in sunxi-mmc i2c-mv64xxx; do
+    # The root-on-SD path, whichever of it this kernel series takes from
+    # the board kmods (extra/) and from the stock kernel (release.sh).
+    boot=$(cubie_boot_kmods "$k")
+    for m in ${boot%% -- *}; do
+        grep -q "/extra/$m\.ko" "$W/initramfs-$k.txt" ||
+            { echo "mkdevcard: board kmod $m not in initramfs-$k.img" >&2; exit 1; }
+    done
+    for m in ${boot##* -- }; do
         grep -q "/$m\.ko" "$W/initramfs-$k.txt" ||
             { echo "mkdevcard: $m not in initramfs-$k.img" >&2; exit 1; }
     done
@@ -479,7 +512,7 @@ mkfs.fat -F 32 -n EFI -i "$ESP_ID" -C "$esp" $((ESP_MIB * 1024)) >/dev/null
 mcopy -s -p -m -i "$esp" "$ROOT"/boot/efi/* ::
 find "$ROOT/boot/efi" -mindepth 1 -delete
 truncate -s "${ROOT_MIB}M" "$rootimg"
-mkfs.ext4 -q -L "Fedora$RELEASEVER-root" -U "$ROOT_UUID" -E root_owner=0:0 -d "$ROOT" "$rootimg"
+mkfs.ext4 -q -L "$RELEASE_LABEL" -U "$ROOT_UUID" -E root_owner=0:0 -d "$ROOT" "$rootimg"
 # SELinux labels, written into the image (they cannot be set here): an
 # unlabeled root freezes systemd when booted enforcing, before any relabel.
 python3 -I "$TOP/fedora/selinux-label.py" "$ROOT" "$rootimg" "$W/selinux"
@@ -523,13 +556,14 @@ else
 fi
 cat >"$W/manifest.txt" <<EOF
 image        $OUT
+release      Fedora $RELEASEVER (packages .fc$RELEASE_NUM; repositories ${RELEASE_REPOS[*]#--repo=}; reposdir $REPOSDIR)
 root UUID    $ROOT_UUID
 ESP UUID     $ESP_UUID
 DTB          stamp $DTB_VERSION; firmware stamp $FIRMWARE_DTB_VERSION ($(if [ "$FIRMWARE_DTB_VERSION" -lt "$DTB_VERSION" ]; then echo "ESP copy in use"; else echo "firmware DTB in use"; fi))
 firmware     $(if [ -n "$FIRMWARE" ]; then echo "$FIRMWARE sha256 $(sha256sum <"$FIRMWARE" | cut -d' ' -f1) at sector $SEEK"; else echo "none (LBA 256-32767 zero, for firmware.bin at LBA 256)"; fi)
 cubie-a7a    $(for r in "${BOARD_RPMS[@]}"; do basename "$r"; done | tr '\n' ' ')
 packages     $W/packages.txt ($(wc -l <"$W/packages.txt") RPMs)
-kernel       $(grep -o '^kernel-core-[^ ]*' "$W/packages.txt" | tr '\n' ' ')
+kernel       $(grep -o '^kernel-core-[^ ]*' "$W/packages.txt" | tr '\n' ' ')$([ -n "$KERNEL_VERSION" ] && echo "(pinned: KERNEL_VERSION=$KERNEL_VERSION)" || echo "(newest in the repositories at build time)")
 firmware fs  $(grep '^image-firmware: ' "$W/firmware-audit.txt" | tail -1 | sed 's/^image-firmware: //') (audit, report only: $W/firmware-audit.txt)
 extra pkgs   ${EXTRA_PACKAGES:-none}
 boot modes   ${BOOT_MODES:-single entry per kernel}${FIRST_BOOT:+; first boot: $FIRST_BOOT (one-shot)}

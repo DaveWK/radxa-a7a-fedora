@@ -8,6 +8,10 @@
 # Usage: fedora/verify-devcard.sh [IMAGE] [WORK_DIR]
 #
 # Set as for the build (mkdevcard.sh), to check what it added:
+#   FEDORA_RELEASE=45|rawhide  the release (fedora/release.sh): default
+#                           image and work directory, the kernel's .fcN, the
+#                           release the image says it is, its repositories
+#   KERNEL_VERSION=V-R      the one kernel installed is exactly this build
 #   BOOT_MODES=protective   the three entries per kernel (fedora/bootmodes/)
 #   EXTRA_PACKAGES="a b"    the extra packages are installed
 #   FIRST_BOOT=maintenance  grubenv next_entry is the default's ~maintenance
@@ -19,8 +23,11 @@
 set -uo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
-IMG=${1:-$TOP/build/image/a7a-fedora-dev.img}
-W=${2:-$TOP/build/fedora/devcard}
+# shellcheck source=fedora/release.sh
+. "$TOP/fedora/release.sh"
+IMG=${1:-$TOP/build/image/a7a-fedora$RELEASE_SUFFIX-dev.img}
+W=${2:-$TOP/build/fedora/devcard$RELEASE_SUFFIX}
+KERNEL_VERSION=${KERNEL_VERSION:-}
 # The dev card firmware's build tree (FWREPO), if any.
 FWREPO=${FWREPO:-none}
 # FW=none (default) for an image without firmware (make fedora-image).
@@ -86,8 +93,33 @@ echo "== kernel, BLS, initramfs"
 kver=$(ls "$ROOT/usr/lib/modules")
 echo "  kernel $kver ($(grep -c . <<<"$kver") installed)"
 check "one Fedora kernel installed" test "$(grep -c . <<<"$kver")" = 1
-check "kernel is a Fedora ${FEDORA_RELEASE:-45} build" bash -c "[[ '$kver' == *.fc${FEDORA_RELEASE:-45}.aarch64 ]]"
+check "kernel is a Fedora $RELEASEVER build (.fc$RELEASE_NUM)" bash -c "[[ '$kver' == *.fc$RELEASE_NUM.aarch64 ]]"
+if [ -n "$KERNEL_VERSION" ]; then
+    check "kernel is the pinned build $KERNEL_VERSION" test "$kver" = "$KERNEL_VERSION.aarch64"
+fi
+# What the image says it is, and where its dnf looks for packages.
+osrel_get() { # KEY: its value in the image's os-release (read as text, never sourced)
+    sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$ROOT/etc/os-release" | head -1
+}
+echo "  os-release: VERSION_ID=$(osrel_get VERSION_ID) VARIANT_ID=$(osrel_get VARIANT_ID) VERSION=$(osrel_get VERSION)"
+check "os-release VERSION_ID is $RELEASE_NUM" test "$(osrel_get VERSION_ID)" = "$RELEASE_NUM"
+enabled_repos() { # ids of the enabled repositories in the image's repository files
+    # dnf5 reads both directories; either may be empty.
+    find "$ROOT/etc/yum.repos.d" "$ROOT/usr/share/dnf5/repos.d" -maxdepth 1 -name '*.repo' \
+        -exec awk '/^\[/{id=substr($0,2,length($0)-2)} /^enabled[ ]*=[ ]*1/{print id}' {} + 2>/dev/null | sort -u | tr '\n' ' '
+}
+echo "  enabled repositories in the image: $(enabled_repos)"
+if [ "$FEDORA_RELEASE" = rawhide ]; then
+    check "os-release names Rawhide" bash -c "grep -qi rawhide '$ROOT/etc/os-release'"
+    check "image dnf uses the rawhide repository only (no fedora/updates of an unreleased number)" bash -c "[ \"$(enabled_repos | tr -s ' ' '\n' | grep -vx 'fedora-cisco-openh264' | tr '\n' ' ')\" = 'rawhide ' ]"
+    check "Rawhide signing key in the image (fedora-gpg-keys)" bash -c "test -e '$ROOT/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-rawhide-aarch64' || test -e '$ROOT/usr/share/pki/rpm-gpg/RPM-GPG-KEY-fedora-rawhide-aarch64'"
+else
+    check "image dnf uses fedora and updates (no rawhide)" bash -c "r=' $(enabled_repos)'; [[ \$r == *' fedora '* && \$r == *' updates '* && \$r != *' rawhide '* ]]"
+fi
 check "kernel-core is Fedora-signed" bash -c "grep -E '^kernel-core-' '$W/packages.txt' | grep -vq '(none)'"
+boot_kmods=$(cubie_boot_kmods "$kver")
+pinctrl_builtin=no
+case " ${boot_kmods%% -- *} " in *" pinctrl-sun60i-a733 "*) ;; *) pinctrl_builtin=yes ;; esac
 for e in "$ROOT"/boot/loader/entries/*.conf; do
     linux=$(awk '$1=="linux"{print $2}' "$e")
     initrd=$(awk '$1=="initrd"{print $2}' "$e")
@@ -99,18 +131,39 @@ for e in "$ROOT"/boot/loader/entries/*.conf; do
     check "$(basename "$e"): regulator_ignore_unused (temporary)" grep -qw regulator_ignore_unused <<<"$opts"
     check "$(basename "$e"): no devicetree line (firmware DTB wins)" bash -c "! grep -q '^devicetree' '$e'"
     rd=$ROOT$initrd
-    for m in sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma sunxi-mmc i2c-mv64xxx; do
+    # The root-on-SD path of this kernel series (release.sh): the board
+    # kmods from extra/, and the stock modules.
+    for m in ${boot_kmods%% -- *}; do
+        check "initramfs has the board kmod $m (extra/)" bash -c "'$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null | grep -q '/extra/$m.ko'"
+    done
+    for m in ${boot_kmods##* -- }; do
         check "initramfs has $m" bash -c "'$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null | grep -q '/$m.ko'"
     done
+    if [ "$pinctrl_builtin" = yes ]; then
+        check "initramfs carries no A733 pinctrl module (the kernel's built-in driver binds)" bash -c "! '$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null | grep -q 'pinctrl-sun60i-a733'"
+        check "initramfs does not force-load a pinctrl module" bash -c "! '$TOP/fedora/run-build-ns.sh' user lsinitrd -f etc/cmdline.d/20-force_drivers.conf '$rd' 2>/dev/null | grep -q pinctrl"
+    fi
     check "initramfs force-loads the A733 drivers" bash -c "'$TOP/fedora/run-build-ns.sh' user lsinitrd -f etc/cmdline.d/20-force_drivers.conf '$rd' 2>/dev/null | grep -q sun60i_a733_ccu"
 done
-for m in sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma dwmac-sun55i sun8i_thermal nvmem_sunxi_sid; do
+if [ "$pinctrl_builtin" = yes ]; then
+    dkms_mods="sun60i-a733-ccu axp318w axp318-regulator dwmac-sun55i sun8i_thermal nvmem_sunxi_sid"
+    override_mods="dwmac-sun55i sun55i-pck600 sun8i_thermal nvmem_sunxi_sid"
+    check "kernel config: A733 pinctrl built in (CONFIG_PINCTRL_SUN60I_A733=y)" grep -qx 'CONFIG_PINCTRL_SUN60I_A733=y' "$ROOT/usr/lib/modules/$kver/config"
+    check "no A733 pinctrl kmod for $kver (it would never bind)" bash -c "! ls '$ROOT/usr/lib/modules/$kver/extra/pinctrl-sun60i-a733.ko'* >/dev/null 2>&1"
+    check "sun6i-dma is the stock module (A733 support is upstream)" bash -c "! ls '$ROOT/usr/lib/modules/$kver/extra/sun6i-dma.ko'* >/dev/null 2>&1 && grep -q '^kernel/drivers/dma/sun6i-dma.ko' '$ROOT/usr/lib/modules/$kver/modules.dep'"
+    check "stock sun6i-dma knows the A733 (allwinner,sun60i-a733-dma alias)" bash -c "grep -q 'sun60i-a733-dma.* sun6i_dma' '$ROOT/usr/lib/modules/$kver/modules.alias'"
+else
+    dkms_mods="sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma dwmac-sun55i sun8i_thermal nvmem_sunxi_sid"
+    override_mods="sun6i-dma dwmac-sun55i sun55i-pck600 sun8i_thermal nvmem_sunxi_sid"
+fi
+for m in $dkms_mods; do
     f=$(ls "$ROOT/usr/lib/modules/$kver/extra/$m.ko"* 2>/dev/null)
     check "DKMS $m built for $kver" test -n "$f"
 done
-for m in sun6i-dma dwmac-sun55i sun55i-pck600 sun8i_thermal nvmem_sunxi_sid; do
+for m in $override_mods; do
     check "depmod prefers the A733 $m (extra/)" bash -c "grep -q '^extra/$m.ko' '$ROOT/usr/lib/modules/$kver/modules.dep'"
 done
+check "the board package's own kernel check passes for $kver" "$TOP/fedora/run-build-ns.sh" user chroot "$ROOT" /usr/libexec/cubie-a7a/kernel check "$kver"
 check "SerDes/PCIe/PPU staged (modprobe.d blacklist)" grep -q '^blacklist sun60i_a733_pcie' "$ROOT/usr/lib/modprobe.d/cubie-a7a-staged.conf"
 check "kernel-install guard installed, after Fedora's 95-set-boot-entry" bash -c "test -x '$ROOT/usr/lib/kernel/install.d/99-zz-cubie-a7a.install' && [ \"\$(ls '$ROOT/usr/lib/kernel/install.d' | sort | tail -1)\" = 99-zz-cubie-a7a.install ]"
 check "systemd pets WDT0 (16 s, the sunxi_wdt maximum)" grep -qx 'RuntimeWatchdogSec=16s' "$ROOT/usr/lib/systemd/system.conf.d/60-cubie-a7a-watchdog.conf"

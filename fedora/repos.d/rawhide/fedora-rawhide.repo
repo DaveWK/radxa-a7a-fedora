@@ -1,0 +1,20 @@
+# Fedora Rawhide for the image build (FEDORA_RELEASE=rawhide, fedora/release.sh):
+# the [rawhide] section of fedora-repos-rawhide 46-0.3 (Fedora's own
+# /usr/share/dnf5/repos.d/fedora-rawhide.repo), which a stable Fedora build
+# host does not have. gpgcheck is on; the key files are the build host's
+# fedora-gpg-keys (the rawhide name links to the current Rawhide key, the
+# second name is the next release's, for the days around a branch point).
+# REPOSDIR=<dir> names another repository directory (e.g. one with a baseurl).
+# The image itself gets Fedora's file from fedora-repos-rawhide.
+
+[rawhide]
+name=Fedora - Rawhide - Developmental packages for the next Fedora release
+metalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch
+enabled=1
+countme=0
+metadata_expire=6h
+repo_gpgcheck=0
+type=rpm
+gpgcheck=1
+gpgkey=file:///usr/share/pki/rpm-gpg/RPM-GPG-KEY-fedora-rawhide-$basearch file:///usr/share/pki/rpm-gpg/RPM-GPG-KEY-fedora-47-$basearch
+skip_if_unavailable=False

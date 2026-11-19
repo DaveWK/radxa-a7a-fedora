@@ -14,11 +14,16 @@
 #   cubie-a7a-fwlog          firmware log reader + journal unit (aarch64; its
 #                            binary RPM is built by build-aarch64-rpms.sh)
 #
-# Usage: fedora/build-rpms.sh [OUT_DIR]   (default build/fedora/rpmbuild)
+# Usage: fedora/build-rpms.sh [OUT_DIR]   (default build/fedora/rpmbuild, or
+#        build/fedora/rpmbuild-<release> when FEDORA_RELEASE is not 45)
+# FEDORA_RELEASE (45 | rawhide, fedora/release.sh) sets the dist tag only:
+# the packages are noarch sources and scripts, the same for every release.
 # Rootless; needs rpm-build, dtc, cpp, make, systemd-rpm-macros.
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=fedora/release.sh
+. "$TOP/fedora/release.sh"
 # The firmware log reader and its format document come from a boot-chain
 # tree that has tools/a7a-fwlog (FWREPO). FWREPO=none (default) builds the
 # other packages only.
@@ -27,8 +32,7 @@ if [ "$FWREPO" != none ] && [ ! -f "$FWREPO/tools/a7a-fwlog/a7a-fwlog.c" ]; then
     echo "build-rpms: $FWREPO is missing (FWREPO=none skips cubie-a7a-fwlog)" >&2
     exit 1
 fi
-OUT=${1:-$TOP/build/fedora/rpmbuild}
-DIST=${DIST:-.fc${FEDORA_RELEASE:-45}}
+OUT=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
 mkdir -p "$OUT"/{SOURCES,SPECS,SRPMS,RPMS,BUILD,tmp}
 
 ver() { sed -n 's/^Version:[[:space:]]*//p' "$1"; }
@@ -46,7 +50,8 @@ cp "$spec" "$OUT/SPECS/"
 # --- cubie-a7a-board-support -------------------------------------------------
 spec=$TOP/fedora/rpm/cubie-a7a-board-support/cubie-a7a-board-support.spec
 v=$(ver "$spec")
-stage=$(mktemp -d)
+# Under the output directory, not /tmp (a RAM tmpfs on the build hosts).
+stage=$(mktemp -d -p "$OUT/tmp")
 trap 'rm -rf "$stage"' EXIT
 # dkms.conf keeps PACKAGE_VERSION="@VERSION@": the spec sets it to the
 # package's version-release, so every package build is a new DKMS version.

@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Rebuild the aarch64 SRPMs (cubie-a7a-fwlog) natively, rootless: a Fedora 44
-# aarch64 buildroot made with dnf5 --installroot --forcearch inside a user
-# namespace, rpmbuild run in it under qemu-aarch64 binfmt (what a COPR
-# builder does natively).
+# Rebuild the aarch64 SRPMs (cubie-a7a-fwlog) natively, rootless: an aarch64
+# buildroot of FEDORA_RELEASE (45 | rawhide, fedora/release.sh) made with
+# dnf5 --installroot --forcearch inside a user namespace, rpmbuild run in it
+# under qemu-aarch64 binfmt (what a COPR builder does natively). Each release
+# has its own buildroot and dnf cache.
 #
-# Usage: fedora/build-aarch64-rpms.sh [RPMBUILD_DIR]  (default build/fedora/rpmbuild)
+# Usage: fedora/build-aarch64-rpms.sh [RPMBUILD_DIR]  (default build/fedora/rpmbuild,
+#        or build/fedora/rpmbuild-<release> when FEDORA_RELEASE is not 45)
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
-OUT=${1:-$TOP/build/fedora/rpmbuild}
-BR=${BUILDROOT:-$TOP/build/fedora/buildroot-aarch64}
-CACHE=$TOP/build/fedora/dnf/cache-ns
-FEDORA_RELEASE=${FEDORA_RELEASE:-45}
-DIST=${DIST:-.fc$FEDORA_RELEASE}
+# shellcheck source=fedora/release.sh
+. "$TOP/fedora/release.sh"
+OUT=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
+BR=${BUILDROOT:-$TOP/build/fedora/buildroot-aarch64$RELEASE_SUFFIX}
+CACHE=${DNF_CACHE:-$TOP/build/fedora/dnf/cache-ns$RELEASE_SUFFIX}
 
 [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || {
     echo "no qemu-aarch64 binfmt handler" >&2
@@ -22,19 +24,16 @@ DIST=${DIST:-.fc$FEDORA_RELEASE}
 }
 mkdir -p "$OUT/RPMS"
 
-# Fedora's own repository files: /usr/share/dnf5/repos.d on a Fedora 45 host,
-# /etc/yum.repos.d before that.
-REPOSDIR=${REPOSDIR:-$([ -f /usr/share/dnf5/repos.d/fedora.repo ] && echo /usr/share/dnf5/repos.d || echo /etc/yum.repos.d)}
-export BR CACHE OUT DIST FEDORA_RELEASE REPOSDIR
-"$TOP/fedora/run-build-ns.sh" mount bash -s <<'NS'
+export BR CACHE OUT DIST RELEASEVER REPOSDIR
+"$TOP/fedora/run-build-ns.sh" mount bash -s -- "${RELEASE_REPOS[@]}" <<'NS'
 set -euo pipefail
 mkdir -p "$BR"/{proc,dev,run,var/lib/dnf,srpms,out}
 if [ ! -x "$BR/usr/bin/rpmbuild" ]; then
-    dnf5 -y -q install --use-host-config --installroot="$BR" --forcearch=aarch64 --releasever="$FEDORA_RELEASE" \
+    dnf5 -y -q install --use-host-config --installroot="$BR" --forcearch=aarch64 --releasever="$RELEASEVER" \
         --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$CACHE" \
         --setopt=persistdir="$BR/var/lib/dnf" --setopt=countme=False --setopt=keepcache=True \
         --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
-        --repo=fedora --repo=updates \
+        --setopt=gpgcheck=True "$@" \
         fedora-release bash coreutils rpm-build redhat-rpm-config systemd-rpm-macros gcc make
 fi
 mount -t proc proc "$BR/proc"
