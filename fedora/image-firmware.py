@@ -196,10 +196,10 @@ def list_initramfs(path):
         raise InputError("lsinitrd (dracut) is needed to list an initramfs")
     policy_mod = _load_policy()
     try:
-        all_rows, _ = policy_mod.inspect_initramfs(path)
+        records = policy_mod.inspect_initramfs(path)
     except policy_mod.PolicyError as exc:
         raise InputError(f"lsinitrd {path}: {exc}") from exc
-    return [rel for kind, rel, _ in all_rows if kind in ("file", "symlink")]
+    return [rec[1] for rec in records if rec[0] in ("file", "symlink")]
 
 
 class Debugfs:

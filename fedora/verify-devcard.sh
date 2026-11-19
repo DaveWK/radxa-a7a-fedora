@@ -358,10 +358,10 @@ check "machine-id empty (first boot)" test ! -s "$ROOT/etc/machine-id"
 # eMMC or SD slot.
 repart_root_ok() {
     local out
-    if out=$(python3 -I "$TOP/fedora/devcard-policy.py" repart-root "$ROOT" 2>&1); then
-        ok "systemd-repart runs with --discard=no (the unpartitioned gap holds the boot firmware)"
+    if out=$(python3 -I "$TOP/fedora/devcard-policy.py" repart-root --grow-root "$GROW_ROOT" "$ROOT" 2>&1); then
+        ok "systemd-repart runs with --discard=no, pinned configuration, GROW_ROOT=$GROW_ROOT (the unpartitioned gap holds the boot firmware)"
     else
-        bad "systemd-repart runs with --discard=no: $out"
+        bad "systemd-repart runs with --discard=no, pinned configuration, GROW_ROOT=$GROW_ROOT: $out"
     fi
 }
 repart_initramfs_ok() {
@@ -381,7 +381,9 @@ repart_initramfs_ok() {
 repart_root_ok
 repart_initramfs_ok
 if [ "$GROW_ROOT" = yes ]; then
-    check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
+    # repart-root --grow-root yes above: the unit present, unmasked and
+    # enabled, and exactly our etc/repart.d/50-root.conf.
+    echo "== root growth: on first boot (GROW_ROOT=yes, checked by repart-root)"
 else
     echo "== root growth: never (GROW_ROOT=no)"
     check "no repart.d config (etc, usr/lib, usr/local/lib)" \

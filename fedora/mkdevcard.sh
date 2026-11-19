@@ -407,8 +407,9 @@ fi
 # that repeats the unit's own ExecStart with --discard=no (systemd 262:
 # "systemd-repart --dry-run=no" and "systemd-repart"). Written whatever
 # GROW_ROOT says: a masked unit ignores the drop-in, and it is in place if
-# the mask is ever lifted. verify-devcard.sh checks the drop-ins against the
-# units.
+# the mask is ever lifted. devcard-policy.py repart-dropin writes the bytes
+# (refusing a stock command other than the pinned one), and the same
+# repart-root rule checks them here and in verify-devcard.sh.
 for u in systemd-repart.service systemd-repart@.service; do
     unit=$ROOT/usr/lib/systemd/system/$u
     if [ ! -f "$unit" ]; then
@@ -416,23 +417,10 @@ for u in systemd-repart.service systemd-repart@.service; do
             { echo "mkdevcard: GROW_ROOT=yes but the image has no $u" >&2; exit 1; }
         continue
     fi
-    stock=$(sed -n 's/^ExecStart=//p' "$unit")
-    case $stock in
-    *discard* | *$'\n'*) stock= ;;
-    systemd-repart | "systemd-repart "*) ;;
-    *) stock= ;;
-    esac
-    [ -n "$stock" ] ||
-        { echo "mkdevcard: $u: ExecStart is not one plain systemd-repart command; adapt the no-discard drop-in" >&2; exit 1; }
     mkdir -p "$ROOT/etc/systemd/system/$u.d"
-    cat >"$ROOT/etc/systemd/system/$u.d/10-cubie-a7a-no-discard.conf" <<EOF
-# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of
-# the first partition holds the boot firmware, so systemd-repart must not
-# discard it. The unit's own command line, plus --discard=no.
-[Service]
-ExecStart=
-ExecStart=$stock --discard=no
-EOF
+    python3 -I "$TOP/fedora/devcard-policy.py" repart-dropin "$u" "$unit" \
+        >"$ROOT/etc/systemd/system/$u.d/10-cubie-a7a-no-discard.conf" ||
+        { echo "mkdevcard: $u: ExecStart is not the pinned systemd-repart command; adapt the no-discard drop-in" >&2; exit 1; }
 done
 
 # GRUB: BLS entries from kernel-install; grub.cfg as Fedora writes it, minus
@@ -552,12 +540,16 @@ python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
 # root and the final initramfs, so an overlay cannot drop a drop-in or replace
 # an initramfs with one that runs systemd-repart without --discard=no (the
 # unpartitioned gap in front of the first partition holds the boot firmware).
-python3 -I "$TOP/fedora/devcard-policy.py" repart-root "$ROOT" >/dev/null ||
-    { echo "mkdevcard: a systemd-repart unit lacks the --discard=no protection" >&2; exit 1; }
+# The same rule verify-devcard.sh applies (devcard-policy.py repart-root and
+# repart-initramfs): a build that would fail verify fails here.
+python3 -I "$TOP/fedora/devcard-policy.py" repart-root --grow-root "$GROW_ROOT" "$ROOT" ||
+    { echo "mkdevcard: the systemd-repart configuration is not the pinned one (--discard=no protection, GROW_ROOT=$GROW_ROOT)" >&2; exit 1; }
+repart_initramfs_args=()
+[ "$GROW_ROOT" = yes ] || repart_initramfs_args+=(--forbid-repart)
 for k in $(cat "$W/kernel.txt"); do
     python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs \
-        --chroot "$ROOT" "/boot/initramfs-$k.img" >/dev/null ||
-        { echo "mkdevcard: initramfs-$k.img runs systemd-repart without --discard=no" >&2; exit 1; }
+        --chroot "$ROOT" "${repart_initramfs_args[@]}" "/boot/initramfs-$k.img" ||
+        { echo "mkdevcard: initramfs-$k.img: systemd-repart is not the pinned configuration" >&2; exit 1; }
 done
 
 # Firmware audit, a report only (never fails the build, removes nothing):

@@ -534,11 +534,12 @@ REPART_UNIT = "usr/lib/systemd/system/systemd-repart.service"
 REPART_DROPIN = (
     "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
 )
-GOOD_DROPIN = "[Service]\nExecStart=\nExecStart=systemd-repart --discard=no\n"
+STOCK_UNIT = "[Service]\nExecStart=systemd-repart --dry-run=no\n"
+GOOD_DROPIN = policy.repart_dropin_text("systemd-repart.service", STOCK_UNIT)
 
 
 def build_repart_root(root, dropin=GOOD_DROPIN, etc_unit=None):
-    write(root / REPART_UNIT, "[Service]\nExecStart=systemd-repart\n")
+    write(root / REPART_UNIT, STOCK_UNIT)
     if dropin is not None:
         write(root / REPART_DROPIN, dropin)
     if etc_unit is not None:
@@ -598,14 +599,18 @@ def repart_execstart_wrong_section_ignored():
         assert not ok, "ExecStart outside [Service] must not satisfy the check"
 
 
-def repart_indented_correct_dropin_passes():
+def repart_indented_correct_dropin_refused():
+    """F6: the drop-in is pinned to mkdevcard's bytes; an equivalent rewrite is refused."""
     with fixture() as root:
         build_repart_root(
             root,
-            dropin="  [Service]\n\tExecStart=\n\tExecStart=systemd-repart --discard=no\n",
+            dropin="  [Service]\n\tExecStart=\n"
+            "\tExecStart=systemd-repart --dry-run=no --discard=no\n",
         )
         ok, problems = policy.repart_root_ok(root)
-        assert ok, problems
+        assert not ok and any(
+            "differs from the drop-in" in p for p in problems
+        ), problems
 
 
 def repart_later_dropin_resets_away_the_flag():
@@ -837,6 +842,171 @@ def repart_pinned_refusals():
                 rel,
                 problems,
             )
+
+
+def _bad_dropin(path):
+    write(path, "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no\n")
+
+
+def repart_prefilter_initramfs_cases():
+    """F6 B2: raw cpio records; symlinked or unexpected .d refused before filtering."""
+    cases = {}
+    # A symlinked systemd-repart.service.d whose target hides an override.
+    cases["symlinked-repart-d"] = lambda t: (
+        _bad_dropin(t / "opt/rd/90-bad.conf"),
+        (t / "usr/lib/systemd/system/systemd-repart.service.d").symlink_to("/opt/rd"),
+    )
+    # A symlinked type-wide service.d whose target hides an override.
+    cases["symlinked-service-d"] = lambda t: (
+        _bad_dropin(t / "opt/sd/90-bad.conf"),
+        (t / "usr/lib/systemd/system/service.d").symlink_to("/opt/sd"),
+    )
+    # An empty unexpected drop-in directory for a checked unit.
+    cases["empty-unexpected-d"] = lambda t: (
+        t / "usr/lib/systemd/system/systemd-repart.service.d"
+    ).mkdir(parents=True)
+    # An extra directive in the stock type-wide file.
+    cases["stock-extra-directive"] = lambda t: write(
+        t / "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "[Service]\nTimeoutStopFailureMode=abort\nExecStartPre=/bin/true\n",
+    )
+    for name, plant in cases.items():
+        with fixture() as work:
+            t = work / "tree"
+            build_repart_root(t)
+            (t / "usr/lib/systemd/system").mkdir(parents=True, exist_ok=True)
+            plant(t)
+            img = work / f"{name}.img"
+            _build_cpio_initramfs(t, img)
+            ok, problems = policy.repart_initramfs_ok(img)
+            assert not ok, f"{name}: initramfs accepted: {problems}"
+            ok, problems = policy.repart_root_ok(t)
+            assert not ok, f"{name}: root accepted: {problems}"
+    # The unchanged fixture passes both ways.
+    with fixture() as work:
+        t = work / "tree"
+        build_repart_root(t)
+        write(
+            t / "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "# stock\n[Service]\nTimeoutStopFailureMode=abort\n",
+        )
+        img = work / "good.img"
+        _build_cpio_initramfs(t, img)
+        ok, problems = policy.repart_initramfs_ok(img)
+        assert ok, problems
+        ok, problems = policy.repart_root_ok(t)
+        assert ok, problems
+
+
+def repart_initramfs_bytes_from_cpio():
+    """F6 B2: types and bytes come from the cpio records, not lsinitrd."""
+    with fixture() as work:
+        t = work / "tree"
+        build_repart_root(t, dropin="[Service]\nExecStart=\nExecStart=systemd-repart\n")
+        img = work / "bad.img"
+        _build_cpio_initramfs(t, img)
+        real = shutil.which("lsinitrd")
+        good = work / "good-dropin.conf"
+        good.write_text(GOOD_DROPIN)
+        log = work / "inject.log"
+        log.write_text("")
+        # lsinitrd that lies about the drop-in's bytes (-f) must not matter.
+        wrap = work / "lsinitrd-lie"
+        wrap.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-f" ]; then\n'
+            f'  echo "injected-f:$*" >> "{log}"\n'
+            f'  cat "{good}"\n'
+            "  exit 0\n"
+            "fi\n"
+            f'exec "{real}" "$@"\n'
+        )
+        wrap.chmod(0o755)
+        ok, problems = policy.repart_initramfs_ok(img, [str(wrap)])
+        assert not ok, f"lsinitrd -f bytes trusted over the archive: {problems}"
+
+
+def repart_grow_root_cases():
+    """F6 B2: GROW_ROOT=yes needs the unit present, unmasked, enabled, our repart.d."""
+
+    def good_yes(t):
+        build_repart_root(t)
+        link = t / "usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service"
+        link.parent.mkdir(parents=True)
+        link.symlink_to("../systemd-repart.service")
+        write(t / "etc/repart.d/50-root.conf", "[Partition]\nType=root\n")
+
+    with fixture() as t:
+        good_yes(t)
+        ok, problems = policy.repart_root_ok(t, grow_root="yes")
+        assert ok, problems
+        assert policy.main(["repart-root", "--grow-root", "yes", str(t)]) == 0
+    for label, mutate in (
+        (
+            "masked",
+            lambda t: (t / "etc/systemd/system/systemd-repart.service").symlink_to(
+                "/dev/null"
+            ),
+        ),
+        (
+            "not-enabled",
+            lambda t: (
+                t / "usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service"
+            ).unlink(),
+        ),
+        (
+            "extra-repart.d",
+            lambda t: write(t / "usr/lib/repart.d/60-swap.conf", "[Partition]\n"),
+        ),
+        (
+            "changed-50-root",
+            lambda t: write(
+                t / "etc/repart.d/50-root.conf",
+                "[Partition]\nType=root\nSizeMaxBytes=1G\n",
+            ),
+        ),
+    ):
+        with fixture() as t:
+            good_yes(t)
+            mutate(t)
+            ok, problems = policy.repart_root_ok(t, grow_root="yes")
+            assert not ok, (label, problems)
+            assert policy.main(["repart-root", "--grow-root", "yes", str(t)]) == 1
+    # GROW_ROOT=no: masked in /etc, no repart.d.
+    with fixture() as t:
+        build_repart_root(t, etc_unit="/dev/null")
+        ok, problems = policy.repart_root_ok(t, grow_root="no")
+        assert ok, problems
+        write(t / "etc/repart.d/50-root.conf", "[Partition]\nType=root\n")
+        ok, problems = policy.repart_root_ok(t, grow_root="no")
+        assert not ok, problems
+    with fixture() as t:
+        build_repart_root(t)
+        ok, problems = policy.repart_root_ok(t, grow_root="no")
+        assert not ok and any("/dev/null" in p for p in problems), problems
+
+
+def repart_dropin_writer_cases():
+    """F6 B2: mkdevcard writes the drop-in with the rule's own writer."""
+    with fixture() as t:
+        unit = t / "u.service"
+        unit.write_text(STOCK_UNIT)
+        assert policy.repart_dropin_text("systemd-repart.service", STOCK_UNIT).endswith(
+            "ExecStart=\nExecStart=systemd-repart --dry-run=no --discard=no\n"
+        )
+        for stock in (
+            "[Service]\nExecStart=systemd-repart\n",
+            "[Service]\nExecStart=systemd-repart --dry-run=no --discard=yes\n",
+            "[Service]\nExecStart=systemd-repart --dry-run=no\nExecStart=x\n",
+        ):
+            unit.write_text(stock)
+            rc = policy.main(["repart-dropin", "systemd-repart.service", str(unit)])
+            assert rc == 1, stock
+    mk = (here.parent / "mkdevcard.sh").read_text()
+    assert 'repart-dropin "$u" "$unit"' in mk
+    assert 'repart-root --grow-root "$GROW_ROOT" "$ROOT"' in mk
+    vd = (here.parent / "verify-devcard.sh").read_text()
+    assert 'repart-root --grow-root "$GROW_ROOT" "$ROOT"' in vd
 
 
 def repart_systemd_analyze_oracle():
@@ -1089,8 +1259,8 @@ def repart_silent_truncated_listing():
         padded_img.write_bytes(zstd.compress(padded_cpio))
         parsed = policy.parse_cpio_initramfs(padded_img)
         assert parsed == [("file", "etc/hello.txt", 3)], parsed
-        all_rows, _ = policy.inspect_initramfs(padded_img)
-        assert [r[1] for r in all_rows] == ["etc/hello.txt"], all_rows
+        records = policy.inspect_initramfs(padded_img)
+        assert [r[1] for r in records] == ["etc/hello.txt"], records
 
         corrupt_cpio = newc_rec(b"etc/a\x00junk\x00", b"hi\n") + newc_rec(
             b"TRAILER!!!\x00", b"", mode=0
@@ -1185,10 +1355,11 @@ def initramfs_check_truncation_cases():
         )
         assert not ok, "forbidden pinctrl text must fail"
 
-        # Silent truncation of `lsinitrd -f` after `sun60i_a733_ccu` before `pinctrl`
-        # must fail closed (byte-size mismatch against verified listing).
+        # The member's bytes come from the raw cpio record, never `lsinitrd -f`:
+        # a wrapper that truncates -f output is never consulted (F6 B2).
         real_lsinitrd = shutil.which("lsinitrd")
         inject_log = work / "inject-f.log"
+        inject_log.write_text("")
         wrapper = work / "lsinitrd-trunc-f"
         wrapper.write_text(
             "#!/bin/sh\n"
@@ -1206,8 +1377,8 @@ def initramfs_check_truncation_cases():
             file_rel="etc/cmdline.d/20-force_drivers.conf",
             forbid_text=[r"pinctrl"],
         )
-        assert "injected-f:" in inject_log.read_text(), "fault was not injected"
-        assert not ok, f"truncated lsinitrd -f passed forbid_text: {problems}"
+        assert "injected-f:" not in inject_log.read_text(), "lsinitrd -f was used"
+        assert not ok, f"forbidden text in the cpio member passed: {problems}"
 
 
 def verify_rpmdb_list_cases():
@@ -1573,6 +1744,22 @@ def main():
         repart_pinned_refusals,
     )
     case(
+        "repart: symlinked/unexpected .d and stock-file directives refused (F6 B2)",
+        repart_prefilter_initramfs_cases,
+    )
+    case(
+        "repart: initramfs bytes from cpio records, not lsinitrd -f (F6 B2)",
+        repart_initramfs_bytes_from_cpio,
+    )
+    case(
+        "repart: GROW_ROOT=yes needs present, unmasked, enabled unit (F6 B2)",
+        repart_grow_root_cases,
+    )
+    case(
+        "repart: mkdevcard writes the drop-in with the rule's writer (F6 B2)",
+        repart_dropin_writer_cases,
+    )
+    case(
         "repart: exact-unit order matches offline systemd-analyze --root= verify oracle",
         repart_systemd_analyze_oracle,
     )
@@ -1617,7 +1804,8 @@ def main():
         repart_execstart_wrong_section_ignored,
     )
     case(
-        "repart: indented correct drop-in passes", repart_indented_correct_dropin_passes
+        "repart: rewritten (indented) drop-in refused: pinned bytes (F6)",
+        repart_indented_correct_dropin_refused,
     )
     case(
         "repart: later drop-in resets away flag",

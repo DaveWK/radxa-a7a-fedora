@@ -22,16 +22,21 @@ Commands:
                       package's recorded digest.  Ownership comes from ROOT's
                       rpm database, or from a recorded TSV / rpm -qlv --dump
                       FILE.  Prints one problem per line; exit 1 on failure.
-  repart-root ROOT    every effective systemd-repart invocation carries
-                      --discard=no; exit 1 with a diagnostic otherwise.  The
-                      effective command comes from the unit plus every drop-in
-                      in systemd precedence order, including indented
-                      ExecStart= lines and ExecStart= resets.
+  repart-root ROOT [--grow-root yes|no]
+                      our build's systemd-repart configuration, pinned: only
+                      the drop-in directories we write, the stock units'
+                      command lines, our drop-in bytes (effective command =
+                      stock + --discard=no), the stock service.d directive
+                      set; with --grow-root, the unit enabled and our repart.d
+                      (yes) or masked with no repart.d (no).  Run by
+                      mkdevcard.sh and verify-devcard.sh alike.
+  repart-dropin UNIT UNIT_FILE
+                      print the no-discard drop-in for UNIT from its stock
+                      unit file; exit 1 if the stock command is not pinned.
   repart-initramfs IMG [--chroot ROOT | --run-build-ns SCRIPT] [--forbid-repart]
-                      extract systemd-repart units, drop-ins and repart.d
-                      configs from IMG via lsinitrd and verify the effective
-                      command carries --discard=no (or is absent/masked);
-                      never accepts a drop-in by filename alone.
+                      the same rule on the unit directories recreated from
+                      IMG's raw cpio records (types, targets and bytes from
+                      the archive; lsinitrd only cross-checks the path set).
   enabled-repos DIR [DIR...]
                       enabled dnf repository ids, sorted, each followed by a
                       space (the awk's sort -u | tr '\n' ' ').
@@ -82,19 +87,45 @@ FEDORA_CERTIFICATES = {
 # non-Fedora file under an AIC firmware path is ours and forbidden
 # (DECISIONS 2026-11-11).
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
-# Exact drop-in directories created by fedora/mkdevcard.sh:427-436 for the two
-# checked units. Any other drop-in directory targeting systemd-repart (dashed
-# prefix, instance, or unit alias) is refused explicitly.
-ALLOWED_REPART_DROPIN_DIRS = frozenset(f"{unit}.d" for unit in REPART_UNITS)
-# Stock Fedora systemd ships one type-wide drop-in setting only
-# TimeoutStopFailureMode=abort; any other unmasked service.d/*.conf, or any
-# service.d/*.conf setting ExecStart/Alias, is refused explicitly.
-ALLOWED_VENDOR_SERVICE_D = frozenset(
-    (
-        "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
-        "lib/systemd/system/service.d/10-timeout-abort.conf",
-    )
+REPART_MAIN = "systemd-repart.service"
+# The stock units' own command lines (systemd 262, Fedora 44/45; the real
+# a7a-fedora-01 tree) and the drop-in fedora/mkdevcard.sh writes for each:
+# the same command plus --discard=no.  Anything else is refused at build
+# and at verify, rather than modelled.
+REPART_STOCK_EXECSTART = {
+    "systemd-repart.service": "systemd-repart --dry-run=no",
+    "systemd-repart@.service": "systemd-repart",
+}
+REPART_DROPIN_NAME = "10-cubie-a7a-no-discard.conf"
+REPART_DROPIN_HEADER = (
+    "# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of\n"
+    "# the first partition holds the boot firmware, so systemd-repart must not\n"
+    "# discard it. The unit's own command line, plus --discard=no.\n"
 )
+# Stock Fedora systemd ships one type-wide drop-in; its directive set is
+# pinned (real a7a-fedora-01: sha256 ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37,
+# owned by systemd).
+STOCK_SERVICE_D = "usr/lib/systemd/system/service.d"
+STOCK_SERVICE_D_FILE = "10-timeout-abort.conf"
+STOCK_SERVICE_D_DIRECTIVES = [("Service", "TimeoutStopFailureMode", "abort")]
+# The only drop-in directories (and their exact entries) our build produces
+# for the units checked here.  Any other drop-in directory for them, a
+# symlinked one, or any other entry in one (empty directories included) is
+# refused before anything is filtered.
+ALLOWED_DROPIN_DIRS = {
+    "etc/systemd/system/systemd-repart.service.d": {REPART_DROPIN_NAME},
+    "etc/systemd/system/systemd-repart@.service.d": {REPART_DROPIN_NAME},
+    STOCK_SERVICE_D: {STOCK_SERVICE_D_FILE},
+}
+# GROW_ROOT=yes: the stock unit is enabled by the systemd package's own
+# sysinit.target.wants link, and mkdevcard writes exactly this repart.d file.
+# GROW_ROOT=no: mkdevcard masks the unit in /etc and writes no repart.d.
+REPART_ENABLE_LINK = (
+    "usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service",
+    "../systemd-repart.service",
+)
+REPART_MASK = "etc/systemd/system/systemd-repart.service"
+REPART_ROOT_CONF = ("etc/repart.d/50-root.conf", "[Partition]\nType=root\n")
 REPART_REPARTD = (
     "etc/repart.d",
     "run/repart.d",
@@ -120,16 +151,6 @@ UNIT_CHAR = r"[A-Za-z0-9_:.\\-]"
 REPART_NAME = rf"systemd-repart(?:-{UNIT_CHAR}+)?(?:@{UNIT_CHAR}*)?\.service"
 REPART_DASHED_DROPIN = (
     rf"systemd-(?:repart-(?:{UNIT_CHAR}+-)?)?(?:@{UNIT_CHAR}*)?\.service"
-)
-UNIT_DIR_RE = (
-    r"(?:(?:etc|run)/systemd/system(?:\.(?:control|attached))?"
-    r"|(?:usr/local/lib|usr/lib|lib)/systemd/system)"
-)
-INITRAMFS_REPART_RE = re.compile(
-    rf"^{UNIT_DIR_RE}/"
-    rf"(?:(?:[^/]+\.(?:wants|requires)/)?{REPART_NAME}"
-    rf"|(?:{REPART_NAME}|{REPART_DASHED_DROPIN}|service)\.d/[^/]+\.conf)$"
-    r"|^(?:etc|run|usr/lib|usr/local/lib)/repart\.d/[^/]+\.conf$"
 )
 # rpm's PGPHASHALGO values (rpm/rpmpgp.h).
 RPM_ALGO = {1: "md5", 2: "sha1", 3: "sha224", 8: "sha256", 9: "sha384", 10: "sha512"}
@@ -813,8 +834,97 @@ def _unit_files(root, unit):
     return [base] + [by_name[n] for n in sorted(by_name) if by_name[n] is not None]
 
 
+def _all_assignments(text):
+    """Every (section, key, value) assignment of a unit file, in order."""
+    out = []
+    section = None
+    for line in _logical_lines(text):
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip()
+            continue
+        if "=" not in stripped:
+            out.append((section, stripped, None))
+            continue
+        key, value = stripped.split("=", 1)
+        out.append((section, key.strip(), value.strip()))
+    return out
+
+
+def _is_checked_dropin_dir(name):
+    """True for NAME.d directories that can change the units checked here."""
+    if not name.endswith(".d"):
+        return False
+    stem = name[:-2]
+    return (
+        stem == "service"
+        or stem in REPART_UNITS
+        or bool(re.fullmatch(REPART_NAME, stem))
+        or bool(re.fullmatch(REPART_DASHED_DROPIN, stem))
+    )
+
+
+def _dropin_dir_problems(root, directory, name):
+    """Refusals for one checked NAME.d entry in unit DIRECTORY, before filtering."""
+    rel = f"{directory}/{name}"
+    path = root / rel
+    what = "type-wide drop-in" if name == "service.d" else "repart drop-in"
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise PolicyError(f"cannot stat {rel}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        return [f"refused symlinked {what} directory {rel}"]
+    if not stat.S_ISDIR(st.st_mode):
+        return [f"refused non-directory {what} entry {rel}"]
+    allowed = ALLOWED_DROPIN_DIRS.get(rel)
+    if allowed is None:
+        return [f"refused unexpected {what} directory {rel}"]
+    problems = []
+    names = set()
+    for child in _scandir_if_exists(path):
+        names.add(child.name)
+        crel = f"{rel}/{child.name}"
+        if child.name not in allowed:
+            problems.append(f"refused unexpected {what} {crel}")
+            continue
+        if not stat.S_ISREG(os.lstat(child).st_mode):
+            problems.append(f"refused non-regular {what} {crel}")
+    for missing in sorted(allowed - names):
+        problems.append(f"refused {what} directory {rel} without {missing}")
+    return problems
+
+
+def _stock_service_d_problems(root):
+    """The stock type-wide drop-in carries exactly its pinned directive set."""
+    rel = f"{STOCK_SERVICE_D}/{STOCK_SERVICE_D_FILE}"
+    path = root / rel
+    if not path.is_file() or path.is_symlink():
+        return []  # absence or a wrong type is reported by _dropin_dir_problems
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise PolicyError(f"cannot read {rel}: {exc}") from exc
+    directives = _all_assignments(text)
+    if directives != STOCK_SERVICE_D_DIRECTIVES:
+        return [
+            f"refused type-wide drop-in {rel}: directives {directives!r} "
+            f"differ from the stock {STOCK_SERVICE_D_DIRECTIVES!r}"
+        ]
+    return []
+
+
 def _check_repart_refusals(root):
-    """Refuse aliases, unexpected drop-in dirs and unexpected service.d drop-ins."""
+    """Refusals made before any filtering: drop-in directories, aliases, overrides.
+
+    Every entry of every unit directory is looked at.  A drop-in directory
+    for the checked units or the type-wide service.d must be one our build
+    produces (ALLOWED_DROPIN_DIRS), a real directory holding exactly the
+    expected regular files; a symlinked or unexpected one (empty included)
+    is refused.  Aliases to or from the checked units are refused.
+    """
     root = Path(root)
     unit_dirs = _active_unit_dirs(root)
     problems = []
@@ -823,17 +933,10 @@ def _check_repart_refusals(root):
         dir_path = root / directory
         for entry in _scandir_if_exists(dir_path):
             name = entry.name
+            if _is_checked_dropin_dir(name):
+                problems.extend(_dropin_dir_problems(root, directory, name))
+                continue
             if name.endswith(".d"):
-                stem = name[:-2]
-                if stem == "service":
-                    continue
-                if (
-                    re.fullmatch(REPART_NAME, stem)
-                    or re.fullmatch(REPART_DASHED_DROPIN, stem)
-                ) and name not in ALLOWED_REPART_DROPIN_DIRS:
-                    problems.append(
-                        f"refused unexpected repart drop-in directory {directory}/{name}"
-                    )
                 continue
             if name.endswith((".wants", ".requires")) and entry.is_dir():
                 for child in _scandir_if_exists(entry):
@@ -847,6 +950,12 @@ def _check_repart_refusals(root):
                 continue
             if re.fullmatch(REPART_NAME, name) and name not in REPART_UNITS:
                 problems.append(f"refused unexpected repart unit {directory}/{name}")
+            if name in REPART_UNITS and not entry.is_symlink():
+                if f"{directory}/{name}" != f"usr/lib/systemd/system/{name}":
+                    problems.append(
+                        f"refused unit override {directory}/{name} (only the stock "
+                        f"usr/lib/systemd/system/{name} is accepted)"
+                    )
             if entry.is_symlink() and not _masked(entry):
                 try:
                     raw_target = os.readlink(entry)
@@ -867,36 +976,37 @@ def _check_repart_refusals(root):
                         f"refused alias symlink to checked unit {directory}/{name} -> {raw_target}"
                     )
                     alias_names.add(name)
-        for conf in _scandir_if_exists(dir_path / "service.d"):
-            if not conf.name.endswith(".conf") or _masked(conf):
-                continue
-            rel = f"{directory}/service.d/{conf.name}"
-            resolved = _resolve_within(root, conf)
-            if resolved is None or not resolved.is_file():
-                problems.append(f"refused unreadable type-wide drop-in {rel}")
-                continue
-            try:
-                text = resolved.read_text()
-            except OSError:
-                problems.append(f"refused unreadable type-wide drop-in {rel}")
-                continue
-            touches = any(
-                k == "ExecStart" for k, _ in _section_assignments(text, "Service")
-            ) or any(k == "Alias" for k, _ in _section_assignments(text, "Install"))
-            if touches:
-                problems.append(
-                    f"refused type-wide drop-in {rel}: sets ExecStart or Alias"
-                )
-            elif rel not in ALLOWED_VENDOR_SERVICE_D:
-                problems.append(f"refused unexpected type-wide drop-in {rel}")
+    problems.extend(_stock_service_d_problems(root))
     for alias in sorted(alias_names):
         for directory in unit_dirs:
             alias_d = root / directory / f"{alias}.d"
-            if alias_d.is_dir():
+            if alias_d.is_dir() or alias_d.is_symlink():
                 problems.append(
                     f"refused alias drop-in directory {directory}/{alias}.d"
                 )
     return problems
+
+
+def repart_dropin_text(unit, unit_text):
+    """The exact no-discard drop-in mkdevcard writes for UNIT, from its stock text.
+
+    Refuses (PolicyError) a unit whose own [Service] ExecStart is not the
+    pinned stock command line: the drop-in would then have to be adapted.
+    """
+    stock = REPART_STOCK_EXECSTART.get(unit)
+    if stock is None:
+        raise PolicyError(f"{unit} is not a checked systemd-repart unit")
+    own = [v for k, v in _service_assignments(unit_text) if k == "ExecStart"]
+    if own != [stock]:
+        raise PolicyError(
+            f"{unit}: ExecStart {own!r} is not the pinned stock [{stock!r}]; "
+            "adapt the no-discard drop-in"
+        )
+    return (
+        REPART_DROPIN_HEADER
+        + "[Service]\nExecStart=\n"
+        + f"ExecStart={stock} {DISCARD_FLAG}\n"
+    )
 
 
 def _effective_exec_start(files):
@@ -949,13 +1059,64 @@ def _carries_no_discard(commands):
     return bool(commands) and all(_command_carries_no_discard(c) for c in commands)
 
 
-def repart_root_ok(root):
-    """Every effective systemd-repart invocation carries --discard=no.
+def _grow_root_problems(root, grow_root):
+    """GROW_ROOT=yes: the stock unit present, unmasked, enabled, our repart.d.
 
-    Pinned to our build's exact units (`systemd-repart.service`,
-    `systemd-repart@.service`) and drop-in directory names; refuses aliases,
-    unexpected repart/dashed drop-in directories and unexpected `service.d`
-    drop-ins.
+    GROW_ROOT=no: the unit masked in /etc (-> /dev/null) and no repart.d.
+    """
+    problems = []
+    if grow_root not in ("yes", "no"):
+        raise PolicyError(f"invalid GROW_ROOT {grow_root!r} (yes or no)")
+    unit_rel = f"usr/lib/systemd/system/{REPART_MAIN}"
+    unit = root / unit_rel
+    masks = []
+    for directory in _active_unit_dirs(root):
+        cand = root / directory / REPART_MAIN
+        if _masked(cand):
+            masks.append(f"{directory}/{REPART_MAIN}")
+    confs = []
+    for rel in REPART_REPARTD:
+        for entry in _scandir_if_exists(root / rel):
+            confs.append(f"{rel}/{entry.name}")
+    if grow_root == "yes":
+        if not unit.is_file() or unit.is_symlink():
+            problems.append(f"GROW_ROOT=yes but {unit_rel} is missing")
+        for mask in masks:
+            problems.append(f"GROW_ROOT=yes but {REPART_MAIN} is masked ({mask})")
+        link, target = REPART_ENABLE_LINK
+        lpath = root / link
+        if not lpath.is_symlink() or os.readlink(lpath) != target:
+            problems.append(
+                f"GROW_ROOT=yes but {REPART_MAIN} is not enabled ({link} -> {target})"
+            )
+        conf_rel, conf_text = REPART_ROOT_CONF
+        if confs != [conf_rel]:
+            problems.append(
+                f"GROW_ROOT=yes needs exactly {conf_rel} in repart.d, found {confs!r}"
+            )
+        else:
+            cpath = root / conf_rel
+            if cpath.is_symlink() or not cpath.is_file():
+                problems.append(f"{conf_rel} is not a regular file")
+            elif cpath.read_text() != conf_text:
+                problems.append(f"{conf_rel} differs from {conf_text!r}")
+    else:
+        mask = root / REPART_MASK
+        if not (mask.is_symlink() and os.readlink(mask) == "/dev/null"):
+            problems.append(f"GROW_ROOT=no but {REPART_MASK} is not -> /dev/null")
+        if confs:
+            problems.append(f"GROW_ROOT=no but repart.d holds {confs!r}")
+    return problems
+
+
+def repart_root_ok(root, grow_root=None):
+    """Our build's systemd-repart configuration, pinned; the same rule at build and verify.
+
+    Refusals before filtering (_check_repart_refusals); then for each checked
+    unit present and not masked: its own ExecStart is the pinned stock
+    command, its drop-in is byte-for-byte the one mkdevcard writes, and the
+    effective command is the stock one plus --discard=no.  GROW_ROOT (yes or
+    no, root only) adds _grow_root_problems.
     """
     root = Path(root)
     problems = _check_repart_refusals(root)
@@ -968,12 +1129,16 @@ def repart_root_ok(root):
         ):
             continue
         files = _unit_files(root, unit)
+        dropin_rel = f"etc/systemd/system/{unit}.d/{REPART_DROPIN_NAME}"
+        dropin = root / dropin_rel
         if files == []:
+            if dropin.exists() or dropin.is_symlink():
+                problems.append(f"{dropin_rel} present without {unit}")
             continue
-        if unit == "systemd-repart.service":
+        if unit == REPART_MAIN:
             repart_service_seen = True
         if files is None:
-            continue  # masked: cannot run
+            continue  # masked: cannot run (GROW_ROOT rules below)
         for path in files:
             if not path.is_file():
                 continue
@@ -992,11 +1157,25 @@ def repart_root_ok(root):
                             problems.append(
                                 f"refused alias drop-in directory {directory}/{alias}.d"
                             )
+        try:
+            expected = repart_dropin_text(unit, files[0].read_text())
+        except (PolicyError, OSError) as exc:
+            problems.append(f"{unit}: {exc}")
+            expected = None
+        if expected is not None:
+            if dropin.is_symlink() or not dropin.is_file():
+                problems.append(f"{unit}: missing {dropin_rel}")
+            elif dropin.read_text() != expected:
+                problems.append(
+                    f"{unit}: {dropin_rel} differs from the drop-in mkdevcard writes"
+                )
         commands = _effective_exec_start(files)
         if commands is None:
             problems.append(f"{unit}: unreadable unit or drop-in")
         elif not _carries_no_discard(commands):
             problems.append(f"{unit} runs {commands!r} without {DISCARD_FLAG}")
+        elif commands != [f"{REPART_STOCK_EXECSTART[unit]} {DISCARD_FLAG}"]:
+            problems.append(f"{unit} runs {commands!r}, not the pinned command line")
     configs = []
     for rel in REPART_REPARTD:
         for entry in _scandir_if_exists(root / rel):
@@ -1004,6 +1183,8 @@ def repart_root_ok(root):
                 configs.append(entry)
     if configs and not repart_service_seen:
         problems.append("repart.d configuration without systemd-repart.service")
+    if grow_root is not None:
+        problems.extend(_grow_root_problems(root, grow_root))
     return (not problems, problems)
 
 
@@ -1072,7 +1253,12 @@ def _decompress_zstd_single_frame(data, start_pos):
 
 
 def _parse_cpio_one(data, offset):
-    """Parse one cpio newc/crc archive starting at OFFSET, requiring TRAILER!!!."""
+    """Parse one cpio newc/crc archive starting at OFFSET, requiring TRAILER!!!.
+
+    Returns ([(kind, rel, meta, mode, payload)], end).  KIND is file, symlink
+    or other; META is the file size or the symlink target; PAYLOAD is the
+    record's raw data bytes, straight from the archive.
+    """
     entries = []
     pos = offset
     length = len(data)
@@ -1110,15 +1296,15 @@ def _parse_cpio_one(data, offset):
             return entries, pos
         rel = _norm_archive_path(name)
         if stat.S_ISLNK(mode):
-            entries.append(("symlink", rel, os.fsdecode(payload)))
+            entries.append(("symlink", rel, os.fsdecode(payload), mode, payload))
         elif stat.S_ISREG(mode):
-            entries.append(("file", rel, filesize))
+            entries.append(("file", rel, filesize, mode, payload))
         else:
-            entries.append(("other", rel, 0))
+            entries.append(("other", rel, 0, mode, payload))
 
 
-def parse_cpio_stream(data):
-    """Parse one or more concatenated cpio newc/crc archives, each ending in TRAILER!!!."""
+def _cpio_records_stream(data):
+    """Raw records of one or more concatenated cpio newc/crc archives."""
     entries = []
     pos = 0
     length = len(data)
@@ -1138,13 +1324,14 @@ def parse_cpio_stream(data):
     return entries
 
 
-def parse_cpio_initramfs(archive_path):
+def parse_cpio_records(archive_path):
     """Independently parse our build's initramfs (optional early cpio + zstd cpio).
 
     Leading uncompressed early-CPIO segments (if present) must each end cleanly
     at TRAILER!!! with only NUL alignment bytes before the zstd payload. The
     main payload must be exactly one complete zstd frame ending at EOF, and
     its decompressed cpio stream(s) must each terminate cleanly at TRAILER!!!.
+    Returns raw records (kind, rel, meta, mode, payload) in archive order.
     """
     path = Path(archive_path)
     try:
@@ -1169,10 +1356,15 @@ def parse_cpio_initramfs(archive_path):
             continue
         break
     decompressed = _decompress_zstd_single_frame(data, pos)
-    entries.extend(parse_cpio_stream(decompressed))
+    entries.extend(_cpio_records_stream(decompressed))
     if not entries:
         raise PolicyError(f"initramfs {path} contains no entries")
     return entries
+
+
+def parse_cpio_initramfs(archive_path):
+    """(kind, rel, meta) of every record of the initramfs at ARCHIVE_PATH."""
+    return [rec[:3] for rec in parse_cpio_records(archive_path)]
 
 
 def _parse_ls_row(line):
@@ -1200,54 +1392,12 @@ def _parse_ls_row(line):
     return ("other", _norm_archive_path(rest), 0)
 
 
-def _select_initramfs_repart_entries(all_rows):
-    """Select repart units, drop-ins, service.d, repart.d and alias symlinks/drop-ins."""
-    unit_dir_set = set(SYSTEMD_UNIT_DIRS)
-    symlink_targets = {}
-    for kind, rel, meta in all_rows:
-        if kind != "symlink" or meta == "/dev/null":
-            continue
-        parent, _, name = rel.rpartition("/")
-        if parent in unit_dir_set and name:
-            symlink_targets.setdefault(name, set()).add(Path(meta).name)
-    alias_names = set()
-    changed = True
-    while changed:
-        changed = False
-        for name, targets in symlink_targets.items():
-            if name in alias_names:
-                continue
-            if re.fullmatch(REPART_NAME, name) or any(
-                re.fullmatch(REPART_NAME, t) or t in alias_names for t in targets
-            ):
-                alias_names.add(name)
-                changed = True
-    alias_dropin_dirs = {f"{a}.d" for a in alias_names}
-    selected = []
-    for kind, rel, meta in all_rows:
-        if kind in ("file", "symlink") and INITRAMFS_REPART_RE.match(rel):
-            selected.append((kind, rel, meta))
-            continue
-        parent, _, name = rel.rpartition("/")
-        if kind == "symlink" and parent in unit_dir_set and name in alias_names:
-            selected.append((kind, rel, meta))
-            continue
-        grand, _, dname = parent.rpartition("/")
-        if (
-            kind in ("file", "symlink")
-            and grand in unit_dir_set
-            and dname in alias_dropin_dirs
-            and name.endswith(".conf")
-        ):
-            selected.append((kind, rel, meta))
-    return selected
-
-
 def _parse_lsinitrd_listing(listing):
     """Parse lsinitrd stdout requiring opening and closing 72-'=' section framing.
 
-    Returns (all_rows, repart_entries) where all_rows is a list of
-    (kind, relpath, size_or_target) across every file-listing section.
+    Returns all_rows, a list of (kind, relpath, size_or_target) across every
+    file-listing section; only the path set is used (a completeness
+    cross-check), never lsinitrd's types, targets or bytes.
     Raises PolicyError on missing closing separator, malformed listing row, or
     empty listing.
     """
@@ -1277,71 +1427,101 @@ def _parse_lsinitrd_listing(listing):
             all_rows.append((kind, rel, meta))
     if not all_rows:
         raise PolicyError("incomplete lsinitrd listing: no recognized file rows")
-    return all_rows, _select_initramfs_repart_entries(all_rows)
+    return all_rows
 
 
 def inspect_initramfs(img, lsinitrd_cmd=None, archive_path=None):
-    """Run lsinitrd and cross-check its framed listing against the raw cpio archive.
+    """Raw cpio records of IMG, cross-checked for completeness against lsinitrd.
 
-    Returns (all_rows, repart_entries). Raises PolicyError if lsinitrd fails,
-    emits stderr, lacks closing section framing, or disagrees with the
-    independently parsed cpio archive (which requires TRAILER!!! on every segment).
+    Returns the records (kind, rel, meta, mode, payload) parsed from the
+    archive bytes; types, symlink targets and file bytes come only from
+    those records.  Raises PolicyError if lsinitrd fails, emits stderr, lacks
+    closing section framing, or lists a different path set.
     """
     cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
     listing = subprocess.run(cmd + [str(img)], capture_output=True, text=True)
     if listing.returncode != 0 or listing.stderr.strip():
         msg = listing.stderr.strip() or listing.stdout.strip() or "lsinitrd failed"
         raise PolicyError(f"cannot inspect initramfs {img}: {msg}")
-    all_rows, repart_entries = _parse_lsinitrd_listing(listing.stdout)
+    all_rows = _parse_lsinitrd_listing(listing.stdout)
     archive = Path(archive_path) if archive_path is not None else Path(img)
-    cpio_entries = parse_cpio_initramfs(archive)
+    records = parse_cpio_records(archive)
     listed_paths = sorted(rel for _, rel, _ in all_rows)
-    cpio_paths = sorted(rel for _, rel, _ in cpio_entries)
+    cpio_paths = sorted(rec[1] for rec in records)
     if listed_paths != cpio_paths:
         raise PolicyError(
             f"initramfs {img} listing mismatch: lsinitrd reported {len(listed_paths)} "
             f"entries, cpio archive holds {len(cpio_paths)}"
         )
-    return all_rows, repart_entries
+    return records
+
+
+def _materialize_unit_tree(records, tree):
+    """Write every cpio record under a unit or repart.d directory into TREE.
+
+    Nothing is filtered by name: every directory, symlink and file under the
+    systemd unit directories and repart.d directories (and a top-level lib
+    symlink) is recreated with its archive type, target and bytes, so the
+    same tree checks run on the initramfs as on the root.
+    """
+    prefixes = tuple(SYSTEMD_UNIT_DIRS) + REPART_REPARTD
+    kinds = {}
+    for kind, rel, meta, mode, payload in records:
+        parts = Path(rel).parts
+        if rel == "." or ".." in parts or Path(rel).is_absolute():
+            if rel == ".":
+                continue
+            raise PolicyError(f"invalid initramfs path: {rel}")
+        wanted = rel == "lib" or any(
+            rel == pre or rel.startswith(pre + "/") or pre.startswith(rel + "/")
+            for pre in prefixes
+        )
+        if not wanted:
+            continue
+        is_dir = stat.S_ISDIR(mode)
+        new_kind = "dir" if is_dir else kind
+        if rel in kinds:
+            if kinds[rel] == "dir" and new_kind == "dir":
+                continue
+            raise PolicyError(f"duplicate initramfs path: {rel}")
+        dest = tree / rel
+        for i in range(1, len(parts)):
+            anc = "/".join(parts[:i])
+            if kinds.get(anc, "dir") != "dir":
+                raise PolicyError(
+                    f"initramfs entry {rel} lies under non-directory {anc}"
+                )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if is_dir:
+            dest.mkdir(exist_ok=True)
+        elif kind == "symlink":
+            dest.symlink_to(meta)
+        elif kind == "file":
+            dest.write_bytes(payload)
+        else:
+            raise PolicyError(f"unexpected special file in a unit directory: {rel}")
+        kinds[rel] = new_kind
 
 
 def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False, archive_path=None):
-    """Extract systemd-repart units/drop-ins from IMG and verify effective command.
+    """Check IMG's systemd-repart units with the same rule as the root.
 
-    Never accepts a drop-in by filename alone; fails closed when lsinitrd fails
-    or disagrees with the independently parsed cpio archive.
+    Units, drop-ins and directories come from the raw cpio records (types,
+    targets and bytes), recreated unfiltered and checked by repart_tree_problems.
+    With FORBID_REPART (GROW_ROOT=no) no systemd-repart unit or repart.d
+    configuration may be active.  Fails closed on any listing or parse error.
     """
     cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
     try:
-        _, entries = inspect_initramfs(img, lsinitrd_cmd=cmd, archive_path=archive_path)
+        records = inspect_initramfs(img, lsinitrd_cmd=cmd, archive_path=archive_path)
     except PolicyError as exc:
         return False, [str(exc)]
-    if not entries:
-        return True, []
     with tempfile.TemporaryDirectory(prefix="a7a-initramfs-repart-") as td:
         tree = Path(td)
-        for kind, rel, meta in entries:
-            if ".." in Path(rel).parts:
-                return False, [f"invalid initramfs path: {rel}"]
-            dest = tree / rel
-            if dest.is_symlink() or dest.exists():
-                return False, [f"duplicate initramfs path: {rel}"]
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if kind == "symlink":
-                if dest.exists() or dest.is_symlink():
-                    dest.unlink()
-                dest.symlink_to(meta)
-            else:
-                extracted = subprocess.run(
-                    cmd + ["-f", rel, str(img)], capture_output=True
-                )
-                if (
-                    extracted.returncode != 0
-                    or extracted.stderr.strip()
-                    or len(extracted.stdout) != meta
-                ):
-                    return False, [f"cannot extract {rel} from {img}"]
-                dest.write_bytes(extracted.stdout)
+        try:
+            _materialize_unit_tree(records, tree)
+        except PolicyError as exc:
+            return False, [str(exc)]
         if forbid_repart:
             problems = _check_repart_refusals(tree)
             for unit in REPART_UNITS:
@@ -1371,13 +1551,11 @@ def initramfs_check(
     """Verify path and member-text requirements against a completeness-checked initramfs."""
     cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
     try:
-        all_rows, _ = inspect_initramfs(
-            img, lsinitrd_cmd=cmd, archive_path=archive_path
-        )
+        records = inspect_initramfs(img, lsinitrd_cmd=cmd, archive_path=archive_path)
     except PolicyError as exc:
         return False, [str(exc)]
     problems = []
-    paths = [rel for _, rel, _ in all_rows]
+    paths = [rec[1] for rec in records]
     for pattern in require_paths:
         if not any(re.search(pattern, p) for p in paths):
             problems.append(f"initramfs {img} missing path matching {pattern!r}")
@@ -1388,40 +1566,24 @@ def initramfs_check(
             )
     if file_rel is not None:
         norm = _norm_archive_path(file_rel)
-        matches = [
-            (kind, meta)
-            for kind, rel, meta in all_rows
-            if rel == norm and kind == "file"
-        ]
+        matches = [rec for rec in records if rec[1] == norm and rec[0] == "file"]
         if not matches:
             if require_text:
                 problems.append(f"initramfs {img} missing file {norm}")
         else:
-            expected_size = matches[-1][1]
-            extracted = subprocess.run(
-                cmd + ["-f", norm, str(img)], capture_output=True
-            )
-            if (
-                extracted.returncode != 0
-                or extracted.stderr.strip()
-                or len(extracted.stdout) != expected_size
-            ):
-                problems.append(
-                    f"cannot extract complete {norm} from {img} "
-                    f"(got {len(extracted.stdout)} bytes, expected {expected_size})"
-                )
-            else:
-                text = extracted.stdout.decode("utf-8", errors="replace")
-                for pattern in require_text:
-                    if not re.search(pattern, text):
-                        problems.append(
-                            f"{norm} in {img} missing text matching {pattern!r}"
-                        )
-                for pattern in forbid_text:
-                    if re.search(pattern, text):
-                        problems.append(
-                            f"{norm} in {img} contains forbidden text matching {pattern!r}"
-                        )
+            # The bytes of the last record for the path (what the kernel
+            # unpacks last), straight from the archive.
+            text = matches[-1][4].decode("utf-8", errors="replace")
+            for pattern in require_text:
+                if not re.search(pattern, text):
+                    problems.append(
+                        f"{norm} in {img} missing text matching {pattern!r}"
+                    )
+            for pattern in forbid_text:
+                if re.search(pattern, text):
+                    problems.append(
+                        f"{norm} in {img} contains forbidden text matching {pattern!r}"
+                    )
     return (not problems, problems)
 
 
@@ -1909,6 +2071,10 @@ def main(argv=None):
     p.add_argument("--report", type=Path)
     p = sub.add_parser("repart-root")
     p.add_argument("root", type=Path)
+    p.add_argument("--grow-root", choices=("yes", "no"))
+    p = sub.add_parser("repart-dropin")
+    p.add_argument("unit", choices=REPART_UNITS)
+    p.add_argument("unit_file", type=Path)
     p = sub.add_parser("repart-initramfs")
     p.add_argument("img")
     runner = p.add_mutually_exclusive_group()
@@ -1990,13 +2156,20 @@ def main(argv=None):
         return 1 if problems else 0
     if a.cmd == "repart-root":
         try:
-            ok, problems = repart_root_ok(a.root)
+            ok, problems = repart_root_ok(a.root, grow_root=a.grow_root)
         except PolicyError as exc:
             print(f"repart-root: {exc}", file=sys.stderr)
             return 1
         for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
+    if a.cmd == "repart-dropin":
+        try:
+            sys.stdout.write(repart_dropin_text(a.unit, a.unit_file.read_text()))
+        except (PolicyError, OSError) as exc:
+            print(f"repart-dropin: {exc}", file=sys.stderr)
+            return 1
+        return 0
     if a.cmd == "repart-initramfs":
         lsinitrd_cmd = None
         archive_path = None
