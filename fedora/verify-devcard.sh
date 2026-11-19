@@ -29,15 +29,49 @@ KERNEL_VERSION=${KERNEL_VERSION:-}
 FWREPO=${FWREPO:-none}
 # FW=none (default) for an image without firmware (make fedora-image).
 FW=${FW:-none}
-ROOT=$W/root
 # The DTB the firmware would embed from this source tree (DTB_ORIGIN=firmware);
 # built here unless a specific firmware DTB is given.
 FIRMWARE_DTB=${FIRMWARE_DTB:-}
-ESP=$W/esp.img
 BOOT_MODES=${BOOT_MODES:-}
 EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
 FIRST_BOOT=${FIRST_BOOT:-}
 GROW_ROOT=${GROW_ROOT:-yes}
+[ -f "$IMG" ] || {
+    echo "verify-devcard: image $IMG does not exist" >&2
+    exit 1
+}
+mkdir -p "$W"
+# Bind every check directly to IMG: extract the ESP and root partitions out of
+# IMG itself into the work directory, never trusting a staging tree that could
+# have diverged after the build (and with GROW_ROOT=no, reading the real
+# post-overlay content from the image).
+VERIFY_ESP=$W/verify-esp.img
+VERIFY_ROOT_IMG=$W/verify-root.img
+VERIFY_ROOT=$W/verify-root
+VERIFY_PACKAGES=$W/verify-packages.txt
+python3 -I "$TOP/fedora/image-extract.py" extract-partition "$IMG" "$VERIFY_ESP" \
+    C12A7328-F81F-11D2-BA4B-00A0C93EC93B || {
+    echo "verify-devcard: cannot extract the ESP from $IMG" >&2
+    exit 1
+}
+python3 -I "$TOP/fedora/image-extract.py" extract-partition "$IMG" "$VERIFY_ROOT_IMG" \
+    B921B045-1DF0-41C3-AF44-4C6F280D3FAE || {
+    echo "verify-devcard: cannot extract the root partition from $IMG" >&2
+    exit 1
+}
+python3 -I "$TOP/fedora/image-extract.py" extract-root "$VERIFY_ROOT_IMG" "$VERIFY_ROOT" || {
+    echo "verify-devcard: cannot read the root filesystem in $IMG" >&2
+    exit 1
+}
+ROOT=$VERIFY_ROOT
+ESP=$VERIFY_ESP
+ROOT_IMG=$VERIFY_ROOT_IMG
+rpm --root "$ROOT" -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}\n' |
+    sort >"$VERIFY_PACKAGES" || {
+    echo "verify-devcard: cannot read the rpm database in $IMG" >&2
+    exit 1
+}
+PACKAGES=$VERIFY_PACKAGES
 fail=0
 ok() { printf '  ok    %s\n' "$*"; }
 bad() {
@@ -49,6 +83,9 @@ check() {
     shift
     if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what"; fi
 }
+if [ -f "$W/root.img" ]; then
+    check "staging root.img is byte-identical to IMG's root partition" cmp "$W/root.img" "$ROOT_IMG"
+fi
 
 echo "== layout"
 sfdisk -J "$IMG" | python3 -I -c '
@@ -112,7 +149,7 @@ if [ "$FEDORA_RELEASE" = rawhide ]; then
 else
     check "image dnf uses fedora and updates (no rawhide)" bash -c "r=' $(enabled_repos)'; [[ \$r == *' fedora '* && \$r == *' updates '* && \$r != *' rawhide '* ]]"
 fi
-check "kernel-core is Fedora-signed" bash -c "grep -E '^kernel-core-' '$W/packages.txt' | grep -vq '(none)'"
+check "kernel-core is Fedora-signed" bash -c "grep -E '^kernel-core-' '$PACKAGES' | grep -vq '(none)'"
 boot_kmods=$(cubie_boot_kmods "$kver")
 pinctrl_builtin=no
 case " ${boot_kmods%% -- *} " in *" pinctrl-sun60i-a733 "*) ;; *) pinctrl_builtin=yes ;; esac
@@ -198,7 +235,7 @@ check "no SSH host keys" bash -c "! ls '$ROOT'/etc/ssh/ssh_host_* >/dev/null 2>&
 check "no authorized_keys" bash -c "! ls '$ROOT'/root/.ssh/authorized_keys* >/dev/null 2>&1"
 # cubie-a7a-fwlog is optional (built only where the boot-chain checkout is).
 units="sshd NetworkManager firewalld chronyd cubie-a7a-dtb dkms bluetooth"
-if grep -q '^cubie-a7a-fwlog-' "$W/packages.txt"; then
+if grep -q '^cubie-a7a-fwlog-' "$PACKAGES"; then
     units="$units a7a-fwlog"
     check "a7a-fwlog installed (aarch64)" bash -c "file '$ROOT/usr/bin/a7a-fwlog' | grep -q 'ARM aarch64'"
     check "a7a-fwlog.service: SyslogIdentifier, previous boot first, exit 1 tolerated" bash -c "u='$ROOT/usr/lib/systemd/system/a7a-fwlog.service'; grep -q '^SyslogIdentifier=a7a-fwlog' \$u && grep -q '^SuccessExitStatus=1' \$u && [ \"\$(grep -n 'a7a-fwlog -p\$' \$u | cut -d: -f1)\" -lt \"\$(grep -n '^ExecStart=/usr/bin/a7a-fwlog\$' \$u | cut -d: -f1)\" ]"
@@ -209,7 +246,7 @@ fi
 for u in $units; do
     check "$u.service enabled" bash -c "ls '$ROOT'/etc/systemd/system/*.wants/$u.service >/dev/null 2>&1"
 done
-check "no cockpit" bash -c "! grep -q '^cockpit' '$W/packages.txt'"
+check "no cockpit" bash -c "! grep -q '^cockpit' '$PACKAGES'"
 check "CPU rendering: Mesa llvmpipe (libgallium), kms_swrast, EGL and GBM" bash -c "ls '$ROOT'/usr/lib64/libgallium-*.so '$ROOT'/usr/lib64/dri/kms_swrast_dri.so '$ROOT'/usr/lib64/libEGL_mesa.so.0 '$ROOT'/usr/lib64/libgbm.so.1 >/dev/null"
 # Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
 # package and match its recorded digest: provenance, not path.  Fedora's
@@ -217,7 +254,7 @@ check "CPU rendering: Mesa llvmpipe (libgallium), kms_swrast, EGL and GBM" bash 
 # non-Fedora file fails.  Verified directly against ROOT's rpm database.
 check "no unowned, modified or non-Fedora AIC8800 firmware" \
     python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT"
-if grep -q '^cubie-a7a-aic8800-usb-' "$W/packages.txt"; then
+if grep -q '^cubie-a7a-aic8800-usb-' "$PACKAGES"; then
     for m in aic_load_fw aic8800_fdrv; do
         check "DKMS $m built for $kver" bash -c "ls '$ROOT/usr/lib/modules/$kver/extra/$m.ko'* >/dev/null"
     done
@@ -230,15 +267,15 @@ fi
 # with its Wi-Fi plugin and a supplicant; nothing marks Wi-Fi unmanaged and
 # nothing connects anywhere on its own.
 for pkg in NetworkManager-wifi wpa_supplicant iw bluez wireless-regdb; do
-    check "$pkg installed" grep -q "^$pkg-[0-9]" "$W/packages.txt"
+    check "$pkg installed" grep -q "^$pkg-[0-9]" "$PACKAGES"
 done
-check "no iwd (NetworkManager's Wi-Fi backend is wpa_supplicant)" bash -c "! grep -q '^iwd-[0-9]' '$W/packages.txt'"
+check "no iwd (NetworkManager's Wi-Fi backend is wpa_supplicant)" bash -c "! grep -q '^iwd-[0-9]' '$PACKAGES'"
 check "NetworkManager Wi-Fi device plugin present" bash -c "ls '$ROOT'/usr/lib64/NetworkManager/*/libnm-device-plugin-wifi.so >/dev/null 2>&1"
 check "NetworkManager config leaves devices managed (no unmanaged-devices, no managed=false)" bash -c "! grep -rqsiE '^[[:space:]]*(unmanaged-devices|managed[[:space:]]*=[[:space:]]*(0|false|no))' '$ROOT/etc/NetworkManager' '$ROOT/usr/lib/NetworkManager/conf.d'"
 check "no udev rule marks Wi-Fi unmanaged (only NetworkManager's own 85-nm-unmanaged.rules, which names no Wi-Fi)" bash -c "! grep -rlsE 'NM_UNMANAGED' '$ROOT/etc/udev/rules.d' '$ROOT/usr/lib/udev/rules.d' | grep -qv '/85-nm-unmanaged.rules\$' && ! grep -qiE 'wlan|wifi|wlp|aic' '$ROOT/usr/lib/udev/rules.d/85-nm-unmanaged.rules'"
 check "no Wi-Fi connection profile in the image (nothing auto-connects)" bash -c "! grep -rlsq 'type=wifi\|type=802-11-wireless' '$ROOT/etc/NetworkManager/system-connections' '$ROOT/usr/lib/NetworkManager/system-connections'"
 for pkg in $EXTRA_PACKAGES; do
-    check "$pkg installed (EXTRA_PACKAGES)" grep -q "^$pkg-[0-9]" "$W/packages.txt"
+    check "$pkg installed (EXTRA_PACKAGES)" grep -q "^$pkg-[0-9]" "$PACKAGES"
 done
 if [ -s "$W/overlay.sha256" ]; then
     check "overlay files in the root as built ($(wc -l <"$W/overlay.sha256") files)" "$TOP/fedora/run-build-ns.sh" user bash -c "cd '$(realpath "$ROOT")' && sha256sum --quiet -c '$(realpath "$W/overlay.sha256")'"
@@ -257,8 +294,8 @@ check "/dev has no regular files" bash -c "! find '$ROOT/dev' -type f 2>/dev/nul
 # Rootless builds see file capabilities as v3 xattrs with the build user's
 # rootid outside the namespace; inside it (where mkfs.ext4 -d runs) the kernel
 # hands out the v2 form, which the board applies for root. Lock that in.
-check "file capabilities in ext4 are version 2 (no namespace rootid)" bash -c "debugfs -R 'ea_get -x usr/sbin/arping security.capability' '$W/root.img' 2>/dev/null | grep -q 'security.capability (20) = 00 00 00 02'"
-check "SELinux labels in ext4 match target policy" "$TOP/fedora/run-build-ns.sh" user python3 -I "$TOP/fedora/selinux-label.py" --verify "$ROOT" "$W/root.img" "$W/selinux-verify"
+check "file capabilities in ext4 are version 2 (no namespace rootid)" bash -c "debugfs -R 'ea_get -x usr/sbin/arping security.capability' '$ROOT_IMG' 2>/dev/null | grep -q 'security.capability (20) = 00 00 00 02'"
+check "SELinux labels in ext4 match target policy" "$TOP/fedora/run-build-ns.sh" user python3 -I "$TOP/fedora/selinux-label.py" --verify "$ROOT" "$ROOT_IMG" "$W/selinux-verify"
 check "no first-boot relabel required (all image labels verified)" test ! -e "$ROOT/.autorelabel"
 check "machine-id empty (first boot)" test ! -s "$ROOT/etc/machine-id"
 # systemd-repart discards the unpartitioned gap in front of the first
@@ -298,14 +335,24 @@ else
     echo "== root growth: never (GROW_ROOT=no)"
     check "no repart.d config (etc, usr/lib, usr/local/lib)" bash -c "! find '$ROOT/etc/repart.d' '$ROOT/usr/lib/repart.d' '$ROOT/usr/local/lib/repart.d' -name '*.conf' 2>/dev/null | grep -q ."
     check "fstab: no x-systemd.growfs (and no x-systemd.makefs)" bash -c "! grep -qE 'x-systemd\.(growfs|makefs)' '$ROOT/etc/fstab'"
-    check "initramfs does not run systemd-repart" bash -c "! grep -q 'systemd-repart' '$W'/initramfs-*.txt"
+    repart_initramfs_absent() {
+        local img found=0
+        for img in "$ROOT"/boot/initramfs-*.img; do
+            [ -f "$img" ] || continue
+            found=1
+            python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs \
+                --run-build-ns "$TOP/fedora/run-build-ns.sh" --forbid-repart "$img" >/dev/null || return 1
+        done
+        [ "$found" = 1 ]
+    }
+    check "initramfs does not run systemd-repart (post-overlay image)" repart_initramfs_absent
     for u in systemd-repart.service systemd-growfs-root.service; do
-        lbl=$(debugfs -R "ea_get -V etc/systemd/system/$u security.selinux" "$W/root.img" 2>/dev/null | tr -d '\0\n')
+        lbl=$(debugfs -R "ea_get -V etc/systemd/system/$u security.selinux" "$ROOT_IMG" 2>/dev/null | tr -d '\0\n')
         check "$u masked in /etc/systemd/system (-> /dev/null)" bash -c "[ \"\$(readlink '$ROOT/etc/systemd/system/$u')\" = /dev/null ]"
         check "$u mask labelled in the image ($lbl)" bash -c "[[ '$lbl' == system_u:object_r:*_t:s0 ]]"
     done
 fi
-echo "  info  root filesystem: $(python3 -I "$TOP/fedora/devcard-policy.py" dumpe2fs "$W/root.img"); image $(stat -c %s "$IMG") bytes"
+echo "  info  root filesystem: $(python3 -I "$TOP/fedora/devcard-policy.py" dumpe2fs "$ROOT_IMG"); image $(stat -c %s "$IMG") bytes"
 
 if [ "$BOOT_MODES" = protective ]; then
     echo "== boot modes (protective default, maintenance, full)"
@@ -316,7 +363,7 @@ if [ "$BOOT_MODES" = protective ]; then
     sshpath=$(strings "$ROOT/usr/libexec/openssh/sshd-session" "$ROOT/usr/bin/sshd" 2>/dev/null | grep -m1 -E '^/usr/local/bin:/' || :)
     echo "  info  sshd PATH for commands: ${sshpath:-not found}"
     check "cubie-a7a-bootmode found by name on that PATH (ssh root@board cubie-a7a-bootmode ...)" bash -c "[ -n '$sshpath' ] && IFS=: && for d in \$(echo '$sshpath'); do [ -x '$ROOT'\$d/cubie-a7a-bootmode ] && exit 0; done; exit 1"
-    check "cubie-a7a-bootmode labelled bin_t in the image" bash -c "debugfs -R 'ea_get usr/local/bin/cubie-a7a-bootmode security.selinux' '$W/root.img' 2>/dev/null | grep -q ':object_r:bin_t:s0'"
+    check "cubie-a7a-bootmode labelled bin_t in the image" bash -c "debugfs -R 'ea_get usr/local/bin/cubie-a7a-bootmode security.selinux' '$ROOT_IMG' 2>/dev/null | grep -q ':object_r:bin_t:s0'"
     check "kernel-install plugin 96-cubie-a7a-bootmodes installed" test -x "$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
     check "the plugin and cubie-a7a-bootmode-ro.service call the installed helper" bash -c "for f in '$ROOT/etc/kernel/install.d/96-cubie-a7a-bootmodes.install' '$ROOT/etc/systemd/system/cubie-a7a-bootmode-ro.service'; do for h in \$(grep -o '/usr/[a-z/]*/cubie-a7a-bootmode\\b' \"\$f\" | sort -u); do [ -x '$ROOT'\$h ] || exit 1; done; grep -q '/usr/local/bin/cubie-a7a-bootmode' \"\$f\" || exit 1; done"
     check "cubie-a7a-bootmode-ro.service enabled" bash -c "ls '$ROOT'/etc/systemd/system/sysinit.target.wants/cubie-a7a-bootmode-ro.service >/dev/null 2>&1"
@@ -374,7 +421,7 @@ if [ "$BOOT_MODES" = protective ]; then
     else
         check "grubenv has no next_entry (the first boot is the default entry)" bash -c "! grep -q '^next_entry=' <<<'$genv'"
     fi
-    check "grubenv is one 1024-byte block (cubie-a7a-bootmode rewrites it in place on the ro boot)" bash -c "[ \"\$(stat -c %s '$ROOT/boot/grub2/grubenv')\" = 1024 ] && debugfs -R 'blocks /boot/grub2/grubenv' '$W/root.img' 2>/dev/null | grep -qE '^[0-9]+ *\$'"
+    check "grubenv is one 1024-byte block (cubie-a7a-bootmode rewrites it in place on the ro boot)" bash -c "[ \"\$(stat -c %s '$ROOT/boot/grub2/grubenv')\" = 1024 ] && debugfs -R 'blocks /boot/grub2/grubenv' '$ROOT_IMG' 2>/dev/null | grep -qE '^[0-9]+ *\$'"
     check "without saved_entry, the newest default entry still sorts first (rpm/sort -V order)" bash -c "ls '$ROOT/boot/loader/entries' | sed 's/\.conf\$//' | sort -rV | head -1 | grep -qv '~'"
     check "grub.cfg: next_entry honoured, and its only save_env clears it (GRUB writes nothing on a default boot)" bash -c "c=\$('$TOP/fedora/run-build-ns.sh' user cat '$ROOT/boot/grub2/grub.cfg'); grep -q 'set default=\"\\\${next_entry}\"' <<<\"\$c\" && [ \"\$(grep -c save_env <<<\"\$c\")\" = 1 ] && grep -q '^ *save_env next_entry\$' <<<\"\$c\""
     for e in "$ROOT"/boot/loader/entries/*.conf; do
@@ -383,9 +430,9 @@ if [ "$BOOT_MODES" = protective ]; then
         check "$(basename "$e" .conf): initramfs has systemd-volatile-root and overlay.ko" bash -c "l=\$('$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null); grep -q 'systemd/systemd-volatile-root\$' <<<\"\$l\" && grep -q 'systemd-volatile-root.service\$' <<<\"\$l\" && grep -q '/overlay.ko' <<<\"\$l\""
     done
 fi
-unsigned=$(grep -v -E '^gpg-pubkey' "$W/packages.txt" | grep '(none)' | cut -d' ' -f1 | tr '\n' ' ')
+unsigned=$(grep -v -E '^gpg-pubkey' "$PACKAGES" | grep '(none)' | cut -d' ' -f1 | tr '\n' ' ')
 echo "  info  unsigned packages: ${unsigned:-none}"
-check "unsigned packages limited to the cubie-a7a board packages" bash -c "! grep -v -E '^(gpg-pubkey|cubie-a7a-)' '$W/packages.txt' | grep -q '(none)'"
+check "unsigned packages limited to the cubie-a7a board packages" bash -c "! grep -v -E '^(gpg-pubkey|cubie-a7a-)' '$PACKAGES' | grep -q '(none)'"
 
 if [ $fail = 0 ]; then
     echo "all checks passed"
