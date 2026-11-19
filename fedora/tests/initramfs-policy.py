@@ -167,6 +167,18 @@ def cases(work, base):
     bad = extra / "pinctrl-sun60i-a733.ko"
     bad.write_text("overlay replacement fixture")
     check(args, 1, "forbidden module")
+    check(
+        [
+            *SCRIPT,
+            "root-modules",
+            str(extracted),
+            "fixture",
+            "--board",
+            "sun60i-a733-ccu",
+        ],
+        1,
+        "forbidden module",
+    )
     bad.unlink()
     forced.write_text("rd.driver.pre=pinctrl\n")
     check(args, 1, "wrong forced A733 drivers")

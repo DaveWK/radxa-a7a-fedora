@@ -180,10 +180,21 @@ def overlay(path):
         raise PolicyError(f"overlay writes an initramfs entry: {entry}")
 
 
+def forbidden_modules(base, board):
+    forbidden = {"aic_btusb"}
+    if "pinctrl-sun60i-a733" not in board:
+        forbidden.add("pinctrl_sun60i_a733")
+    for path in walk(base):
+        match = MODULE.fullmatch(path.name)
+        if match and match[1].replace("-", "_") in forbidden:
+            raise PolicyError(f"forbidden module: {path}")
+
+
 def modules(root, kernel, board, stock, protective):
     base = root / "usr/lib/modules" / kernel
     if base.is_symlink() or not base.is_dir():
         raise PolicyError(f"{base}: missing unpacked kernel module directory")
+    forbidden_modules(base, board)
     found = {}
     for path in walk(base):
         matches = MODULE.fullmatch(path.name)
@@ -200,11 +211,6 @@ def modules(root, kernel, board, stock, protective):
         if not found.get(name.replace("-", "_")):
             raise PolicyError(f"{base}: missing required {name}.ko")
     pin_builtin = "pinctrl-sun60i-a733" not in board
-    forbidden = {"aic_btusb"}
-    if pin_builtin:
-        forbidden.add("pinctrl_sun60i_a733")
-    for name in sorted(forbidden & found.keys()):
-        raise PolicyError(f"{base}: forbidden module {found[name][0]}")
     force = root / "etc/cmdline.d/20-force_drivers.conf"
     if not force.is_file() or force.is_symlink():
         raise PolicyError(f"{force}: expected the dracut force-driver configuration")
@@ -259,6 +265,10 @@ def main():
     p.add_argument("--board", required=True)
     p.add_argument("--stock", required=True)
     p.add_argument("--protective", action="store_true")
+    p = sub.add_parser("root-modules")
+    p.add_argument("root", type=Path)
+    p.add_argument("kernel")
+    p.add_argument("--board", required=True)
     args = parser.parse_args()
     try:
         if args.command == "unpack":
@@ -267,6 +277,9 @@ def main():
             overlay(args.directory)
         elif args.command == "set":
             final_set(args.root, args.kernels)
+        elif args.command == "root-modules":
+            extra = resolve(args.root, f"usr/lib/modules/{args.kernel}/extra")
+            forbidden_modules(extra, args.board.split())
         else:
             modules(
                 args.root,

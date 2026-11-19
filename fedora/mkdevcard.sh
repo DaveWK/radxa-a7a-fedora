@@ -603,6 +603,8 @@ while IFS= read -r k; do
     unpack="$W/initramfs-$k-unpacked"
     python3 -I "$TOP/fedora/initramfs-policy.py" unpack "$img" "$unpack"
     boot=$(cubie_boot_kmods "$k")
+    python3 -I "$TOP/fedora/initramfs-policy.py" root-modules "$ROOT" "$k" \
+        --board "${boot%% -- *}"
     module_args=(--board "${boot%% -- *}" --stock "${boot##* -- }")
     [ "$BOOT_MODES" != protective ] || module_args+=(--protective)
     python3 -I "$TOP/fedora/initramfs-policy.py" modules "$unpack" "$k" "${module_args[@]}"
