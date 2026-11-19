@@ -794,6 +794,43 @@ def test_verifier_rejects_damaged_inode():
         ), result.stderr
 
 
+def test_image_firmware_no_pycache_beside_source():
+    """Should-fix 4d: image-firmware dynamic import leaves no __pycache__ beside source."""
+    with tempfile.TemporaryDirectory(prefix="a7a-fw-pyc-") as td:
+        work = Path(td)
+        src_copy = work / "src"
+        src_copy.mkdir()
+        shutil.copy2(here.parent / "image-firmware.py", src_copy / "image-firmware.py")
+        shutil.copy2(here.parent / "devcard-policy.py", src_copy / "devcard-policy.py")
+        rd_root = work / "root"
+        (rd_root / "boot").mkdir(parents=True)
+        rd_tree = work / "rd-tree"
+        (rd_tree / "usr/lib/firmware/open").mkdir(parents=True)
+        (rd_tree / "usr/lib/firmware/open/a.fw").write_text("ok\n")
+        _cpio(rd_tree, rd_root / "boot/initramfs-7.4.0.img")
+        allow = work / "allow"
+        allow.write_text("open/*\n")
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(src_copy / "image-firmware.py"),
+                "check",
+                "--root",
+                str(rd_root),
+                "--initramfs",
+                "--allow",
+                str(allow),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        assert not (
+            src_copy / "__pycache__"
+        ).exists(), f"__pycache__ written beside source: {list(src_copy.iterdir())}"
+
+
 def main():
     case(
         "extract-root: reject a silent short extraction (B3)",
@@ -834,6 +871,10 @@ def main():
     case(
         "GROW_ROOT=no: catches post-overlay initramfs from IMG",
         test_grow_root_no_catches_post_overlay_initramfs_from_img,
+    )
+    case(
+        "image-firmware: dynamic import writes no __pycache__ beside source (Should-fix 4d)",
+        test_image_firmware_no_pycache_beside_source,
     )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")

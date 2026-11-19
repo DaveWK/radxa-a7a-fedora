@@ -180,10 +180,15 @@ def _load_policy():
     )
     if not os.path.isfile(policy_path):
         raise InputError(f"cannot locate {policy_path} for initramfs verification")
-    spec = importlib.util.spec_from_file_location("devcard_policy_fw", policy_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    prev = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location("devcard_policy_fw", policy_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        sys.dont_write_bytecode = prev
 
 
 def list_initramfs(path):
