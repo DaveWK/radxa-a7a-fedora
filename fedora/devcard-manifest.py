@@ -52,7 +52,7 @@ FIRMWARE_GAP_LBA = 256
 ESP_DTB = "dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
 FW_DTB_STAMP = "var/lib/cubie-a7a/firmware-dtb-version"
 PKG_DTB_VERSION = "usr/lib/cubie-a7a/dtb/VERSION"
-PINNED_UNITS = ("systemd-repart.service", "systemd-repart@.service")
+PINNED_UNIT_MODES = ("yes", "no", "initramfs")
 
 
 class ManifestError(RuntimeError):
@@ -232,13 +232,13 @@ def _initramfs_model(root):
 def _pinned_units_model(fixtures_dir):
     base = Path(fixtures_dir)
     units = {}
-    for unit in PINNED_UNITS:
-        root_fixture = base / f"root-{unit}.cat-config"
-        initramfs_fixture = base / f"initramfs-{unit}.cat-config"
-        for tag, path in (("root", root_fixture), ("initramfs", initramfs_fixture)):
+    for mode in PINNED_UNIT_MODES:
+        for suffix in ("unit.txt", "inventory.json"):
+            name = f"repart-{mode}.{suffix}"
+            path = base / name
             if not path.is_file():
                 raise ManifestError(f"missing pinned-unit fixture {path}")
-            units[f"{tag}-{unit}"] = _sha256_path(path)
+            units[name] = _sha256_path(path)
     return units
 
 

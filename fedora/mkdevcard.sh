@@ -110,7 +110,7 @@ die() {
     exit 1
 }
 for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3 \
-    systemctl lsinitrd rpm; do
+    systemctl zstd cpio rpm; do
     command -v $t >/dev/null || die "$t not found"
 done
 [ -x /usr/lib/systemd/systemd ] || die "systemd manager for staged loader not found"
@@ -344,39 +344,12 @@ if [ "$BOOT_MODES" = protective ]; then
     chroot "$ROOT" /usr/local/bin/cubie-a7a-bootmode sync
 fi
 
-# --- board modules, initramfs and BLS checks -----------------------------
-# Every kernel needs the A733 kmods (DKMS) in extra/ and the boot-critical
-# ones in its initramfs; the BLS entries must carry the interim arguments and
-# no devicetree line (the DTB comes from the firmware's EFI table).
+# Record the kernel set before overlays. Admit only the final staged trees.
 kernels=$(ls "$ROOT/usr/lib/modules")
 [ "$(wc -w <<<"$kernels")" = 1 ] || { echo "mkdevcard: expected one kernel, got: $kernels" >&2; exit 1; }
 [ -z "$KERNEL_VERSION" ] || [ "$kernels" = "$KERNEL_VERSION.aarch64" ] ||
     { echo "mkdevcard: kernel $kernels installed, KERNEL_VERSION asked for $KERNEL_VERSION" >&2; exit 1; }
-# shellcheck source=release.sh
-. "$TOP/fedora/release.sh"
-for k in $kernels; do
-    # The board package's own guard: every boot kmod built (and selected
-    # by depmod) for this kernel and present in its initramfs.
-    chroot "$ROOT" /usr/libexec/cubie-a7a/kernel check "$k" ||
-        { echo "mkdevcard: board kmods incomplete for $k" >&2; exit 1; }
-    for m in sun60i-a733-serdes sun60i-a733-pcie sun55i-pck600; do
-        ls "$ROOT/usr/lib/modules/$k/extra/$m.ko"* >/dev/null 2>&1 ||
-            { echo "mkdevcard: staged module $m.ko missing for $k" >&2; exit 1; }
-    done
-    chroot "$ROOT" lsinitrd "/boot/initramfs-$k.img" >"$W/initramfs-$k.txt"
-    # The root-on-SD path, whichever of it this kernel series takes from
-    # the board kmods (extra/) and from the stock kernel (release.sh).
-    boot=$(cubie_boot_kmods "$k")
-    for m in ${boot%% -- *}; do
-        grep -q "/extra/$m\.ko" "$W/initramfs-$k.txt" ||
-            { echo "mkdevcard: board kmod $m not in initramfs-$k.img" >&2; exit 1; }
-    done
-    for m in ${boot##* -- }; do
-        grep -q "/$m\.ko" "$W/initramfs-$k.txt" ||
-            { echo "mkdevcard: $m not in initramfs-$k.img" >&2; exit 1; }
-    done
-    echo "$k" >"$W/kernel.txt"
-done
+printf '%s\n' "$kernels" >"$W/kernel.txt"
 for e in "$ROOT"/boot/loader/entries/*.conf; do
     grep -q '^devicetree' "$e" && { echo "mkdevcard: $e sets devicetree" >&2; exit 1; }
     grep -q '^options .*clk_ignore_unused pd_ignore_unused' "$e" ||
@@ -559,6 +532,7 @@ if [ -n "$OVERLAY" ]; then
         { echo "mkdevcard: cannot inspect OVERLAY's ESP entries" >&2; exit 1; }
     [ -z "$esp_overlay_hits" ] ||
         { echo "mkdevcard: OVERLAY writes the ESP (boot/efi): $esp_overlay_hits" >&2; exit 1; }
+    python3 -I "$TOP/fedora/initramfs-policy.py" overlay "$OVERLAY"
     cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/
     for u in "$OVERLAY"/usr/lib/systemd/system/*.service; do
         [ -e "$u" ] || continue
@@ -580,19 +554,15 @@ python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
     --report "$W/aic-provenance.tsv" >/dev/null ||
     { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
 
-# The ESP, the no-discard drop-ins and the initramfs are all checked from the
-# parent shell after STAGE1 (the staged root is final once the overlay is in).
-
-# Firmware audit, a report only (never fails the build, removes nothing):
-# which firmware files in the root and initramfs are closed blobs, Realtek's
-# named separately; fedora/image-firmware.allow lists the reviewed open
-# ones. Open replacements take a blob's place once they reach parity.
-audit_lists=()
-while read -r k; do audit_lists+=(--list "$W/initramfs-$k.txt"); done <"$W/kernel.txt"
-python3 -I "$TOP/fedora/image-firmware.py" audit --root "$ROOT" --quiet \
-    "${audit_lists[@]}" \
-    --allow "$TOP/fedora/image-firmware.allow" --json "$W/firmware-audit.json" \
-    >"$W/firmware-audit.txt" 2>&1 || echo "mkdevcard: firmware audit did not run (report only)" >&2
+while IFS= read -r k; do
+    # Recheck root module ownership/depmod selection after overlays.
+    chroot "$ROOT" /usr/libexec/cubie-a7a/kernel check "$k" ||
+        { echo "mkdevcard: board kmods incomplete for $k" >&2; exit 1; }
+    for m in sun60i-a733-serdes sun60i-a733-pcie sun55i-pck600; do
+        ls "$ROOT/usr/lib/modules/$k/extra/$m.ko"* >/dev/null 2>&1 ||
+            { echo "mkdevcard: staged module $m.ko missing for $k" >&2; exit 1; }
+    done
+done <"$W/kernel.txt"
 
 chroot "$ROOT" rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}\n' \
     | sort >"$W/packages.txt"
@@ -614,42 +584,26 @@ UNITS_FIXTURES=$TOP/fedora/fixtures/units
 python3 -I "$TOP/fedora/staged-systemd.py" check "$ROOT" "$UNITS_FIXTURES" "$GROW_ROOT" \
     --root-uuid "$ROOT_UUID" --esp-uuid "$ESP_UUID"
 
-# The initramfs set must equal the kernels in kernel.txt, and each initramfs
-# (unpacked with dracut's own lsinitrd) must carry no systemd-repart unit.
-python3 -I - "$ROOT/boot" "$W/kernel.txt" <<'PY' || exit 1
-import sys
-from pathlib import Path
-
-boot = Path(sys.argv[1])
-kernels = Path(sys.argv[2]).read_text().split()
-have = sorted(p.name for p in boot.glob("initramfs-*.img"))
-want = sorted(f"initramfs-{k}.img" for k in kernels)
-if have != want:
-    sys.stderr.write(f"mkdevcard: initramfs set {have} != kernels {want}\n")
-    sys.exit(1)
-PY
-while read -r k; do
+# Validate exactly the build's final images and audit those same native trees.
+python3 -I "$TOP/fedora/initramfs-policy.py" set "$ROOT" "$W/kernel.txt"
+audit_roots=(--root "$ROOT")
+unpacked=()
+while IFS= read -r k; do
     img="$ROOT/boot/initramfs-$k.img"
     unpack="$W/initramfs-$k-unpacked"
-    python3 -I "$TOP/fedora/devcard-policy.py" initramfs-unpack "$img" "$unpack" ||
-        {
-            echo "mkdevcard: cannot unpack $img (dracut)" >&2
-            exit 1
-        }
-    python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$unpack" systemd-repart.service \
-        --fixture "$UNITS_FIXTURES/initramfs-systemd-repart.service.cat-config" ||
-        {
-            echo "mkdevcard: initramfs-$k.img carries systemd-repart.service" >&2
-            exit 1
-        }
-    python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$unpack" systemd-repart@.service \
-        --fixture "$UNITS_FIXTURES/initramfs-systemd-repart@.service.cat-config" ||
-        {
-            echo "mkdevcard: initramfs-$k.img carries systemd-repart@.service" >&2
-            exit 1
-        }
-    rm -rf "$unpack"
+    python3 -I "$TOP/fedora/initramfs-policy.py" unpack "$img" "$unpack"
+    boot=$(cubie_boot_kmods "$k")
+    module_args=(--board "${boot%% -- *}" --stock "${boot##* -- }")
+    [ "$BOOT_MODES" != protective ] || module_args+=(--protective)
+    python3 -I "$TOP/fedora/initramfs-policy.py" modules "$unpack" "$k" "${module_args[@]}"
+    python3 -I "$TOP/fedora/staged-systemd.py" check "$unpack" "$UNITS_FIXTURES" initramfs
+    audit_roots+=(--root "$unpack")
+    unpacked+=("$unpack")
 done <"$W/kernel.txt"
+python3 -I "$TOP/fedora/image-firmware.py" audit "${audit_roots[@]}" --quiet \
+    --allow "$TOP/fedora/image-firmware.allow" --json "$W/firmware-audit.json" \
+    >"$W/firmware-audit.txt" 2>&1 || echo "mkdevcard: firmware audit did not run (report only)" >&2
+rm -rf -- "${unpacked[@]}"
 
 # The ESP, on the staged tree before mtools, bound to the built cubie-a7a-dtb
 # RPM's own file list (stamps first; DTB, VERSION and esp-override from rpm -qp
