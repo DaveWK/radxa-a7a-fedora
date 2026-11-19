@@ -20,6 +20,8 @@ LZMA_GUID = bytes.fromhex(
 def lzma_sections(blob):
     for m in re.finditer(re.escape(LZMA_GUID), blob):
         start = m.start() - 4  # EFI_GUID_DEFINED_SECTION
+        if start < 0 or m.start() + 18 > len(blob):
+            continue
         size = int.from_bytes(blob[start : start + 3], "little")
         if blob[start + 3] != 0x02 or size < 24:
             continue
@@ -33,7 +35,7 @@ def lzma_sections(blob):
 
 
 def main_fwlog(blob):
-    if b"A7AFWLOG" not in blob:
+    if len(blob) % 4 or b"A7AFWLOG" not in blob:
         return False
     words = struct.unpack_from("<%dI" % (len(blob) // 4), blob)
     for i, w in enumerate(words):
@@ -49,12 +51,16 @@ def main_fwlog(blob):
     return False
 
 
-cmd = sys.argv[1]
-if cmd == "fd-has":
-    needle = sys.argv[2].encode()
-    blob = open(sys.argv[3], "rb").read()
-    found = any(needle in fv for fv in lzma_sections(blob)) or needle in blob
-    sys.exit(0 if found else 1)
-elif cmd == "main-fwlog":
-    sys.exit(0 if main_fwlog(open(sys.argv[2], "rb").read()) else 1)
-sys.exit(2)
+def fd_has(blob, needle):
+    return needle in blob or any(needle in fv for fv in lzma_sections(blob))
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1]
+    if cmd == "fd-has":
+        with open(sys.argv[3], "rb") as stream:
+            sys.exit(0 if fd_has(stream.read(), sys.argv[2].encode()) else 1)
+    if cmd == "main-fwlog":
+        with open(sys.argv[2], "rb") as stream:
+            sys.exit(0 if main_fwlog(stream.read()) else 1)
+    sys.exit(2)

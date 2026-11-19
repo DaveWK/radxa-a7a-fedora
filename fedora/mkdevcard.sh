@@ -68,6 +68,7 @@
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
+BUILD_STARTED=$(date -u +%FT%TZ)
 FIRMWARE=${1:?firmware.bin}
 RPM_RUN=$(realpath -e "${2:?sealed run directory printed by build-rpms.sh}")
 # shellcheck source=release.sh
@@ -109,8 +110,8 @@ die() {
     echo "mkdevcard: $*" >&2
     exit 1
 }
-for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3 \
-    systemctl zstd rpm ssh-keygen; do
+for t in unshare dnf5 mkfs.ext4 mkfs.fat fsck.fat mcopy sfdisk openssl xz debugfs python3 \
+    systemctl zstd rpm ssh-keygen git sha256sum; do
     command -v $t >/dev/null || die "$t not found"
 done
 python3 -I -c 'import selinux' 2>/dev/null || die "python3-libselinux not found"
@@ -121,24 +122,51 @@ if [ "$(uname -m)" != aarch64 ]; then
     [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || die "no qemu-aarch64 binfmt handler registered"
     grep -q '^flags: .*F' /proc/sys/fs/binfmt_misc/qemu-aarch64 || die "qemu-aarch64 binfmt needs the F (fix-binary) flag"
 fi
+build_source() {
+    local source untracked
+    source=$(git --no-optional-locks -C "$TOP" rev-parse --verify 'HEAD^{commit}') || return 1
+    git --no-optional-locks -C "$TOP" diff --quiet "$source" -- fedora/ || return 1
+    untracked=$(git --no-optional-locks -C "$TOP" ls-files --others --exclude-standard -- fedora/) || return 1
+    [ -z "$untracked" ] || return 1
+    printf '%s\n' "$source"
+}
+BUILD_SOURCE=$(build_source) || die "build requires an identifiable clean Fedora source checkout"
+DRAM_FIRMWARE_IDENTITY=${DRAM_FIRMWARE_IDENTITY:-}
+firmware_args=()
 if [ "$FIRMWARE" = none ]; then
     FIRMWARE=
+    [ -z "$DRAM_FIRMWARE_IDENTITY" ] || die "DRAM_FIRMWARE_IDENTITY requires firmware"
 else
-    [ -f "$FIRMWARE" ] || die "missing $FIRMWARE"
-    SEEK=$(cat "${FIRMWARE%.bin}.seek" 2>/dev/null || echo 256)
-    FW_END=$((SEEK * 512 + $(stat -c %s "$FIRMWARE")))
+    [ -f "$FIRMWARE" ] && [ -s "$FIRMWARE" ] || die "empty or missing firmware: $FIRMWARE"
+    [[ $DRAM_FIRMWARE_IDENTITY =~ ^[A-Za-z0-9][A-Za-z0-9_.:+/-]{0,127}$ ]] ||
+        die "set DRAM_FIRMWARE_IDENTITY to the packaged firmware's build profile"
+    SEEK=256
+    if [ -e "${FIRMWARE%.bin}.seek" ] || [ -L "${FIRMWARE%.bin}.seek" ]; then
+        [ -f "${FIRMWARE%.bin}.seek" ] || die "invalid firmware seek file"
+        SEEK=$(<"${FIRMWARE%.bin}.seek")
+    fi
+    if ! [[ $SEEK =~ ^[1-9][0-9]{0,4}$ ]] || ((SEEK < 256 || SEEK >= 32768)); then
+        die "firmware seek must be in the reserved LBA gap"
+    fi
+    FW_SIZE=$(stat -Lc %s -- "$FIRMWARE")
+    FW_END=$((SEEK * 512 + FW_SIZE))
     ((FW_END <= 16 * 1024 * 1024)) || die "firmware ends at $FW_END, inside the first partition"
+    FW_SHA=$(sha256sum <"$FIRMWARE")
+    firmware_args=(--firmware-sha256 "${FW_SHA%% *}" --firmware-seek "$SEEK" --firmware-size "$FW_SIZE")
 fi
 # Read the run's snapshot once and retain the records through image sealing.
 # DNF and the DTB admission use the exact checked copies in this run's repo.
 # Its firmware comes from Fedora's linux-firmware (aic/aic8800d80;
 # fedora/WIFI-FIRMWARE.md), which the image installs and requires by the
-# driver package; verify-devcard.sh rejects only unowned, modified or
+# driver package; the staged provenance checks reject unowned, modified or
 # non-Fedora AIC firmware, never the standard linux-firmware files.
 BOARD_RPMS=()
 BOARD_UNITS=(cubie-a7a-dtb.service)
 DTB_RPM=
 DTB_RPM_SHA=
+RPM_SNAPSHOT="$RPM_RUN/rpm-snapshot.json"
+SNAPSHOT_SHA=$(sha256sum <"$RPM_SNAPSHOT") || die "cannot hash the RPM snapshot"
+SNAPSHOT_SHA=${SNAPSHOT_SHA%% *}
 rpm_inputs=$(python3 -I "$TOP/fedora/devcard-policy.py" load-rpm-run "$RPM_RUN") ||
     die "cannot select checked board RPMs from $RPM_RUN"
 RPM_RECORDS=${rpm_inputs%%$'\n'*}
@@ -666,6 +694,8 @@ mkfs.fat -F 32 -n EFI -i "$ESP_ID" -C "$esp" $((ESP_MIB * 1024)) >/dev/null
 # FAT keeps no owners or modes; copy the tree, then leave /boot/efi empty
 # as the mount point.
 mcopy -s -p -m -i "$esp" "$ROOT"/boot/efi/* ::
+# Packed FAT structure only, not file provenance or EFI execution.
+python3 -I "$TOP/fedora/devcard-manifest.py" check-fat "$esp"
 # Record the staged ESP (file names, types, sha256) for the build manifest
 # before boot/efi is emptied as the mount point; verify re-reads it with mtools.
 python3 -I "$TOP/fedora/devcard-manifest.py" esp-model "$ROOT/boot/efi" "$W/esp-model.json" || {
@@ -702,7 +732,7 @@ dd if="$W/esp.img" of="$OUT" bs=1M seek=16 conv=notrunc,sparse status=none
 dd if="$W/root.img" of="$OUT" bs=512 seek=$ROOT_START conv=notrunc,sparse status=none
 if [ -n "$FIRMWARE" ]; then
     dd if="$FIRMWARE" of="$OUT" bs=512 seek="$SEEK" conv=notrunc status=none
-    cmp -n "$(stat -c %s "$FIRMWARE")" -i 0:$((SEEK * 512)) "$FIRMWARE" "$OUT" || die "firmware readback"
+    cmp -n "$FW_SIZE" -i 0:$((SEEK * 512)) "$FIRMWARE" "$OUT" || die "firmware readback"
 else
     # The firmware gap (LBA 256-32767) must be zero.
     cmp -n $((ESP_START * 512 - 256 * 512)) -i $((256 * 512)):0 "$OUT" /dev/zero || die "firmware gap not zero"
@@ -715,9 +745,6 @@ sfdisk --verify "$OUT" >/dev/null || die "GPT verify"
 
 if [ "$XZ" = yes ]; then
     xz -T"${XZ_THREADS:-2}" -6 -k "$OUT"
-    (cd "$(dirname "$OUT")" && sha256sum "$(basename "$OUT")" "$(basename "$OUT").xz") >"$OUT.sha256"
-else
-    (cd "$(dirname "$OUT")" && sha256sum "$(basename "$OUT")") >"$OUT.sha256"
 fi
 cat >"$W/manifest.txt" <<EOF
 image        $OUT
@@ -725,7 +752,7 @@ release      Fedora $RELEASEVER (packages .fc$RELEASE_NUM; repositories ${RELEAS
 root UUID    $ROOT_UUID
 ESP UUID     $ESP_UUID
 DTB          stamp $DTB_VERSION; firmware stamp $FIRMWARE_DTB_VERSION ($(if [ "$FIRMWARE_DTB_VERSION" -lt "$DTB_VERSION" ]; then echo "ESP copy in use"; else echo "firmware DTB in use"; fi))
-firmware     $(if [ -n "$FIRMWARE" ]; then echo "$FIRMWARE sha256 $(sha256sum <"$FIRMWARE" | cut -d' ' -f1) at sector $SEEK"; else echo "none (LBA 256-32767 zero, for firmware.bin at LBA 256)"; fi)
+ firmware     $(if [ -n "$FIRMWARE" ]; then echo "$FIRMWARE sha256 ${FW_SHA%% *} at sector $SEEK"; else echo "none (LBA 256-32767 zero, for firmware.bin at LBA 256)"; fi)
 cubie-a7a    $(for r in "${BOARD_RPMS[@]}"; do basename "$r"; done | tr '\n' ' ')
 packages     $W/packages.txt ($(wc -l <"$W/packages.txt") RPMs)
 kernel       $(grep -o '^kernel-core-[^ ]*' "$W/packages.txt" | tr '\n' ' ')$([ -n "$KERNEL_VERSION" ] && echo "(pinned: KERNEL_VERSION=$KERNEL_VERSION)" || echo "(newest in the repositories at build time)")
@@ -741,15 +768,28 @@ EOF
 # initramfs files, the DTB stamps and the RPM
 # set (from the records retained at RPM selection).
 MANIFEST_PATH="$OUT.devcard-manifest.json"
+profile_args=(--boot-modes "$BOOT_MODES" --grow-root "$GROW_ROOT" --first-boot "$FIRST_BOOT")
 manifest_sha=$(python3 -I "$TOP/fedora/devcard-manifest.py" write "$OUT" "$ROOT" \
-    "$RPM_RECORDS" "$MANIFEST_PATH" \
-    --esp-model "$W/esp-model.json" --boot-modes "$BOOT_MODES" \
-    --grow-root "$GROW_ROOT" --first-boot "$FIRST_BOOT") ||
+    "$RPM_RECORDS" "$MANIFEST_PATH" --esp-model "$W/esp-model.json" \
+    "${profile_args[@]}" "${firmware_args[@]}") ||
     die "cannot write the build manifest"
 cat >>"$W/manifest.txt" <<EOF
 manifest    $MANIFEST_PATH sha256 $manifest_sha
 EOF
-cat >>"$OUT.sha256" <<EOF
-manifest sha256 $manifest_sha ($MANIFEST_PATH)
-EOF
+[ "$(build_source)" = "$BUILD_SOURCE" ] || die "Fedora source changed during the build"
+RECEIPT_PATH="$OUT.build-receipt.json"
+# Seal build inputs and output digests; the CI-retained receipt, not this directory, anchors verification.
+python3 -I "$TOP/fedora/devcard-manifest.py" seal "$OUT" "$MANIFEST_PATH" "$RECEIPT_PATH" \
+    "$RPM_SNAPSHOT" "$W/initramfs-digests.json" "${profile_args[@]}" \
+    --dram-identity "$DRAM_FIRMWARE_IDENTITY" --source-commit "$BUILD_SOURCE" \
+    --run-id "${RPM_RUN##*/}" --started-utc "$BUILD_STARTED" --finished-utc "$(date -u +%FT%TZ)" \
+    --expect-manifest-sha256 "$manifest_sha" --expect-snapshot-sha256 "$SNAPSHOT_SHA" ||
+    die "cannot seal the build receipt"
+(
+    cd "$(dirname "$OUT")"
+    image=$(basename "$OUT")
+    sums=("$image" "$image.devcard-manifest.json" "$image.build-receipt.json")
+    if [ "$XZ" = yes ]; then sums+=("$image.xz"); fi
+    sha256sum -- "${sums[@]}"
+) >"$OUT.sha256"
 cat "$OUT.sha256" "$W/manifest.txt"

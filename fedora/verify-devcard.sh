@@ -1,61 +1,35 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-#
-# Prove a dev card image is exactly what a checked fedora/mkdevcard.sh build
-# produced: the manifest it wrote, recomputed byte for byte. Reads only; not a
-# board test.
-#
-# Usage: fedora/verify-devcard.sh IMAGE MANIFEST [FIRMWARE]
-#   IMAGE      the raw disk image (mkdevcard.sh's OUT)
-#   MANIFEST   the build manifest (OUT.devcard-manifest.json, next to the image)
-#   FIRMWARE   optional firmware.bin embedded at LBA 256; when given, its
-#              read-back, eGON header and boot-log strings are checked too
-#              (FWREPO=<tree> and MAIN_BIN=<path> select the boot-chain inputs,
-#              as for mkdevcard.sh).
-#
-# The manifest holds each value mkdevcard.sh recorded from the build -- the GPT,
-# the sha256 of every partition's bytes and of the firmware gap, the whole
-# image, the ESP entries (via mtools) and the initramfs (via debugfs per path) --
-# these image measurements are recomputed here and required to match exactly.
-# The requested profile and RPM inputs are build records. The first
-# mismatch is named. No CPIO, zstd, systemd, ext4-walk or FAT-listing logic:
-# verify interprets no format beyond hashing the bytes it is told to.
+# Verify sealed bytes, not bootability, runtime policy or a DTB handoff.
+# Usage: fedora/verify-devcard.sh IMAGE MANIFEST --expect-manifest-sha256 HEX
+#        [--firmware FIRMWARE] [--main-bin MAIN_BIN]
+# HEX comes from the independently retained CI receipt, never the image directory.
+# TMPDIR must name approved absolute scratch: dense ESP + dense root partition
+# (each partition's sector count × 512 bytes), plus one targeted dump at a time.
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
-IMG=${1:?usage: verify-devcard.sh IMAGE MANIFEST [FIRMWARE]}
-MANIFEST=${2:?usage: verify-devcard.sh IMAGE MANIFEST [FIRMWARE]}
-FW=${3:-none}
-
-die() {
-    echo "verify-devcard: $*" >&2
-    exit 1
-}
-for t in sfdisk mdir mcopy debugfs python3; do
-    command -v $t >/dev/null || die "$t not found"
-done
-[ -f "$IMG" ] || die "image $IMG does not exist"
-[ -f "$MANIFEST" ] || die "manifest $MANIFEST does not exist"
-
-# The whole proof: schema check, GPT, each partition's and the gap's sha256, the
-# whole image, the ESP entries (types and sha256 via mtools) and the initramfs
-# files (per-path debugfs dump). Exact equality; the first difference is named.
-python3 -I "$TOP/fedora/devcard-manifest.py" verify "$IMG" "$MANIFEST" ||
-    die "the image is not exactly what the build manifest records"
-
-if [ "$FW" != none ] && [ -f "$FW" ]; then
-    cmp -n "$(stat -c %s "$FW")" -i 0:131072 "$FW" "$IMG" ||
-        die "firmware.bin at sector 256 does not read back"
-    dd if="$IMG" bs=1 skip=$((131072 + 4)) count=8 status=none | grep -q 'eGON.BT0' ||
-        die "eGON header not found at 128 KiB"
-    python3 -I "$TOP/fedora/fwcheck.py" fd-has A7AFWLOG "$FW" ||
-        die "EDK2 FD does not log to RAM (A7AFWLOG)"
-    python3 -I "$TOP/fedora/fwcheck.py" fd-has oreboot,firmware-log "$FW" ||
-        die "EDK2 FD does not publish /chosen/oreboot,firmware-log"
-    if [ -n "${MAIN_BIN:-}" ] && [ -f "$MAIN_BIN" ]; then
-        python3 -I "$TOP/fedora/fwcheck.py" main-fwlog "$MAIN_BIN" ||
-            die "main.bin lacks the firmware log handler"
-    fi
+IMG=${1:?usage: verify-devcard.sh IMAGE MANIFEST --expect-manifest-sha256 HEX [--firmware FILE]}
+MANIFEST=${2:?missing manifest}
+shift 2
+verify_args=("$@")
+if [[ -v MAIN_BIN ]]; then
+    for arg in "$@"; do
+        case $arg in
+        --main-bin | --main-bin=*)
+            echo "verify-devcard: use either MAIN_BIN or --main-bin" >&2
+            exit 2
+            ;;
+        esac
+    done
+    verify_args+=(--main-bin "$MAIN_BIN")
 fi
 
-echo "verify-devcard: $IMG matches $MANIFEST exactly"
+# Expected manifest digest is checked first: a self-consistent swapped pair is not this build.
+# GPT, gap, image and partitions prove byte identity; not whether the image can boot.
+# FAT and ESP prove packed structure and staged file equality; not firmware execution.
+# Targeted root DTB stamp and initramfs digests prove shipped bytes, not the boot handoff.
+# Optional firmware and main.bin checks bind the examined bytes at the recorded seek,
+# not that the board used those bytes. Profile/RPM inputs are sealed build records.
+python3 -I "$TOP/fedora/devcard-manifest.py" verify "$IMG" "$MANIFEST" "${verify_args[@]}"
+printf 'verify-devcard: %s matches the independently sealed manifest %s\n' "$IMG" "$MANIFEST"

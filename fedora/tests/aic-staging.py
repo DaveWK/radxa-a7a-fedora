@@ -585,6 +585,25 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
             "exit 42\n"
         )
         stub.chmod(0o755)
+        subprocess.run(["git", "init", "-q", str(repo_top)], check=True)
+        subprocess.run(["git", "-C", repo_top, "add", "--", "fedora"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_top,
+                "-c",
+                "user.name=DaveWK",
+                "-c",
+                "user.email=13626476+DaveWK@users.noreply.github.com",
+                "commit",
+                "-qm",
+                "Synthetic Fedora build source",
+                "--",
+                "fedora",
+            ],
+            check=True,
+        )
 
         def run_mkdevcard(tag, extra=""):
             recorded.unlink(missing_ok=True)
