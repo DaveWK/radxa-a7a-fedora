@@ -271,16 +271,15 @@ check "no authorized_keys" \
     python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
     --mode no-glob --pattern 'authorized_keys*' root/.ssh
 # cubie-a7a-fwlog is optional (built only where the boot-chain checkout is).
-units="sshd NetworkManager firewalld chronyd cubie-a7a-dtb dkms bluetooth"
+units=(sshd NetworkManager firewalld chronyd cubie-a7a-dtb dkms bluetooth)
 if grep -q '^cubie-a7a-fwlog-' "$PACKAGES"; then
-    units="$units a7a-fwlog"
+    units+=(a7a-fwlog)
     check "a7a-fwlog installed (aarch64)" bash -c "file '$ROOT/usr/bin/a7a-fwlog' | grep -q 'ARM aarch64'"
     check "a7a-fwlog.service: SyslogIdentifier, previous boot first, exit 1 tolerated" bash -c "u='$ROOT/usr/lib/systemd/system/a7a-fwlog.service'; grep -q '^SyslogIdentifier=a7a-fwlog' \$u && grep -q '^SuccessExitStatus=1' \$u && [ \"\$(grep -n 'a7a-fwlog -p\$' \$u | cut -d: -f1)\" -lt \"\$(grep -n '^ExecStart=/usr/bin/a7a-fwlog\$' \$u | cut -d: -f1)\" ]"
 else
     echo "  info  cubie-a7a-fwlog not installed (no boot-chain checkout at build time)"
 fi
-# shellcheck disable=SC2086 # a word list
-for u in $units; do
+for u in "${units[@]}"; do
     check "$u.service enabled" bash -c "ls '$ROOT'/etc/systemd/system/*.wants/$u.service >/dev/null 2>&1"
 done
 check "no cockpit" bash -c "! grep -q '^cockpit' '$PACKAGES'"

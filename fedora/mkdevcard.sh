@@ -566,9 +566,10 @@ done
 # which firmware files in the root and initramfs are closed blobs, Realtek's
 # named separately; fedora/image-firmware.allow lists the reviewed open
 # ones. Open replacements take a blob's place once they reach parity.
-# shellcheck disable=SC2046 # one --list per kernel
+audit_lists=()
+while read -r k; do audit_lists+=(--list "$W/initramfs-$k.txt"); done <"$W/kernel.txt"
 python3 -I "$TOP/fedora/image-firmware.py" audit --root "$ROOT" --quiet \
-    $(for k in $(cat "$W/kernel.txt"); do echo --list "$W/initramfs-$k.txt"; done) \
+    "${audit_lists[@]}" \
     --allow "$TOP/fedora/image-firmware.allow" --json "$W/firmware-audit.json" \
     >"$W/firmware-audit.txt" 2>&1 || echo "mkdevcard: firmware audit did not run (report only)" >&2
 
