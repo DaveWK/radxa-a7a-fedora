@@ -1,0 +1,2 @@
+Unit Load State: masked
+Fragment Path: /etc/systemd/system/systemd-repart.service

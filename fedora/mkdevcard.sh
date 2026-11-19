@@ -110,9 +110,10 @@ die() {
     exit 1
 }
 for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3 \
-    systemd-analyze systemctl lsinitrd rpm; do
+    systemctl lsinitrd rpm; do
     command -v $t >/dev/null || die "$t not found"
 done
+[ -x /usr/lib/systemd/systemd ] || die "systemd manager for staged loader not found"
 python3 -I -c 'import selinux' 2>/dev/null || die "python3-libselinux not found"
 # On an aarch64 host (the image builder's QEMU guest) the target's scriptlets
 # run natively; elsewhere they need qemu-aarch64 binfmt.
@@ -413,7 +414,8 @@ if [ "$GROW_ROOT" = yes ]; then
 Type=root
 EOF
 else
-    systemctl --root="$ROOT" mask systemd-repart.service systemd-growfs-root.service >/dev/null
+    systemctl --root="$ROOT" mask systemd-repart.service systemd-repart@.service \
+        systemd-growfs-root.service >/dev/null
 fi
 
 # systemd-repart must not discard on this board's media. Whenever it changes
@@ -430,8 +432,8 @@ fi
 # that repeats the unit's own ExecStart with --discard=no (systemd 262:
 # "systemd-repart --dry-run=no" and "systemd-repart"). Written whatever
 # GROW_ROOT says: a masked unit ignores the drop-in, and it is in place if
-# the mask is ever lifted. The drop-in bytes are pinned by the unit-config
-# check below (systemd-analyze cat-config against fedora/fixtures/units/).
+# the mask is ever lifted. The final staged loader and pinned inventory below
+# check the drop-in bytes.
 mkdir -p "$ROOT/etc/systemd/system/systemd-repart.service.d" \
     "$ROOT/etc/systemd/system/systemd-repart@.service.d"
 for u in systemd-repart.service systemd-repart@.service; do
@@ -609,29 +611,8 @@ STAGE1
 # systemd's own resolution and dracut's own reader; a deviation fails the build.
 # There is no fallback when a tool is missing (devcard-policy.py fails closed).
 UNITS_FIXTURES=$TOP/fedora/fixtures/units
-# The no-discard drop-ins, resolved by systemd (symlinks, usr-merge, drop-ins):
-python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$ROOT" systemd-repart.service \
-    --fixture "$UNITS_FIXTURES/root-systemd-repart.service.cat-config" ||
-    {
-        echo "mkdevcard: systemd-repart.service is not the pinned configuration" >&2
-        exit 1
-    }
-python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$ROOT" systemd-repart@.service \
-    --fixture "$UNITS_FIXTURES/root-systemd-repart@.service.cat-config" ||
-    {
-        echo "mkdevcard: systemd-repart@.service is not the pinned configuration" >&2
-        exit 1
-    }
-# GROW_ROOT=yes: the main unit enabled (our build resolves it as static, via the
-# systemd package's sysinit.target.wants link, which unit-enabled accepts);
-# GROW_ROOT=no: exactly masked.
-unit_state=enabled
-[ "$GROW_ROOT" = yes ] || unit_state=masked
-python3 -I "$TOP/fedora/devcard-policy.py" unit-enabled "$ROOT" systemd-repart.service --state "$unit_state" ||
-    {
-        echo "mkdevcard: systemd-repart.service is not $unit_state (GROW_ROOT=$GROW_ROOT)" >&2
-        exit 1
-    }
+python3 -I "$TOP/fedora/staged-systemd.py" check "$ROOT" "$UNITS_FIXTURES" "$GROW_ROOT" \
+    --root-uuid "$ROOT_UUID" --esp-uuid "$ESP_UUID"
 
 # The initramfs set must equal the kernels in kernel.txt, and each initramfs
 # (unpacked with dracut's own lsinitrd) must carry no systemd-repart unit.

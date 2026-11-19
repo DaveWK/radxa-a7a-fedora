@@ -1,0 +1,17 @@
+{
+  "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf": {
+    "sha256": "aae7f4f41dfa031450a103332481d2b9f18090fae47e4f9f4db1306b9dc2f2f8"
+  },
+  "etc/systemd/system/systemd-repart@.service.d/10-cubie-a7a-no-discard.conf": {
+    "sha256": "c8847f257c0185e40a282f93f2b75185082e2bfa19fa000cb7531770496e4836"
+  },
+  "usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service": {
+    "link": "../systemd-repart.service"
+  },
+  "usr/lib/systemd/system/systemd-repart.service": {
+    "sha256": "d590b409196656bbcfab769b44f6c8314c65ee119d41fa7ac8dea124b340de58"
+  },
+  "usr/lib/systemd/system/systemd-repart@.service": {
+    "sha256": "503173e5cba736ae102d80dadddcbc748271f09d0b59d2159ea05cbe37b9b3d9"
+  }
+}

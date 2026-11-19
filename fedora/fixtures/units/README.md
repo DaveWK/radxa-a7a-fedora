@@ -1,19 +1,23 @@
-# Pinned-unit fixtures
+# Staged systemd fixture regeneration
 
-These are the expected `systemd-analyze --root=<root> cat-config
-systemd/system/<unit>` outputs for the two systemd-repart units, normalised to
-`# /<path>` headers. The build-time check `devcard-policy.py unit-config`
-compares the staged root's resolution byte for byte with these, so symlinks,
-usr-merge, drop-ins, conditions and aliases are systemd's decisions, not ours.
+`repart-yes`, `repart-no`, and `repart-initramfs` each pin the real manager
+result and the complete unit inventory. From an owned staged fixture tree:
 
-- `root-*.cat-config`  the stock unit's own command line plus the no-discard
-  drop-in `10-cubie-a7a-no-discard.conf` that mkdevcard.sh writes for each
-  unit (the unpartitioned gap in front of the first partition holds the boot
-  firmware, so systemd-repart must run with `--discard=no`).
-- `initramfs-*.cat-config`  "Main configuration file ... not found": the dracut
-  initramfs carries no systemd-repart unit (the discard protection lives on the
-  root), so the resolved unit is absent.
+```sh
+python3 -I fedora/staged-systemd.py capture "$root" "$candidate_fixtures" yes
+python3 -I fedora/staged-systemd.py capture "$no_grow_root" "$candidate_fixtures" no
+python3 -I fedora/staged-systemd.py capture "$unpacked_initramfs" "$candidate_fixtures" initramfs
+```
 
-Generated once from the intended state (systemd 262, 262.1-1.fc45) and reviewed;
-a systemd update that changes any of these files fails the build until the pin is
-updated. The manifest records their sha256 (fedora/devcard-manifest.py).
+Generate into a separate existing directory. Review the effective commands
+and every inventory difference before updating the pin; never capture a failed
+overlay or automatically refresh pins during an image build.
+
+The initial pins are seed fixtures made by
+`python3 -I fedora/tests/staged-systemd.py --seed-pins "$candidate_fixtures"`.
+They exercise the real loader against the stock repart fragment, its drop-ins,
+the vendor wants link, both masks, and the no-repart initramfs case. They do
+not attest to a real Fedora image's full symlink and drop-in inventory.
+
+The older `*.cat-config` outputs are retained as source for the seed fixture
+and for regression comparison with the former resolver.
