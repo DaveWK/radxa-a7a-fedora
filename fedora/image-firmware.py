@@ -203,7 +203,21 @@ def list_initramfs(path):
 
 
 class Debugfs:
-    """Read-only view of an ext4 filesystem inside a disk image."""
+    """Read-only view of an ext4 filesystem inside a disk image.
+
+    What is checked, and no more: the superblock is pinned to what
+    mkfs.ext4 makes for us (filetype and extents, no inline_data or
+    encryption, 1/2/4 KiB blocks); every directory is listed by inode, and
+    its listing (names, inode numbers, file types, subdirectory count) must
+    equal the entries parsed from that directory's own raw blocks, located
+    through the extent map debugfs stat reports (contiguous logical blocks,
+    inside the partition, no logical block twice).  Not checked: regular
+    files' sizes or extents, block ownership across inodes (two inodes
+    sharing a block), or extent-tree interior nodes; a dump's size is
+    compared only with the size debugfs itself lists.  Firmware paths are
+    classified by name, so these limits affect file contents, not which
+    files are found.
+    """
 
     _BANNER_RE = re.compile(r"^debugfs [0-9.]+ \([^()]+\)$")
     _EXT4_INCOMPAT_FILETYPE = 0x0002
@@ -290,7 +304,12 @@ class Debugfs:
         return block_size
 
     def _raw_dir_entries(self, stat_ino, stat_text, path):
-        """Independently parse raw ext4 directory blocks from the image file."""
+        """Parse a directory's raw ext4 blocks from the image file.
+
+        Blocks are located through the extent map from debugfs stat (the
+        directory's size, logical-to-physical runs); only the directory's
+        own records are parsed, not file extents or block ownership.
+        """
         m_flags = re.search(r"Flags:\s+0x([0-9a-fA-F]+)", stat_text)
         m_size = re.search(r"Size:\s+(\d+)", stat_text)
         if not m_flags or not m_size:
