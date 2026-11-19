@@ -4,11 +4,13 @@
 
 import hashlib
 import os
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 FEDORA = Path(__file__).resolve().parent.parent
 CHECK = [sys.executable, "-I", str(FEDORA / "staged-root-policy.py")]
@@ -138,6 +140,36 @@ def cases(work):
     def preboot(code, diagnostic=""):
         require(staged, code, diagnostic, data=PASSWORD + "\n")
 
+    preboot(0)
+    dbus_id = write(root, "var/lib/dbus/machine-id", "stale-fixture-id\n")
+    preboot(1, "var/lib/dbus/machine-id")
+    dbus_id.unlink()
+    for target in ("/etc/machine-id", "../../../etc/machine-id"):
+        dbus_id.symlink_to(target)
+        preboot(0)
+        dbus_id.unlink()
+    dbus_id.symlink_to("/elsewhere/machine-id")
+    preboot(1, "var/lib/dbus/machine-id")
+    dbus_id.unlink()
+
+    policy = runpy.run_path(str(FEDORA / "staged-root-policy.py"))
+    real_scandir = os.scandir
+    for relative in ("etc/ssh", "root/.ssh"):
+        blocked = root / relative
+        blocked.mkdir(parents=True, exist_ok=True)
+
+        def scandir(path):
+            if Path(path) == blocked:
+                raise PermissionError("fixture directory scan refused")
+            return real_scandir(path)
+
+        with patch.object(os, "scandir", scandir):
+            try:
+                policy["first_boot"](root)
+            except policy["PolicyError"] as exc:
+                assert f"{relative}: cannot scan staged directory" in str(exc), exc
+            else:
+                raise AssertionError(f"{relative}: scan error was accepted")
     preboot(0)
     fstab = (root / "etc/fstab").read_text()
     mutations = (

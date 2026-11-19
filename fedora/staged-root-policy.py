@@ -3,6 +3,7 @@
 """Final staged-root policy and two targeted checks on the packed root FS."""
 
 import argparse
+import fnmatch
 import hashlib
 import hmac
 import os
@@ -33,12 +34,19 @@ def regular(root, relative):
     return path
 
 
-def absent_glob(root, directory, pattern):
-    directory = optional_dir(root, directory)
+def absent_match(root, relative, pattern):
+    directory = optional_dir(root, relative)
     if directory is None:
         return
-    for entry in directory.glob(pattern):
-        raise PolicyError(f"unexpected staged entry: {entry.relative_to(root)}")
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if fnmatch.fnmatchcase(entry.name, pattern):
+                    raise PolicyError(
+                        f"unexpected staged entry: {relative}/{entry.name}"
+                    )
+    except OSError as exc:
+        raise PolicyError(f"{relative}: cannot scan staged directory: {exc}") from exc
 
 
 def absent_text(root, roots, regex, skip=None):
@@ -71,17 +79,26 @@ def first_boot(root):
         ("etc/ssh", "ssh_host_*"),
         ("root/.ssh", "authorized_keys*"),
     ):
-        absent_glob(root, directory, pattern)
+        absent_match(root, directory, pattern)
     for name in (".autorelabel", "var/lib/systemd/random-seed"):
         if physical(root, name, missing=True) is not None:
             raise PolicyError(f"unexpected first-boot state: {name}")
     if regular(root, "etc/machine-id").stat().st_size:
         raise PolicyError("etc/machine-id is not empty for first boot")
+    fallback = physical(root, "var/lib/dbus/machine-id", missing=True)
+    # Accept only the two spellings that refer to the already checked empty file.
+    if fallback is not None and (
+        not fallback.is_symlink()
+        or os.readlink(fallback) not in ("/etc/machine-id", "../../../etc/machine-id")
+    ):
+        raise PolicyError(
+            "var/lib/dbus/machine-id: expected absence or a link to /etc/machine-id"
+        )
 
 
 def wifi(root):
     # No persisted connection profiles or wpa_supplicant network blocks; not live policy.
-    absent_glob(root, "etc/NetworkManager/system-connections", "*")
+    absent_match(root, "etc/NetworkManager/system-connections", "*")
     absent_text(
         root,
         ("etc/wpa_supplicant", "etc/wpa_supplicant.conf"),
