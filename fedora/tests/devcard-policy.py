@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """Host tests for fedora/devcard-policy.py (the build-time image-policy checks
-behind mkdevcard.sh and the shared helpers verify-devcard.sh still uses).
+behind mkdevcard.sh and the retained build helpers).
 
 The checks that used to reconstruct archive and filesystem formats (cpio, zstd,
 systemd drop-in precedence, ext4 and FAT listings) were removed when verify

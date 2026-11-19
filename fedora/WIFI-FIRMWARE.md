@@ -20,8 +20,9 @@ replaces the user opt-in of 2026-11-11:
 - `cubie-a7a-wifi-firmware` stays, as an **optional** override: it installs
   a USB firmware set you obtained yourself (checked against the manifest
   below) into the override directory. Nothing requires it.
-- `verify-devcard.sh` checks that the linux-firmware files are in the image
-  (and that the override directory is not).
+- `mkdevcard.sh` checks staged AIC file provenance against Fedora-signed RPM
+  records and file digests before dracut and again after the overlay.
+  `verify-devcard.sh` then checks the sealed image bytes, not Wi-Fi policy.
 
 None of our packages or repositories carries firmware, and nothing here
 downloads it.
@@ -43,7 +44,7 @@ does not ask for one. The USB chip cannot run an SDIO Wi-Fi image, and
 **refuses** an `fmacfw` from linux-firmware that is an SDIO build (one
 error naming the override directory and this file) instead of starting it;
 the chip stays unbound in ROM mode, as without firmware.
-`cubie-a7a-wifi-firmware status` and `verify-devcard.sh` report the same.
+`cubie-a7a-wifi-firmware status` reports this on the running system.
 Wi-Fi/Bluetooth therefore work out of the box only once linux-firmware
 carries a USB build of the D80 Wi-Fi image (or the user installs the
 optional override). Not tested on hardware: whether linux-firmware's
@@ -156,7 +157,8 @@ appears without a reboot. The driver also accepts `<name>.xz` or
   `nmcli device wifi connect <SSID> --ask`); Bluetooth is BlueZ
   (`bluetoothctl`). Every image installs `NetworkManager-wifi`,
   `wpa_supplicant`, `iw`, `bluez` and `wireless-regdb` and enables
-  `bluetooth.service` (`mkdevcard.sh`, checked by `verify-devcard.sh`).
+  `bluetooth.service` (`mkdevcard.sh`; runtime state is not checked by the
+  packed-image verifier).
   Without the Wi-Fi plugin NetworkManager lists `wlan0` as unmanaged even
   with the driver and firmware working; `NetworkManager-wifi` needs
   `wpa_supplicant` or `iwd`, and the image names `wpa_supplicant` (Fedora

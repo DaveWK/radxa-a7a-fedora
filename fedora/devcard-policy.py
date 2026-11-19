@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Image-policy checks shared by fedora/mkdevcard.sh and fedora/verify-devcard.sh.
+"""Staged image-policy and RPM input checks for the Fedora build.
 
 Python 3, run with -I by the shell scripts; the host tests import it.  Every
 command prints a stable, shell-friendly result and exits nonzero on a policy
@@ -615,7 +615,7 @@ def passwd_sole_root(text):
     return roots == 1
 
 
-# --- build-time systemd checks (systemd's own resolution) ------------------
+# --- staged ESP admission --------------------------------------------------
 
 
 ESP_BASE_ENTRIES = frozenset(

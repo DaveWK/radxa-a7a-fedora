@@ -34,7 +34,8 @@ Each kernel module directory keeps its upstream licence headers and a
 
 Requirements on a Fedora 45 host: `rpm-build`, `dtc`, `cpp`, `make`,
 `systemd-rpm-macros`, `createrepo_c`, `dnf5`, `util-linux` (`unshare`), `e2fsprogs`,
-`dosfstools`, `mtools`, `openssl`, `xz`, `python3-libselinux`, and
+`dosfstools` (including `fsck.fat`), `mtools`, `openssl`, `xz`, `git`,
+`python3-libselinux`, and
 `qemu-user-static-aarch64` with its binfmt handler (the `F` flag) on x86_64
 hosts.
 
@@ -57,6 +58,44 @@ the boot firmware (`firmware.bin`, written at LBA 256). Image policy: root
 is the only login, the password is `Fedora123` (`ROOT_PASSWORD`), sshd and
 DHCP are on, and the image holds no SSH keys of anyone (host keys are
 generated on first boot).
+
+### Build receipt and image verification
+
+Build from a Git checkout with clean Fedora source files. When embedding
+`FIRMWARE_BIN`, set `DRAM_FIRMWARE_IDENTITY` to the packaged firmware's build
+profile (for example `blobfree-1200`); the digest in that profile is of the
+entire DRAM-bearing `firmware.bin` actually packed, not of a separately verified
+training component. `none` records no embedded firmware identity. When a
+firmware `.seek` file is present, its LBA must be inside the reserved gap.
+
+`mkdevcard.sh` writes `OUT.devcard-manifest.json`, `OUT.build-receipt.json` and
+`OUT.sha256`. The checksum file uses standard `sha256sum -c` rows for the
+image, manifest, receipt and, when generated, its `.xz` copy. The build
+receipt records the source commit, seal times, run ID, profile, snapshot
+digest, packed image and manifest digests, DTB stamp digests, and the bound
+initramfs digest set. Source, profile and RPM inputs are **build records**,
+not facts independently recovered from the image.
+
+Task 147 must retain the receipt as its own CI artifact and copy it into A7A
+evidence before acceptance or publication. Use the manifest digest from that
+retained receipt, not from the copy next to the image:
+
+    TMPDIR="$HOME/approved-devcard-scratch" \
+      fedora/verify-devcard.sh IMAGE MANIFEST --expect-manifest-sha256 HEX
+
+Create that scratch directory first, outside `/tmp` and `/var/tmp`. The
+verifier makes dense copies of the ESP and root partition: budget each
+partition's sector count multiplied by 512 bytes, plus one targeted file dump
+at a time. The ESP is currently 512 MiB; the root size varies by build.
+
+| Check | Proves | Does not prove |
+| --- | --- | --- |
+| Retained manifest SHA-256 and strict schema | The exact expected manifest, not just any matching image/manifest pair. | That the artifact boots or is correctly configured. |
+| GPT, partition, gap and whole-image digests | Geometry and exact shipped bytes, including image tail/padding. | What the machine did with those bytes. |
+| `fsck.fat -n`, ESP paths and digests | Packed FAT structure and equality with the admitted staged ESP. | That EFI boot succeeded. |
+| Root DTB stamps, optional ESP DTB and its payload marker | The shipped stamps agree with the receipt through the sealed manifest; the optional ESP payload matches its marker. | Which DTB was handed off (on-board acceptance, task 166). |
+| Initramfs path and digest | The packed initramfs files are the build-bound bytes. | Contents, archive validity or which initramfs booted. |
+| `--firmware FILE` and optional `--main-bin FILE` (or `MAIN_BIN`) | Supplied firmware matches the manifest's recorded seek, size and digest; the examined `main.bin`, when requested, is embedded and has the log-handler signature. | Which boot chain ran, what DRAM code executed or whether logs were emitted. |
 
 ### Dev card pre-boot checks
 

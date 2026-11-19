@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 #
 # The Fedora release an image or package build targets. Sourced by
-# mkdevcard.sh, verify-devcard.sh and the build-*rpms.sh scripts (TOP set).
+# mkdevcard.sh and the build-*rpms.sh scripts (TOP set).
 #
 #   FEDORA_RELEASE=45        (default) the stable line: repositories fedora +
 #                            updates, packages .fc45, paths as before
@@ -26,7 +26,7 @@
 
 FEDORA_RELEASE=${FEDORA_RELEASE:-45}
 # The number Rawhide currently is (its packages are .fcN). Bump at each
-# Fedora branch point; verify-devcard.sh checks the kernel against it.
+# Fedora branch point; the builder uses this for rawhide package selection.
 FEDORA_RAWHIDE_VERSION=${FEDORA_RAWHIDE_VERSION:-46}
 RELEASE_PACKAGES=()
 case $FEDORA_RELEASE in
@@ -97,7 +97,7 @@ cubie_check_root_kmods() {
     esac
 }
 
-# Sourced by mkdevcard.sh, verify-devcard.sh and build-*rpms.sh: reference the
+# Sourced by mkdevcard.sh and build-*rpms.sh: reference the
 # exported release variables here so shellcheck sees them used without a disable.
 : "${FEDORA_RELEASE}" "${FEDORA_RAWHIDE_VERSION}" "${RELEASEVER}" "${RELEASE_NUM}" \
     "${RELEASE_SUFFIX}" "${RELEASE_REPOS[*]}" "${RELEASE_PACKAGES[*]}" \
