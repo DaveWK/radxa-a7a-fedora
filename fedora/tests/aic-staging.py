@@ -657,7 +657,7 @@ def _fake_fwlog_binary(work, srpm, out_dir):
     spec = top / "SPECS/cubie-a7a-fwlog.spec"
     spec.write_text(
         f"Name: cubie-a7a-fwlog\nVersion: {vr[0]}\nRelease: {vr[1]}\n"
-        "Summary: test\nLicense: GPL-2.0-only\nBuildArch: noarch\n"
+        "Summary: test\nLicense: GPL-2.0-only\n"
         "%description\ntest\n%install\nmkdir -p %{buildroot}/usr/bin\n"
         "echo hi > %{buildroot}/usr/bin/a7a-fwlog\n%files\n/usr/bin/a7a-fwlog\n"
     )
@@ -668,13 +668,15 @@ def _fake_fwlog_binary(work, srpm, out_dir):
             f"_topdir {top}",
             "--define",
             f"_tmppath {top}/tmp",
+            "--target",
+            "aarch64-redhat-linux",
             "-bb",
             str(spec),
         ],
         check=True,
         capture_output=True,
     )
-    built = next((top / "RPMS/noarch").glob("cubie-a7a-fwlog-*.rpm"))
+    built = next((top / "RPMS/aarch64").glob("cubie-a7a-fwlog-*.rpm"))
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / built.name
     shutil.copy2(built, dest)
@@ -759,7 +761,7 @@ def test_rpm_manifests_bound_to_one_run():
             (spec_top / d).mkdir(parents=True)
         (spec_top / "SPECS/x.spec").write_text(
             "Name: cubie-a7a-fwlog\nVersion: 9\nRelease: 9\nSummary: t\n"
-            "License: GPL-2.0-only\nBuildArch: noarch\n%description\nt\n"
+            "License: GPL-2.0-only\n%description\nt\n"
             "%files\n"
         )
         subprocess.run(
@@ -769,13 +771,15 @@ def test_rpm_manifests_bound_to_one_run():
                 f"_topdir {spec_top}",
                 "--define",
                 f"_tmppath {spec_top}/tmp",
+                "--target",
+                "aarch64-redhat-linux",
                 "-bb",
                 str(spec_top / "SPECS/x.spec"),
             ],
             check=True,
             capture_output=True,
         )
-        shutil.copy2(next((spec_top / "RPMS/noarch").glob("*.rpm")), renamed)
+        shutil.copy2(next((spec_top / "RPMS/aarch64").glob("*.rpm")), renamed)
         r = _policy(*bind, "--bind-noarch-sha256", msha, str(renamed))
         assert r.returncode != 0 and "not the bound" in r.stderr, r.stderr
         renamed.unlink()

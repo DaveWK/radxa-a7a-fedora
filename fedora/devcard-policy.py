@@ -1,51 +1,56 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Image-policy checks shared by fedora/mkdevcard.sh and
-fedora/verify-devcard.sh.
+"""Image-policy checks shared by fedora/mkdevcard.sh and fedora/verify-devcard.sh.
 
 Python 3, run with -I by the shell scripts; the host tests import it.  Every
 command prints a stable, shell-friendly result and exits nonzero on a policy
 violation, so a caller can use it directly as a check.
 
-Commands:
+The checks that run at *build* time (mkdevcard.sh) work on staged directory
+trees and real tool output, so a format is never re-derived from packed bytes:
+
   aic-overlay DIR     AIC8800 firmware paths in an OVERLAY directory that
-                      must be refused before the copy: anything under
-                      usr/lib/firmware/ or lib/firmware/ matching aic/,
-                      aic8800*, or *aic8800* (DECISIONS 2026-11-11; Dave
-                      2026-11-19: Fedora's standard linux-firmware files are
-                      fine, our own are not).  Prints one path per line;
-                      exit 1 when any is found.
+                      must be refused before the copy.
   aic-provenance ROOT [--ownership FILE] [--report FILE]
-                      every file under usr/lib/firmware/aic* (and any stray
-                      aic8800* or manifest-named file under firmware/) in ROOT
-                      must be owned by a signed Fedora package and match that
-                      package's recorded digest.  Ownership comes from ROOT's
-                      rpm database, or from a recorded TSV / rpm -qlv --dump
-                      FILE.  Prints one problem per line; exit 1 on failure.
-  repart-root ROOT [--grow-root yes|no]
-                      our build's systemd-repart configuration, pinned: only
-                      the drop-in directories we write, the stock units'
-                      command lines, our drop-in bytes (effective command =
-                      stock + --discard=no), the stock service.d directive
-                      set; with --grow-root, the unit enabled and our repart.d
-                      (yes) or masked with no repart.d (no).  Run by
-                      mkdevcard.sh and verify-devcard.sh alike.
-  repart-dropin UNIT UNIT_FILE
-                      print the no-discard drop-in for UNIT from its stock
-                      unit file; exit 1 if the stock command is not pinned.
-  repart-initramfs IMG [--chroot ROOT | --run-build-ns SCRIPT] [--forbid-repart]
-                      the same rule on the unit directories recreated from
-                      IMG's raw cpio records (types, targets and bytes from
-                      the archive; lsinitrd only cross-checks the path set).
+                      every file under usr/lib/firmware/aic* must be owned by
+                      a signed Fedora package matching its recorded digest.
+  unit-config ROOT UNIT --fixture FILE
+                      ``systemd-analyze --root=ROOT cat-config systemd/system/UNIT``
+                      compared byte for byte (host-root headers normalized)
+                      with the pinned expected text in FILE (a repo fixture).
+                      That is systemd's own resolution: symlinks, usr-merge,
+                      drop-ins, conditions and aliases are all systemd's
+                      decisions.  Fails closed when systemd-analyze is absent.
+  unit-enabled ROOT UNIT --state enabled|masked
+                      ``systemctl --root=ROOT is-enabled UNIT``.  ``enabled``
+                      accepts enabled or static (our build's sysinit link);
+                      refutes masked, disabled and not-found.  ``masked``
+                      requires exactly "masked".
+  initramfs-unpack IMG DEST
+                      unpack IMG with dracut's own ``lsinitrd --unpack`` into a
+                      fresh DEST (the system's initramfs reader).
+  esp-staged ROOT --esp-dir DIR --dtb-rpm RPM
+                      the one ESP admission rule at build, on the staged tree
+                      before mtools: the stamps are validated first; the DTB
+                      and marker bytes, the VERSION file and the esp-override
+                      presence are bound to the built cubie-a7a-dtb RPM's own
+                      file list (``rpm -qp --dump``); the entry set with types
+                      is exactly our build's.  An OVERLAY may not write
+                      boot/efi (see overlay-esp).
+
   enabled-repos DIR [DIR...]
-                      enabled dnf repository ids, sorted, each followed by a
-                      space (the awk's sort -u | tr '\n' ' ').
+                      enabled dnf repository ids, sorted.
   dumpe2fs IMG        "X GiB, Y GiB free" from dumpe2fs -h.
   loader-entry FILE FIELD
                       linux, initrd or options of a BLS entry file.
   shadow              stdin is /etc/shadow: "salt<TAB>root-hash<TAB>others".
   passwd-sole-root FILE
                       exactly one uid 0 named root and no other human user.
+  write-rpm-manifest ...  (also records NEVRA and %{ARCH} per RPM)
+  stage-srpm, select-rpms, verify-rpmdb-list, absence-check
+                      the RPM provenance and filesystem absence checks.
+
+The exact build manifest and its verify live in fedora/devcard-manifest.py.
 """
 
 import argparse
@@ -53,12 +58,10 @@ import base64
 import errno
 import fnmatch
 import hashlib
-import importlib
 import json
 import os
 import re
 import secrets
-import shlex
 import shutil
 import stat
 import subprocess
@@ -83,76 +86,10 @@ FEDORA_CERTIFICATES = {
     "ecf2e6d384554b1ddd2b221d90dc1d5c96b351c2e16204c798f63d1213bdb414",
     "b176af5099fa5f13452ad84d33821edcee235cd1d484018fe96daa39e54e6a50",
 }
-# Provenance, not path: Fedora's standard linux-firmware package owns
-# aic/aic8800d80 and is fine (Dave 2026-11-19); any unowned, modified or
-# non-Fedora file under an AIC firmware path is ours and forbidden
-# (DECISIONS 2026-11-11).
+# The pinned systemd units mkdevcard's no-discard drop-ins and the unit-config
+# build-time check both cover (the repart service and its Varlink instance).
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
 REPART_MAIN = "systemd-repart.service"
-# The stock units' own command lines (systemd 262, Fedora 44/45; the real
-# a7a-fedora-01 tree) and the drop-in fedora/mkdevcard.sh writes for each:
-# the same command plus --discard=no.  Anything else is refused at build
-# and at verify, rather than modelled.
-REPART_STOCK_EXECSTART = {
-    "systemd-repart.service": "systemd-repart --dry-run=no",
-    "systemd-repart@.service": "systemd-repart",
-}
-REPART_DROPIN_NAME = "10-cubie-a7a-no-discard.conf"
-REPART_DROPIN_HEADER = (
-    "# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of\n"
-    "# the first partition holds the boot firmware, so systemd-repart must not\n"
-    "# discard it. The unit's own command line, plus --discard=no.\n"
-)
-# Stock Fedora systemd ships one type-wide drop-in; its directive set is
-# pinned (real a7a-fedora-01: sha256 ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37,
-# owned by systemd).
-STOCK_SERVICE_D = "usr/lib/systemd/system/service.d"
-STOCK_SERVICE_D_FILE = "10-timeout-abort.conf"
-STOCK_SERVICE_D_DIRECTIVES = [("Service", "TimeoutStopFailureMode", "abort")]
-# The only drop-in directories (and their exact entries) our build produces
-# for the units checked here.  Any other drop-in directory for them, a
-# symlinked one, or any other entry in one (empty directories included) is
-# refused before anything is filtered.
-ALLOWED_DROPIN_DIRS = {
-    "etc/systemd/system/systemd-repart.service.d": {REPART_DROPIN_NAME},
-    "etc/systemd/system/systemd-repart@.service.d": {REPART_DROPIN_NAME},
-    STOCK_SERVICE_D: {STOCK_SERVICE_D_FILE},
-}
-# GROW_ROOT=yes: the stock unit is enabled by the systemd package's own
-# sysinit.target.wants link, and mkdevcard writes exactly this repart.d file.
-# GROW_ROOT=no: mkdevcard masks the unit in /etc and writes no repart.d.
-REPART_ENABLE_LINK = (
-    "usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service",
-    "../systemd-repart.service",
-)
-REPART_MASK = "etc/systemd/system/systemd-repart.service"
-REPART_ROOT_CONF = ("etc/repart.d/50-root.conf", "[Partition]\nType=root\n")
-REPART_REPARTD = (
-    "etc/repart.d",
-    "run/repart.d",
-    "usr/lib/repart.d",
-    "usr/local/lib/repart.d",
-)
-# systemd unit search path, highest precedence first (systemd-262.1-1.fc45,
-# derived from `systemd-analyze unit-paths` and verified offline with
-# `systemd-analyze --root= --generators=no verify`).
-SYSTEMD_UNIT_DIRS = (
-    "etc/systemd/system.control",
-    "run/systemd/system.control",
-    "etc/systemd/system",
-    "etc/systemd/system.attached",
-    "run/systemd/system",
-    "run/systemd/system.attached",
-    "usr/local/lib/systemd/system",
-    "usr/lib/systemd/system",
-    "lib/systemd/system",
-)
-DISCARD_FLAG = "--discard=no"
-UNIT_CHAR = r"[A-Za-z0-9_:.\\-]"
-REPART_NAME = rf"systemd-repart(?:-{UNIT_CHAR}+)?(?:@{UNIT_CHAR}*)?\.service"
-REPART_DASHED_DROPIN = (
-    rf"systemd-(?:repart-(?:{UNIT_CHAR}+-)?)?(?:@{UNIT_CHAR}*)?\.service"
-)
 # rpm's PGPHASHALGO values (rpm/rpmpgp.h).
 RPM_ALGO = {1: "md5", 2: "sha1", 3: "sha224", 8: "sha256", 9: "sha384", 10: "sha512"}
 DIGEST_ALGO_DEFAULT = 8
@@ -161,6 +98,7 @@ RPMDB_CANDIDATES = (
     "var/lib/rpm/rpmdb.sqlite",
     "var/lib/rpm/Packages",
 )
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PolicyError(RuntimeError):
@@ -268,9 +206,6 @@ def _aic_root_rel(fw_rel):
 def aic_overlay_inputs(overlay, manifest=None):
     """Overlay inputs that would land in an AIC8800 firmware path or carry a
     manifest-named AIC8800 file anywhere in the overlay.
-
-    mkdevcard.sh refuses these before the overlay copy: only a Fedora package
-    may put AIC8800 firmware in an image, and the overlay is ours.
     """
     base = Path(overlay)
     hits = []
@@ -361,8 +296,7 @@ def _recorded_ownership(path):
 
     Accepts either:
       - tab-separated ``pkg<TAB>path<TAB>digest[<TAB>algo[<TAB>linkto[<TAB>fedora]]]``
-      - ``rpm -qlv --dump`` / ``rpm -q --dump`` lines (11 whitespace fields,
-        with optional ``# package: <name>`` comment header; default linux-firmware)
+      - ``rpm -qlv --dump`` / ``rpm -q --dump`` lines (11 whitespace fields).
     """
     index = {}
     text = Path(path).read_text()
@@ -406,9 +340,7 @@ def _recorded_ownership(path):
 
 
 def _load_fedora_keyring(ts):
-    """Build an rpm.keyring holding only trusted Fedora release signing keys
-    imported in the target root's rpmdb (``gpg-pubkey`` headers).
-    """
+    """Build an rpm.keyring holding only trusted Fedora release signing keys."""
     import rpm
 
     keyring = rpm.keyring()
@@ -432,12 +364,7 @@ def _verify_fedora_header(hdr, verify_ts):
 
 
 def _live_ownership(root, wanted_paths=None):
-    """Index path -> list[(pkg, digest, algo, linkto, is_fedora)] from ROOT's rpmdb.
-
-    When WANTED_PATHS is provided, only packages owning at least one path in
-    WANTED_PATHS undergo cryptographic header signature verification, while
-    still validating that ROOT has a readable non-empty rpmdb.
-    """
+    """Index path -> list[(pkg, digest, algo, linkto, is_fedora)] from ROOT's rpmdb."""
     root = Path(root)
     if not any((root / cand).is_file() for cand in RPMDB_CANDIDATES):
         raise PolicyError(f"no rpm database found under {root}")
@@ -508,16 +435,7 @@ def _digest_problems(path, label, entry):
 
 
 def aic_problems(root, ownership=None):
-    """Every provenance problem in ROOT's AIC8800 firmware tree.
-
-    Every file under usr/lib/firmware/aic* (and any stray aic8800* or
-    manifest-named firmware file) must be owned by a package whose header
-    signature verifies offline against a trusted Fedora release signing key
-    imported in ROOT's rpmdb, with a digest matching that package's recorded
-    digest.  A symlink must itself be owned by a verified Fedora package with
-    a matching target, and resolve inside ROOT to a verified Fedora-owned file
-    with a matching digest.
-    """
+    """Every provenance problem in ROOT's AIC8800 firmware tree."""
     root = Path(root)
     root_res = root.resolve()
     candidates = aic_root_files(root)
@@ -593,13 +511,7 @@ def aic_problems(root, ownership=None):
 
 
 def enabled_repo_ids(dirs):
-    """Ids of the enabled repositories in dnf's .repo files, sorted.
-
-    Mirrors the repo-file parse (a section header names the id, an
-    ``enabled = 1`` line prints it) over every *.repo in every directory,
-    then ``sort -u``.  A missing directory is skipped; unreadable directories
-    or .repo files fail closed with PolicyError.
-    """
+    """Ids of the enabled repositories in dnf's .repo files, sorted."""
     ids = set()
     for directory in dirs:
         path = Path(directory)
@@ -647,13 +559,7 @@ def format_dumpe2fs(text):
 
 
 def loader_field(path, field):
-    """One field of a BLS entry: linux, initrd or options.
-
-    Matches ``awk '$1=="FIELD"{...}'``: the first whitespace-separated field
-    must be exactly FIELD.  options is the remaining fields joined by single
-    spaces (awk rebuilds the record after $1=""), with one line per match;
-    a missing or unreadable file yields the empty string, as the awk did.
-    """
+    """One field of a BLS entry: linux, initrd or options."""
     entry = Path(path)
     if not entry.is_file():
         return ""
@@ -670,11 +576,7 @@ def loader_field(path, field):
 
 
 def shadow_fields(text):
-    """(root salt, root hash, non-root users with a password) of /etc/shadow.
-
-    Mirrors ``awk -F:``: the root hash's third $-separated field is the
-    salt, and any other user whose password starts with $ has a password.
-    """
+    """(root salt, root hash, non-root users with a password) of /etc/shadow."""
     salt, root_hash, others = "", "", []
     for line in text.splitlines():
         parts = line.split(":")
@@ -692,11 +594,7 @@ def shadow_fields(text):
 
 
 def passwd_sole_root(text):
-    """Exactly one uid 0, named root, and no other human (1000-59999) user.
-
-    A malformed UID or GID field is an error, never 0: ``root:x:oops:0:...``
-    must fail.
-    """
+    """Exactly one uid 0, named root, and no other human (1000-59999) user."""
     roots = 0
     for line in text.splitlines():
         if not line.strip():
@@ -709,8 +607,6 @@ def passwd_sole_root(text):
             r"[0-9]+", gid_field
         ):
             return False
-        # uid_t/gid_t exclude the all-ones sentinel. Bound before int() so a
-        # very long decimal field produces a policy rejection, not an exception.
         uid_field, gid_field = (
             value.lstrip("0") or "0" for value in (uid_field, gid_field)
         )
@@ -729,864 +625,322 @@ def passwd_sole_root(text):
     return roots == 1
 
 
-def _logical_lines(text):
-    """Unit-file logical lines: backslash continuations joined per systemd."""
-    lines = []
-    buf = ""
-    for line in text.splitlines():
-        if buf:
-            stripped = line.lstrip()
-            if stripped.startswith(("#", ";")):
-                continue
-            line = stripped
-        if line.endswith("\\"):
-            buf += line[:-1] + " "
-            continue
-        buf += line
-        lines.append(buf)
-        buf = ""
-    if buf:
-        lines.append(buf)
-    return lines
+# --- build-time systemd checks (systemd's own resolution) ------------------
 
 
-def _section_assignments(text, target_section):
-    """Ordered (key, value) pairs inside [TARGET_SECTION], whitespace tolerated."""
-    out = []
-    section = None
-    for line in _logical_lines(text):
-        stripped = line.strip()
-        if not stripped or stripped[0] in "#;":
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped[1:-1].strip()
-            continue
-        if section != target_section or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        out.append((key.strip(), value.strip()))
-    return out
+def _require_tool(name):
+    if shutil.which(name) is None:
+        raise PolicyError(f"{name} is required for this check (no fallback)")
 
 
-def _service_assignments(text):
-    """Ordered (key, value) pairs inside [Service], whitespace tolerated."""
-    return _section_assignments(text, "Service")
+def _normalize_cat_config(text, root):
+    """Rewrite systemd-analyze cat-config's ``# <root>/...`` headers to ``# /...``.
 
-
-def _masked(path):
-    try:
-        if not path.is_symlink():
-            return False
-        return os.readlink(path) == "/dev/null" or os.path.realpath(path) == "/dev/null"
-    except OSError:
-        return False
-
-
-def _active_unit_dirs(root):
-    """Unit directories in precedence order, skipping lib/ when usr-merged."""
-    dirs = []
-    lib = root / "lib"
-    for rel in SYSTEMD_UNIT_DIRS:
-        if rel == "lib/systemd/system" and lib.is_symlink():
-            continue
-        dirs.append(rel)
-    return dirs
-
-
-def _scan_dropin_dir(dropin_dir, root, by_name):
-    for conf in _scandir_if_exists(dropin_dir):
-        if not conf.name.endswith(".conf"):
-            continue
-        if conf.name not in by_name:
-            if _masked(conf):
-                by_name[conf.name] = None
-            else:
-                resolved = _resolve_within(root, conf)
-                if resolved is None:
-                    raise PolicyError(f"cannot resolve drop-in {conf}")
-                by_name[conf.name] = resolved
-
-
-def _unit_files(root, unit):
-    """Resolve exact UNIT and its exact UNIT.d drop-ins in load-path precedence order.
-
-    Only the exact units and drop-in directory names created by our build
-    (`systemd-repart.service`, `systemd-repart@.service`, and their `.d`
-    directories) are modeled. Dashed-prefix, instance, alias and unexpected
-    type-wide drop-ins are refused by `_check_repart_refusals`.
+    Only the ``# `` header lines carry the host root prefix; every other line
+    (including the unit's own ``#`` comments) is left byte for byte.
     """
-    root = Path(root)
-    unit_dirs = _active_unit_dirs(root)
-    base = None
-    for directory in unit_dirs:
-        candidate = root / directory / unit
-        if _masked(candidate):
-            return None
-        if candidate.is_file() or candidate.is_symlink():
-            base = _resolve_within(root, candidate)
-            if base is None:
-                raise PolicyError(f"cannot resolve unit {candidate}")
-            break
-    if base is None:
-        return []
-    by_name = {}
-    for directory in unit_dirs:
-        _scan_dropin_dir(root / directory / (unit + ".d"), root, by_name)
-    return [base] + [by_name[n] for n in sorted(by_name) if by_name[n] is not None]
+    prefix = f"# {root}/"
+    lines = []
+    for line in text.split("\n"):
+        if line.startswith(prefix):
+            line = "# /" + line[len(prefix) :]
+        lines.append(line)
+    return "\n".join(lines)
 
 
-def _all_assignments(text):
-    """Every (section, key, value) assignment of a unit file, in order."""
-    out = []
-    section = None
-    for line in _logical_lines(text):
-        stripped = line.strip()
-        if not stripped or stripped[0] in "#;":
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped[1:-1].strip()
-            continue
-        if "=" not in stripped:
-            out.append((section, stripped, None))
-            continue
-        key, value = stripped.split("=", 1)
-        out.append((section, key.strip(), value.strip()))
-    return out
+def _first_diff(expected, actual):
+    exp_lines = expected.split("\n")
+    got_lines = actual.split("\n")
+    for i in range(max(len(exp_lines), len(got_lines))):
+        e = exp_lines[i] if i < len(exp_lines) else "<absent>"
+        g = got_lines[i] if i < len(got_lines) else "<absent>"
+        if e != g:
+            return f"line {i + 1}: expected {e!r}, got {g!r}"
+    return "unknown difference"
 
 
-def _is_checked_dropin_dir(name):
-    """True for NAME.d directories that can change the units checked here."""
-    if not name.endswith(".d"):
-        return False
-    stem = name[:-2]
+def unit_config(root, unit, fixture):
+    """systemd-analyze's own resolution of UNIT in ROOT vs the pinned fixture text."""
+    _require_tool("systemd-analyze")
+    root = Path(root).resolve()
+    fixture = Path(fixture)
+    try:
+        expected = fixture.read_text()
+    except OSError as exc:
+        raise PolicyError(f"cannot read pinned-unit fixture {fixture}: {exc}") from exc
+    rel = f"systemd/system/{unit}"
+    r = subprocess.run(
+        ["systemd-analyze", f"--root={root}", "cat-config", rel],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise PolicyError(
+            f"systemd-analyze cat-config {unit}: {r.stderr.strip() or r.stdout.strip()}"
+        )
+    got = _normalize_cat_config(r.stdout, root)
+    if got != expected:
+        return (
+            False,
+            f"{unit} differs from the pinned text: {_first_diff(expected, got)}",
+        )
+    return True, ""
+
+
+def unit_enabled(root, unit, state):
+    """systemctl --root is-enabled UNIT, pinned to an expected STATE."""
+    _require_tool("systemctl")
+    r = subprocess.run(
+        ["systemctl", f"--root={root}", "is-enabled", unit],
+        capture_output=True,
+        text=True,
+    )
+    got = (r.stdout.strip() or r.stderr.strip()).strip()
+    enabled_states = (
+        "enabled",
+        "enabled-runtime",
+        "static",
+        "alias",
+        "linked",
+        "linked-runtime",
+        "indirect",
+    )
+    if state == "enabled":
+        ok = got in enabled_states
+    elif state == "masked":
+        ok = got == "masked"
+    else:
+        raise PolicyError(f"invalid unit-enabled state {state!r}")
+    if ok:
+        return True, f"{unit} is {got}"
     return (
-        stem == "service"
-        or stem in REPART_UNITS
-        or bool(re.fullmatch(REPART_NAME, stem))
-        or bool(re.fullmatch(REPART_DASHED_DROPIN, stem))
+        False,
+        f"{unit} is {got!r}, expected {'/'.join(enabled_states) if state == 'enabled' else 'masked'}",
     )
 
 
-def _dropin_dir_problems(root, directory, name):
-    """Refusals for one checked NAME.d entry in unit DIRECTORY, before filtering."""
-    rel = f"{directory}/{name}"
-    path = root / rel
-    what = "type-wide drop-in" if name == "service.d" else "repart drop-in"
+def initramfs_unpack(img, dest, lsinitrd_cmd=None):
+    """Unpack IMG with dracut's own lsinitrd --unpack into a fresh DEST."""
+    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
+    _require_tool(cmd[0])
+    dest = Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    r = subprocess.run(
+        cmd + ["--unpack", str(img)], cwd=str(dest), capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        raise PolicyError(
+            f"{cmd[0]} --unpack {img}: {r.stderr.strip() or f'exit {r.returncode}'}"
+        )
+    return dest
+
+
+# --- ESP: the one build-time admission, bound to the built RPM's file list ---
+
+ESP_BASE_ENTRIES = frozenset(
+    (
+        "efi",
+        "efi/boot",
+        "efi/fedora",
+        "efi/boot/bootaa64.efi",
+        "efi/boot/fbaa64.efi",
+        "efi/fedora/bootaa64.csv",
+        "efi/fedora/grub.cfg",
+        "efi/fedora/grubaa64.efi",
+        "efi/fedora/mmmaa64.efi",
+        "efi/fedora/shim.efi",
+        "efi/fedora/shimaa64.efi",
+    )
+)
+ESP_DTB_ENTRIES = frozenset(
+    (
+        "dtb",
+        "dtb/allwinner",
+        "dtb/allwinner/sun60i-a733-cubie-a7a.dtb",
+        "dtb/allwinner/sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb",
+    )
+)
+ESP_DIRS = frozenset(("efi", "efi/boot", "efi/fedora", "dtb", "dtb/allwinner"))
+ESP_DTB = "dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
+ESP_DTB_MARK = ESP_DTB + ".cubie-a7a-dtb"
+PKG_DTB = "usr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
+PKG_DTB_PACKAGE = "cubie-a7a-dtb"
+PKG_DTB_VERSION = "usr/lib/cubie-a7a/dtb/VERSION"
+PKG_ESP_OVERRIDE = "usr/lib/cubie-a7a/dtb/esp-override"
+FW_DTB_STAMP = "var/lib/cubie-a7a/firmware-dtb-version"
+DTB_STAMP_RE = re.compile(rb"[0-9]{1,9}\n")
+
+
+def _dtb_stamp(root, rel):
+    path = Path(root) / rel
     try:
         st = os.lstat(path)
     except OSError as exc:
-        raise PolicyError(f"cannot stat {rel}: {exc}") from exc
-    if stat.S_ISLNK(st.st_mode):
-        return [f"refused symlinked {what} directory {rel}"]
-    if not stat.S_ISDIR(st.st_mode):
-        return [f"refused non-directory {what} entry {rel}"]
-    allowed = ALLOWED_DROPIN_DIRS.get(rel)
-    if allowed is None:
-        return [f"refused unexpected {what} directory {rel}"]
-    problems = []
-    names = set()
-    for child in _scandir_if_exists(path):
-        names.add(child.name)
-        crel = f"{rel}/{child.name}"
-        if child.name not in allowed:
-            problems.append(f"refused unexpected {what} {crel}")
-            continue
-        if not stat.S_ISREG(os.lstat(child).st_mode):
-            problems.append(f"refused non-regular {what} {crel}")
-    for missing in sorted(allowed - names):
-        problems.append(f"refused {what} directory {rel} without {missing}")
-    return problems
+        raise PolicyError(f"malformed DTB stamp {rel}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise PolicyError(f"malformed DTB stamp {rel}: not a regular file")
+    data = path.read_bytes()
+    if not DTB_STAMP_RE.fullmatch(data):
+        raise PolicyError(f"malformed DTB stamp {rel}: {data[:32]!r}")
+    return int(data)
 
 
-def _stock_service_d_problems(root):
-    """The stock type-wide drop-in carries exactly its pinned directive set."""
-    rel = f"{STOCK_SERVICE_D}/{STOCK_SERVICE_D_FILE}"
-    path = root / rel
-    if not path.is_file() or path.is_symlink():
-        return []  # absence or a wrong type is reported by _dropin_dir_problems
-    try:
-        text = path.read_text()
-    except OSError as exc:
-        raise PolicyError(f"cannot read {rel}: {exc}") from exc
-    directives = _all_assignments(text)
-    if directives != STOCK_SERVICE_D_DIRECTIVES:
-        return [
-            f"refused type-wide drop-in {rel}: directives {directives!r} "
-            f"differ from the stock {STOCK_SERVICE_D_DIRECTIVES!r}"
-        ]
-    return []
+def _rpm_dump(rpm_path):
+    """{rel (no leading /): (digest_hex, linkto)} from ``rpm -qp --dump``.
 
-
-def _check_repart_refusals(root):
-    """Refusals made before any filtering: drop-in directories, aliases, overrides.
-
-    Every entry of every unit directory is looked at.  A drop-in directory
-    for the checked units or the type-wide service.d must be one our build
-    produces (ALLOWED_DROPIN_DIRS), a real directory holding exactly the
-    expected regular files; a symlinked or unexpected one (empty included)
-    is refused.  Aliases to or from the checked units are refused.
+    The RPM's own file list: path size mtime digest mode owner group iscfg isdoc
+    rdev symlink.  Directories are skipped; a symlink carries its target and an
+    empty payload digest.
     """
-    root = Path(root)
-    unit_dirs = _active_unit_dirs(root)
-    problems = []
-    alias_names = set()
-    for directory in unit_dirs:
-        dir_path = root / directory
-        for entry in _scandir_if_exists(dir_path):
-            name = entry.name
-            if _is_checked_dropin_dir(name):
-                problems.extend(_dropin_dir_problems(root, directory, name))
-                continue
-            if name.endswith(".d"):
-                continue
-            if name.endswith((".wants", ".requires")) and entry.is_dir():
-                for child in _scandir_if_exists(entry):
-                    if (
-                        re.fullmatch(REPART_NAME, child.name)
-                        and child.name not in REPART_UNITS
-                    ):
-                        problems.append(
-                            f"refused unexpected repart unit {directory}/{name}/{child.name}"
-                        )
-                continue
-            if re.fullmatch(REPART_NAME, name) and name not in REPART_UNITS:
-                problems.append(f"refused unexpected repart unit {directory}/{name}")
-            if name in REPART_UNITS and not entry.is_symlink():
-                if f"{directory}/{name}" != f"usr/lib/systemd/system/{name}":
-                    problems.append(
-                        f"refused unit override {directory}/{name} (only the stock "
-                        f"usr/lib/systemd/system/{name} is accepted)"
-                    )
-            if entry.is_symlink() and not _masked(entry):
-                try:
-                    raw_target = os.readlink(entry)
-                except OSError as exc:
-                    raise PolicyError(f"cannot read symlink {entry}: {exc}") from exc
-                resolved = _resolve_within(root, entry)
-                raw_base = Path(raw_target).name
-                res_base = resolved.name if resolved is not None else ""
-                if name in REPART_UNITS:
-                    problems.append(
-                        f"refused alias symlink from checked unit {directory}/{name} -> {raw_target}"
-                    )
-                    alias_names.add(name)
-                elif re.fullmatch(REPART_NAME, raw_base) or re.fullmatch(
-                    REPART_NAME, res_base
-                ):
-                    problems.append(
-                        f"refused alias symlink to checked unit {directory}/{name} -> {raw_target}"
-                    )
-                    alias_names.add(name)
-    problems.extend(_stock_service_d_problems(root))
-    for alias in sorted(alias_names):
-        for directory in unit_dirs:
-            alias_d = root / directory / f"{alias}.d"
-            if alias_d.is_dir() or alias_d.is_symlink():
-                problems.append(
-                    f"refused alias drop-in directory {directory}/{alias}.d"
-                )
-    return problems
-
-
-def repart_dropin_text(unit, unit_text):
-    """The exact no-discard drop-in mkdevcard writes for UNIT, from its stock text.
-
-    Refuses (PolicyError) a unit whose own [Service] ExecStart is not the
-    pinned stock command line: the drop-in would then have to be adapted.
-    """
-    stock = REPART_STOCK_EXECSTART.get(unit)
-    if stock is None:
-        raise PolicyError(f"{unit} is not a checked systemd-repart unit")
-    own = [v for k, v in _service_assignments(unit_text) if k == "ExecStart"]
-    if own != [stock]:
-        raise PolicyError(
-            f"{unit}: ExecStart {own!r} is not the pinned stock [{stock!r}]; "
-            "adapt the no-discard drop-in"
-        )
-    return (
-        REPART_DROPIN_HEADER
-        + "[Service]\nExecStart=\n"
-        + f"ExecStart={stock} {DISCARD_FLAG}\n"
+    r = subprocess.run(
+        ["rpm", "-qp", "--dump", str(rpm_path)], capture_output=True, text=True
     )
+    if r.returncode != 0:
+        raise PolicyError(
+            f"rpm -qp --dump {rpm_path}: {r.stderr.strip() or f'exit {r.returncode}'}"
+        )
+    index = {}
+    for number, line in enumerate(r.stdout.splitlines(), 1):
+        parts = line.split()
+        if len(parts) < 11:
+            raise PolicyError(f"{rpm_path}:{number}: malformed rpm --dump row {line!r}")
+        rel = parts[0].lstrip("/")
+        mode = parts[4]
+        if mode.startswith("04"):
+            continue  # directory
+        linkto = "" if parts[10] == "X" else parts[10]
+        digest = "" if linkto else parts[3].lower()
+        index[rel] = (digest, linkto)
+    return index
 
 
-def _effective_exec_start(files):
-    """Effective [Service] ExecStart commands after applying FILES in order.
-
-    An empty ``ExecStart=`` resets the list, as systemd does; a later
-    assignment appends.  Indented lines and whitespace around ``=`` are
-    handled by ``_service_assignments``.  Returns None if any file cannot
-    be read (fail closed).
-    """
-    commands = []
-    for path in files:
-        if not path.is_file():
-            return None
-        try:
-            text = path.read_text()
-        except OSError:
-            return None
-        for key, value in _service_assignments(text):
-            if key != "ExecStart":
-                continue
-            if value == "":
-                commands = []
-            else:
-                commands.append(value)
-    return commands
+def _rpm_payload_sha256(records, rel, rpm_path):
+    """The sha256 the RPM records for REL, or a PolicyError."""
+    entry = records.get(rel)
+    if entry is None:
+        raise PolicyError(f"{rpm_path} does not own {rel}")
+    digest, linkto = entry
+    if linkto or not SHA256_HEX_RE.fullmatch(digest):
+        raise PolicyError(f"{rpm_path} records no sha256 for {rel}")
+    return digest
 
 
-def _command_carries_no_discard(command):
-    """True when COMMAND's effective --discard option is --discard=no."""
-    cmd = command.lstrip("@-:+!")
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    discard = None
-    for tok in tokens[1:]:
-        if tok == "--":
-            break
-        if tok == DISCARD_FLAG:
-            discard = "no"
-        elif tok == "--discard" or tok.startswith("--discard="):
-            discard = "other"
-    return discard == "no"
+def esp_staged(root, esp_dir, dtb_rpm, overlay=None):
+    """The one ESP admission rule, at build, on the staged tree before mtools.
 
-
-def _carries_no_discard(commands):
-    return bool(commands) and all(_command_carries_no_discard(c) for c in commands)
-
-
-def _grow_root_problems(root, grow_root):
-    """GROW_ROOT=yes: the stock unit present, unmasked, enabled, our repart.d.
-
-    GROW_ROOT=no: the unit masked in /etc (-> /dev/null) and no repart.d.
-    """
-    problems = []
-    if grow_root not in ("yes", "no"):
-        raise PolicyError(f"invalid GROW_ROOT {grow_root!r} (yes or no)")
-    unit_rel = f"usr/lib/systemd/system/{REPART_MAIN}"
-    unit = root / unit_rel
-    masks = []
-    for directory in _active_unit_dirs(root):
-        cand = root / directory / REPART_MAIN
-        if _masked(cand):
-            masks.append(f"{directory}/{REPART_MAIN}")
-    confs = []
-    for rel in REPART_REPARTD:
-        for entry in _scandir_if_exists(root / rel):
-            confs.append(f"{rel}/{entry.name}")
-    if grow_root == "yes":
-        if not unit.is_file() or unit.is_symlink():
-            problems.append(f"GROW_ROOT=yes but {unit_rel} is missing")
-        for mask in masks:
-            problems.append(f"GROW_ROOT=yes but {REPART_MAIN} is masked ({mask})")
-        link, target = REPART_ENABLE_LINK
-        lpath = root / link
-        if not lpath.is_symlink() or os.readlink(lpath) != target:
-            problems.append(
-                f"GROW_ROOT=yes but {REPART_MAIN} is not enabled ({link} -> {target})"
-            )
-        conf_rel, conf_text = REPART_ROOT_CONF
-        if confs != [conf_rel]:
-            problems.append(
-                f"GROW_ROOT=yes needs exactly {conf_rel} in repart.d, found {confs!r}"
-            )
-        else:
-            cpath = root / conf_rel
-            if cpath.is_symlink() or not cpath.is_file():
-                problems.append(f"{conf_rel} is not a regular file")
-            elif cpath.read_text() != conf_text:
-                problems.append(f"{conf_rel} differs from {conf_text!r}")
-    else:
-        mask = root / REPART_MASK
-        if not (mask.is_symlink() and os.readlink(mask) == "/dev/null"):
-            problems.append(f"GROW_ROOT=no but {REPART_MASK} is not -> /dev/null")
-        if confs:
-            problems.append(f"GROW_ROOT=no but repart.d holds {confs!r}")
-    return problems
-
-
-def repart_root_ok(root, grow_root=None):
-    """Our build's systemd-repart configuration, pinned; the same rule at build and verify.
-
-    Refusals before filtering (_check_repart_refusals); then for each checked
-    unit present and not masked: its own ExecStart is the pinned stock
-    command, its drop-in is byte-for-byte the one mkdevcard writes, and the
-    effective command is the stock one plus --discard=no.  GROW_ROOT (yes or
-    no, root only) adds _grow_root_problems.
+    Order: the stamps are validated first (a malformed one is refused, never
+    read as "no DTB"); the DTB bytes, the VERSION file and the esp-override
+    presence are bound to the built cubie-a7a-dtb RPM's own file list; the
+    entry set with types is exactly our build's.  Returns (ok, problems).
     """
     root = Path(root)
-    problems = _check_repart_refusals(root)
-    unit_dirs = _active_unit_dirs(root)
-    repart_service_seen = False
-    for unit in REPART_UNITS:
-        if any(
-            "alias symlink from checked unit" in p and f"/{unit} -> " in p
-            for p in problems
-        ):
-            continue
-        files = _unit_files(root, unit)
-        dropin_rel = f"etc/systemd/system/{unit}.d/{REPART_DROPIN_NAME}"
-        dropin = root / dropin_rel
-        if files == []:
-            if dropin.exists() or dropin.is_symlink():
-                problems.append(f"{dropin_rel} present without {unit}")
-            continue
-        if unit == REPART_MAIN:
-            repart_service_seen = True
-        if files is None:
-            continue  # masked: cannot run (GROW_ROOT rules below)
-        for path in files:
-            if not path.is_file():
-                continue
-            try:
-                text = path.read_text()
-            except OSError:
-                continue
-            for key, value in _section_assignments(text, "Install"):
-                if key != "Alias":
-                    continue
-                rel = path.relative_to(root.resolve()).as_posix()
-                problems.append(f"refused [Install] Alias={value!r} in {rel}")
-                for alias in value.split():
-                    for directory in unit_dirs:
-                        if (root / directory / f"{alias}.d").is_dir():
-                            problems.append(
-                                f"refused alias drop-in directory {directory}/{alias}.d"
-                            )
-        try:
-            expected = repart_dropin_text(unit, files[0].read_text())
-        except (PolicyError, OSError) as exc:
-            problems.append(f"{unit}: {exc}")
-            expected = None
-        if expected is not None:
-            if dropin.is_symlink() or not dropin.is_file():
-                problems.append(f"{unit}: missing {dropin_rel}")
-            elif dropin.read_text() != expected:
-                problems.append(
-                    f"{unit}: {dropin_rel} differs from the drop-in mkdevcard writes"
-                )
-        commands = _effective_exec_start(files)
-        if commands is None:
-            problems.append(f"{unit}: unreadable unit or drop-in")
-        elif not _carries_no_discard(commands):
-            problems.append(f"{unit} runs {commands!r} without {DISCARD_FLAG}")
-        elif commands != [f"{REPART_STOCK_EXECSTART[unit]} {DISCARD_FLAG}"]:
-            problems.append(f"{unit} runs {commands!r}, not the pinned command line")
-    configs = []
-    for rel in REPART_REPARTD:
-        for entry in _scandir_if_exists(root / rel):
-            if entry.name.endswith(".conf") and entry.is_file():
-                configs.append(entry)
-    if configs and not repart_service_seen:
-        problems.append("repart.d configuration without systemd-repart.service")
-    if grow_root is not None:
-        problems.extend(_grow_root_problems(root, grow_root))
-    return (not problems, problems)
-
-
-LSINITRD_RULE = "=" * 72
-LS_ROW_RE = re.compile(r"^([dlcbps-])[rwxsStT-]{9}[.+@]?\s")
-CPIO_NEWC_MAGICS = (b"070701", b"070702")
-ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
-
-
-def _norm_archive_path(name):
-    rel = name.lstrip("/")
-    while rel.startswith("./"):
-        rel = rel[2:]
-    return rel if rel else "."
-
-
-def _decompress_zstd_single_frame(data, start_pos):
-    """Decompress exactly one complete zstd frame spanning START_POS to EOF.
-
-    Pinned to what our build produces: Fedora's dracut compresses the main
-    archive with zstd (dracut-cubie-a7a.conf and
-    /usr/lib/dracut/dracut.conf.d/01-dist.conf leave compress unset,
-    /usr/bin/dracut selects $DRACUT_COMPRESS_ZSTD first, the dracut RPM
-    requires zstd) as one frame; the real a7a-fedora-01 initramfs is one frame
-    consuming all of its bytes. Frames are never joined: Linux decompresses
-    each frame and requires every cpio header to lie within one
-    (lib/decompress_unzstd.c, init/initramfs.c), so a second frame, a
-    skippable frame, a truncated frame, another compressor or trailing bytes
-    is refused ("multi-frame zstd initramfs rejected").
-    """
-    try:
-        zstd = importlib.import_module("compression.zstd")
-    except ImportError as exc:
-        raise PolicyError(
-            f"compression.zstd is unavailable to verify zstd initramfs: {exc}"
-        ) from exc
-    view = memoryview(data)
-    pos = start_pos
-    length = len(data)
-    if pos >= length:
-        raise PolicyError("missing zstd initramfs payload")
-    if bytes(view[pos : pos + 4]) != ZSTD_MAGIC:
-        raise PolicyError(
-            f"refused non-zstd initramfs payload at offset {pos}: "
-            f"{bytes(view[pos : pos + 8])!r}"
-        )
-    dec = zstd.ZstdDecompressor()
-    try:
-        out = dec.decompress(view[pos:])
-    except Exception as exc:
-        raise PolicyError(
-            f"truncated or corrupt zstd initramfs frame at offset {pos}: {exc}"
-        ) from exc
-    if not dec.eof:
-        raise PolicyError(
-            f"truncated zstd initramfs frame at offset {pos}: missing end-of-frame"
-        )
-    if dec.unused_data:
-        end = length - len(dec.unused_data)
-        raise PolicyError(
-            f"refused multi-frame zstd initramfs: {len(dec.unused_data)} bytes after "
-            f"the zstd frame ending at offset {end} "
-            f"({bytes(dec.unused_data[:8])!r}); exactly one frame is accepted"
-        )
-    return out
-
-
-def _parse_cpio_one(data, offset):
-    """Parse one cpio newc/crc archive starting at OFFSET, requiring TRAILER!!!.
-
-    Returns ([(kind, rel, meta, mode, payload)], end).  KIND is file, symlink
-    or other; META is the file size or the symlink target; PAYLOAD is the
-    record's raw data bytes, straight from the archive.
-    """
-    entries = []
-    pos = offset
-    length = len(data)
-    while True:
-        if pos + 110 > length:
-            raise PolicyError("truncated cpio header before TRAILER!!!")
-        magic = data[pos : pos + 6]
-        if magic not in CPIO_NEWC_MAGICS:
-            raise PolicyError(f"bad cpio magic {magic!r} at offset {pos}")
-        try:
-            fields = [
-                int(data[pos + 6 + i * 8 : pos + 14 + i * 8], 16) for i in range(13)
-            ]
-        except ValueError as exc:
-            raise PolicyError(f"corrupt cpio header at offset {pos}") from exc
-        mode, filesize, namesize = fields[1], fields[6], fields[11]
-        pos += 110
-        if namesize < 1 or pos + namesize > length:
-            raise PolicyError("truncated cpio entry name before TRAILER!!!")
-        raw_name = data[pos : pos + namesize]
-        nul_idx = raw_name.find(b"\x00")
-        if nul_idx < 0 or not raw_name.endswith(b"\x00"):
-            raise PolicyError("unterminated cpio entry name")
-        if any(byte != 0 for byte in raw_name[nul_idx:]):
-            raise PolicyError("non-NUL byte after NUL terminator in cpio entry name")
-        if nul_idx == 0:
-            raise PolicyError("empty cpio entry name")
-        name = os.fsdecode(raw_name[:nul_idx])
-        pos += namesize + (-(110 + namesize)) % 4
-        if pos + filesize > length:
-            raise PolicyError(f"truncated cpio payload for {name!r}")
-        payload = data[pos : pos + filesize]
-        pos += filesize + (-filesize) % 4
-        if name == "TRAILER!!!":
-            return entries, pos
-        rel = _norm_archive_path(name)
-        if stat.S_ISLNK(mode):
-            entries.append(("symlink", rel, os.fsdecode(payload), mode, payload))
-        elif stat.S_ISREG(mode):
-            entries.append(("file", rel, filesize, mode, payload))
-        else:
-            entries.append(("other", rel, 0, mode, payload))
-
-
-def _cpio_records_stream(data):
-    """Raw records of one or more concatenated cpio newc/crc archives."""
-    entries = []
-    pos = 0
-    length = len(data)
-    archives = 0
-    while pos < length:
-        while pos < length and data[pos] == 0:
-            pos += 1
-        if pos >= length:
-            break
-        if data[pos : pos + 6] not in CPIO_NEWC_MAGICS:
-            raise PolicyError(f"trailing non-cpio bytes at offset {pos}")
-        part, pos = _parse_cpio_one(data, pos)
-        entries.extend(part)
-        archives += 1
-    if archives == 0 or not entries:
-        raise PolicyError("cpio archive contains no entries")
-    return entries
-
-
-def parse_cpio_records(archive_path):
-    """Independently parse our build's initramfs (optional early cpio + zstd cpio).
-
-    Leading uncompressed early-CPIO segments (if present) must each end cleanly
-    at TRAILER!!! with only NUL alignment bytes before the zstd payload. The
-    main payload must be exactly one complete zstd frame ending at EOF, and
-    its decompressed cpio stream(s) must each terminate cleanly at TRAILER!!!.
-    Returns raw records (kind, rel, meta, mode, payload) in archive order.
-    """
-    path = Path(archive_path)
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise PolicyError(f"cannot read initramfs {path}: {exc}") from exc
-    if not data:
-        raise PolicyError(f"empty initramfs archive {path}")
-    entries = []
-    pos = 0
-    length = len(data)
-    while pos < length:
-        while pos < length and data[pos] == 0:
-            pos += 1
-        if pos >= length:
-            raise PolicyError(
-                f"refused uncompressed-only initramfs {path} (expected zstd main payload)"
-            )
-        if data[pos : pos + 6] in CPIO_NEWC_MAGICS:
-            part, pos = _parse_cpio_one(data, pos)
-            entries.extend(part)
-            continue
-        break
-    decompressed = _decompress_zstd_single_frame(data, pos)
-    entries.extend(_cpio_records_stream(decompressed))
-    if not entries:
-        raise PolicyError(f"initramfs {path} contains no entries")
-    return entries
-
-
-def parse_cpio_initramfs(archive_path):
-    """(kind, rel, meta) of every record of the initramfs at ARCHIVE_PATH."""
-    return [rec[:3] for rec in parse_cpio_records(archive_path)]
-
-
-def _parse_ls_row(line):
-    """Parse one lsinitrd `ls -l` row -> (kind, rel, meta), or raise PolicyError."""
-    match = LS_ROW_RE.match(line)
-    if not match:
-        raise PolicyError(f"malformed lsinitrd listing row: {line!r}")
-    ftype = match.group(1)
-    if ftype in ("c", "b"):
-        parts = line.split(None, 9)
-        if len(parts) < 10 or not parts[4].endswith(",") or not parts[5].isdigit():
-            raise PolicyError(f"malformed lsinitrd device row: {line!r}")
-        return ("other", _norm_archive_path(parts[9]), 0)
-    parts = line.split(None, 8)
-    if len(parts) < 9 or not parts[4].isdigit():
-        raise PolicyError(f"malformed lsinitrd listing row: {line!r}")
-    size_str, rest = parts[4], parts[8]
-    if ftype == "l":
-        if " -> " not in rest:
-            raise PolicyError(f"malformed lsinitrd symlink row: {line!r}")
-        rel, target = rest.split(" -> ", 1)
-        return ("symlink", _norm_archive_path(rel), target)
-    if ftype == "-":
-        return ("file", _norm_archive_path(rest), int(size_str))
-    return ("other", _norm_archive_path(rest), 0)
-
-
-def _parse_lsinitrd_listing(listing):
-    """Parse lsinitrd stdout requiring opening and closing 72-'=' section framing.
-
-    Returns all_rows, a list of (kind, relpath, size_or_target) across every
-    file-listing section; only the path set is used (a completeness
-    cross-check), never lsinitrd's types, targets or bytes.
-    Raises PolicyError on missing closing separator, malformed listing row, or
-    empty listing.
-    """
-    lines = listing.splitlines()
-    rule_indices = [i for i, line in enumerate(lines) if line == LSINITRD_RULE]
-    if len(rule_indices) < 2:
-        raise PolicyError("incomplete lsinitrd listing: missing closing separator")
-    # If file-listing rows appear after the last closing separator, output was truncated.
-    trailing = lines[rule_indices[-1] + 1 :]
-    if any(LS_ROW_RE.match(line) for line in trailing):
-        raise PolicyError(
-            "incomplete lsinitrd listing: truncated after file rows without closing separator"
-        )
-    all_rows = []
-    for idx in range(len(rule_indices) - 1):
-        section = [
-            line
-            for line in lines[rule_indices[idx] + 1 : rule_indices[idx + 1]]
-            if line
-        ]
-        if not section:
-            continue
-        if not any(LS_ROW_RE.match(line) for line in section):
-            continue
-        for line in section:
-            kind, rel, meta = _parse_ls_row(line)
-            all_rows.append((kind, rel, meta))
-    if not all_rows:
-        raise PolicyError("incomplete lsinitrd listing: no recognized file rows")
-    return all_rows
-
-
-def inspect_initramfs(img, lsinitrd_cmd=None, archive_path=None):
-    """Raw cpio records of IMG, cross-checked for completeness against lsinitrd.
-
-    Returns the records (kind, rel, meta, mode, payload) parsed from the
-    archive bytes; types, symlink targets and file bytes come only from
-    those records.  Raises PolicyError if lsinitrd fails, emits stderr, lacks
-    closing section framing, or lists a different path set.
-    """
-    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
-    listing = subprocess.run(cmd + [str(img)], capture_output=True, text=True)
-    if listing.returncode != 0 or listing.stderr.strip():
-        msg = listing.stderr.strip() or listing.stdout.strip() or "lsinitrd failed"
-        raise PolicyError(f"cannot inspect initramfs {img}: {msg}")
-    all_rows = _parse_lsinitrd_listing(listing.stdout)
-    archive = Path(archive_path) if archive_path is not None else Path(img)
-    records = parse_cpio_records(archive)
-    listed_paths = sorted(rel for _, rel, _ in all_rows)
-    cpio_paths = sorted(rec[1] for rec in records)
-    if listed_paths != cpio_paths:
-        raise PolicyError(
-            f"initramfs {img} listing mismatch: lsinitrd reported {len(listed_paths)} "
-            f"entries, cpio archive holds {len(cpio_paths)}"
-        )
-    return records
-
-
-def _materialize_unit_tree(records, tree):
-    """Write every cpio record under a unit or repart.d directory into TREE.
-
-    Nothing is filtered by name: every directory, symlink and file under the
-    systemd unit directories and repart.d directories (and a top-level lib
-    symlink) is recreated with its archive type, target and bytes, so the
-    same tree checks run on the initramfs as on the root.
-    """
-    prefixes = tuple(SYSTEMD_UNIT_DIRS) + REPART_REPARTD
-    kinds = {}
-    for kind, rel, meta, mode, payload in records:
-        parts = Path(rel).parts
-        if rel == "." or ".." in parts or Path(rel).is_absolute():
-            if rel == ".":
-                continue
-            raise PolicyError(f"invalid initramfs path: {rel}")
-        wanted = rel == "lib" or any(
-            rel == pre or rel.startswith(pre + "/") or pre.startswith(rel + "/")
-            for pre in prefixes
-        )
-        if not wanted:
-            continue
-        is_dir = stat.S_ISDIR(mode)
-        new_kind = "dir" if is_dir else kind
-        if rel in kinds:
-            if kinds[rel] == "dir" and new_kind == "dir":
-                continue
-            raise PolicyError(f"duplicate initramfs path: {rel}")
-        dest = tree / rel
-        for i in range(1, len(parts)):
-            anc = "/".join(parts[:i])
-            if kinds.get(anc, "dir") != "dir":
-                raise PolicyError(
-                    f"initramfs entry {rel} lies under non-directory {anc}"
-                )
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if is_dir:
-            dest.mkdir(exist_ok=True)
-        elif kind == "symlink":
-            dest.symlink_to(meta)
-        elif kind == "file":
-            dest.write_bytes(payload)
-        else:
-            raise PolicyError(f"unexpected special file in a unit directory: {rel}")
-        kinds[rel] = new_kind
-
-
-def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False, archive_path=None):
-    """Check IMG's systemd-repart units with the same rule as the root.
-
-    Units, drop-ins and directories come from the raw cpio records (types,
-    targets and bytes), recreated unfiltered and checked by repart_tree_problems.
-    With FORBID_REPART (GROW_ROOT=no) no systemd-repart unit or repart.d
-    configuration may be active.  Fails closed on any listing or parse error.
-    """
-    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
-    try:
-        records = inspect_initramfs(img, lsinitrd_cmd=cmd, archive_path=archive_path)
-    except PolicyError as exc:
-        return False, [str(exc)]
-    with tempfile.TemporaryDirectory(prefix="a7a-initramfs-repart-") as td:
-        tree = Path(td)
-        try:
-            _materialize_unit_tree(records, tree)
-        except PolicyError as exc:
-            return False, [str(exc)]
-        if forbid_repart:
-            problems = _check_repart_refusals(tree)
-            for unit in REPART_UNITS:
-                files = _unit_files(tree, unit)
-                if files:
-                    problems.append(f"initramfs contains active {unit}")
-            for rel_dir in REPART_REPARTD:
-                if any(
-                    entry.name.endswith(".conf")
-                    for entry in _scandir_if_exists(tree / rel_dir)
-                ):
-                    problems.append(f"initramfs contains repart.d config in {rel_dir}")
-            return (not problems, problems)
-        return repart_root_ok(tree)
-
-
-def initramfs_check(
-    img,
-    lsinitrd_cmd=None,
-    archive_path=None,
-    require_paths=(),
-    forbid_paths=(),
-    file_rel=None,
-    require_text=(),
-    forbid_text=(),
-):
-    """Verify path and member-text requirements against a completeness-checked initramfs."""
-    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
-    try:
-        records = inspect_initramfs(img, lsinitrd_cmd=cmd, archive_path=archive_path)
-    except PolicyError as exc:
-        return False, [str(exc)]
     problems = []
-    paths = [rec[1] for rec in records]
-    for pattern in require_paths:
-        if not any(re.search(pattern, p) for p in paths):
-            problems.append(f"initramfs {img} missing path matching {pattern!r}")
-    for pattern in forbid_paths:
-        if any(re.search(pattern, p) for p in paths):
+    # The passed RPM must be the DTB package.
+    q = subprocess.run(
+        ["rpm", "-qp", "--qf", "%{NAME}", str(dtb_rpm)], capture_output=True, text=True
+    )
+    if q.returncode != 0 or q.stdout.strip() != PKG_DTB_PACKAGE:
+        return False, [f"{dtb_rpm} is not a {PKG_DTB_PACKAGE} RPM"]
+    fw = _dtb_stamp(root, FW_DTB_STAMP)
+    records = _rpm_dump(dtb_rpm)
+    pkg_dtb_digest = _rpm_payload_sha256(records, PKG_DTB, dtb_rpm)
+    pkg_version_digest = _rpm_payload_sha256(records, PKG_DTB_VERSION, dtb_rpm)
+    # VERSION in the staged root must be the RPM's own VERSION payload.
+    root_version = root / PKG_DTB_VERSION
+    if root_version.is_symlink() or not root_version.is_file():
+        problems.append(f"{PKG_DTB_VERSION} missing or not a regular file in the root")
+    elif _file_digest(root_version, "sha256") != pkg_version_digest:
+        problems.append(
+            f"{PKG_DTB_VERSION} differs from the {PKG_DTB_PACKAGE} RPM payload"
+        )
+    # The esp-override is a regular file iff the RPM owns that file.
+    root_override = root / PKG_ESP_OVERRIDE
+    ov_entry = records.get(PKG_ESP_OVERRIDE)
+    has_override = ov_entry is not None and ov_entry[1] == ""
+    override_present = root_override.is_file() and not root_override.is_symlink()
+    if has_override != override_present:
+        problems.append(
+            f"{PKG_ESP_OVERRIDE} presence ({override_present}) disagrees with "
+            f"the {PKG_DTB_PACKAGE} RPM ({has_override})"
+        )
+    pkg = _dtb_stamp(root, PKG_DTB_VERSION)
+    expect_dtb = has_override or pkg > fw
+
+    entries = {}
+    base = Path(esp_dir)
+
+    def on_error(exc):
+        raise PolicyError(f"cannot traverse {exc.filename or base}: {exc}") from exc
+
+    for dirpath, dirnames, filenames in os.walk(base, onerror=on_error):
+        cur = Path(dirpath)
+        for name in sorted(dirnames) + sorted(filenames):
+            path = cur / name
+            rel = path.relative_to(base).as_posix()
+            key = rel.lower()
+            mode = os.lstat(path).st_mode
+            if stat.S_ISDIR(mode):
+                kind = "dir"
+            elif stat.S_ISREG(mode):
+                kind = "file"
+            else:
+                problems.append(f"ESP entry {rel} is neither a file nor a directory")
+                continue
+            if key in entries:
+                problems.append(f"ESP entries collide on FAT: {rel}")
+                continue
+            entries[key] = kind
+
+    expected = {
+        rel: ("dir" if rel in ESP_DIRS else "file")
+        for rel in (
+            ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
+        )
+    }
+    missing = sorted(set(expected) - set(entries))
+    extra = sorted(set(entries) - set(expected))
+    wrong = sorted(
+        f"{rel} is a {entries[rel]}, expected a {kind}"
+        for rel, kind in expected.items()
+        if rel in entries and entries[rel] != kind
+    )
+    if missing:
+        problems.append(f"ESP missing={missing}")
+    if extra:
+        problems.append(f"ESP extra={extra}")
+    if wrong:
+        problems.append(f"ESP wrong type={wrong}")
+    if expect_dtb and not missing and not extra and not wrong:
+        dtb_bytes = (base / ESP_DTB).read_bytes()
+        got = hashlib.sha256(dtb_bytes).hexdigest()
+        if got != pkg_dtb_digest:
             problems.append(
-                f"initramfs {img} contains forbidden path matching {pattern!r}"
+                f"ESP {ESP_DTB} sha256 {got} is not the packaged DTB's {pkg_dtb_digest}"
             )
-    if file_rel is not None:
-        norm = _norm_archive_path(file_rel)
-        matches = [rec for rec in records if rec[1] == norm and rec[0] == "file"]
-        if not matches:
-            if require_text:
-                problems.append(f"initramfs {img} missing file {norm}")
-        else:
-            # The bytes of the last record for the path (what the kernel
-            # unpacks last), straight from the archive.
-            text = matches[-1][4].decode("utf-8", errors="replace")
-            for pattern in require_text:
-                if not re.search(pattern, text):
-                    problems.append(
-                        f"{norm} in {img} missing text matching {pattern!r}"
-                    )
-            for pattern in forbid_text:
-                if re.search(pattern, text):
-                    problems.append(
-                        f"{norm} in {img} contains forbidden text matching {pattern!r}"
-                    )
+        mark = (base / ESP_DTB_MARK).read_bytes()
+        if mark != (pkg_dtb_digest + "\n").encode():
+            problems.append(f"ESP {ESP_DTB_MARK} does not hold the DTB's digest")
     return (not problems, problems)
 
+
+def overlay_esp_entries(overlay):
+    """OVERLAY entries that would land on the ESP (our ESP is packages only)."""
+    base = Path(overlay) / "boot"
+    if not (base.exists() or base.is_symlink()):
+        return []
+    if base.is_symlink() or not base.is_dir():
+        return [str(base)]
+    efi = base / "efi"
+    if not (efi.exists() or efi.is_symlink()):
+        return []
+    if efi.is_symlink() or not efi.is_dir():
+        return [str(efi)]
+    return sorted(str(p) for p in efi.rglob("*"))
+
+
+# --- checked RPM manifests (NEVRA, %{ARCH}, sha256) --------------------------
 
 REQUIRED_BOARD_PACKAGES = ("cubie-a7a-dtb", "cubie-a7a-board-support")
 OPTIONAL_NOARCH_PACKAGES = (
@@ -1598,10 +952,24 @@ OPTIONAL_NOARCH_PACKAGES = (
     "cubie-a7a-aic8800-usb",
 )
 OPTIONAL_AARCH64_PACKAGES = ("cubie-a7a-fwlog",)
-SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32,64}$")
 RPM_MANIFEST_VERSION = 3
 FWLOG_SRPM_PACKAGE = "cubie-a7a-fwlog"
+
+
+def _rpm_name_nevra_arch(path):
+    """(name, NEVRA, ARCH) of the RPM at PATH, or a PolicyError."""
+    r = subprocess.run(
+        ["rpm", "-qp", "--qf", "%{NAME} %{NEVRA} %{ARCH}", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        raise PolicyError(f"cannot read RPM identity from {path}: {r.stderr.strip()}")
+    fields = r.stdout.strip().split()
+    if len(fields) != 3 or not all(fields):
+        raise PolicyError(f"bad RPM identity from {path}: {r.stdout.strip()!r}")
+    return fields[0], fields[1], fields[2]
 
 
 def _srpm_record(rpms_dir, srpm_path):
@@ -1669,11 +1037,8 @@ def write_rpm_manifest(
 ):
     """Write an atomic checked-RPM manifest bound to one run_id with sha256s.
 
-    noarch: with EXPECT_AARCH64 the fwlog SRPM this run built (SRPM) is
-    recorded by path and sha256.  aarch64: bound to the noarch manifest
-    BIND_NOARCH, whose sha256 must still be BIND_NOARCH_SHA256 (the value
-    stage-srpm read at the start of the rebuild), and every RPM must have
-    been built from the recorded SRPM.
+    Every RPM is recorded as {package, nevra, arch, relpath, sha256}; ARCH must
+    be noarch (kind=noarch) or aarch64 (kind=aarch64) as the package expects.
     """
     srpm_record = None
     noarch_sha = None
@@ -1707,35 +1072,31 @@ def write_rpm_manifest(
                 f"{bind_noarch} changed during the run (sha256 {noarch_sha}, "
                 f"bound {bind_noarch_sha256}): refusing to bind"
             )
-        if bind_noarch is not None:
-            _, bound_run_id, bound_expect, bound_data = _load_rpm_manifest(
-                rpms_dir,
-                bind_noarch,
-                "noarch",
-                set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES),
+        _, bound_run_id, bound_expect, bound_data = _load_rpm_manifest(
+            rpms_dir,
+            bind_noarch,
+            "noarch",
+            set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES),
+        )
+        if _file_digest(bind_noarch, "sha256") != bind_noarch_sha256:
+            raise PolicyError(f"{bind_noarch} changed during the run: refusing to bind")
+        if not bound_expect:
+            raise PolicyError(
+                f"{bind_noarch}: noarch run did not expect aarch64 packages (FWREPO=none)"
             )
-            if _file_digest(bind_noarch, "sha256") != bind_noarch_sha256:
-                raise PolicyError(
-                    f"{bind_noarch} changed during the run: refusing to bind"
-                )
-            if not bound_expect:
-                raise PolicyError(
-                    f"{bind_noarch}: noarch run did not expect aarch64 packages (FWREPO=none)"
-                )
-            if run_id is not None and run_id != bound_run_id:
-                raise PolicyError(
-                    f"run_id {run_id!r} disagrees with bound noarch manifest run_id {bound_run_id!r}"
-                )
-            run_id = bound_run_id
-            srpm_record = bound_data["srpm"]
-            srpm_path = _check_srpm_record(rpms_dir, srpm_record, bind_noarch)
-        if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
-            raise PolicyError(f"invalid run_id: {run_id!r}")
+        if run_id is not None and run_id != bound_run_id:
+            raise PolicyError(
+                f"run_id {run_id!r} disagrees with bound noarch manifest run_id {bound_run_id!r}"
+            )
+        run_id = bound_run_id
+        srpm_record = bound_data["srpm"]
+        srpm_path = _check_srpm_record(rpms_dir, srpm_record, bind_noarch)
     allowed = (
         set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES)
         if kind == "noarch"
         else set(OPTIONAL_AARCH64_PACKAGES)
     )
+    expected_arch = "noarch" if kind == "noarch" else "aarch64"
     base = Path(rpms_dir).resolve()
     records = []
     seen = set()
@@ -1747,14 +1108,11 @@ def write_rpm_manifest(
             rel = path.relative_to(base).as_posix()
         except ValueError as exc:
             raise PolicyError(f"RPM {path} is outside {base}") from exc
-        res = subprocess.run(
-            ["rpm", "-qp", "--qf", "%{NAME}", str(path)],
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode != 0 or not res.stdout.strip():
-            raise PolicyError(f"cannot read RPM name from {path}: {res.stderr.strip()}")
-        pkg = res.stdout.strip()
+        pkg, nevra, arch = _rpm_name_nevra_arch(path)
+        if arch != expected_arch:
+            raise PolicyError(
+                f"{path} has ARCH {arch!r}, expected {expected_arch!r} for this run"
+            )
         if kind == "aarch64":
             src = subprocess.run(
                 ["rpm", "-qp", "--qf", "%{SOURCERPM}", str(path)],
@@ -1772,7 +1130,13 @@ def write_rpm_manifest(
             raise PolicyError(f"duplicate {kind} board RPM package in run: {pkg}")
         seen.add(pkg)
         records.append(
-            {"package": pkg, "relpath": rel, "sha256": _file_digest(path, "sha256")}
+            {
+                "package": pkg,
+                "nevra": nevra,
+                "arch": arch,
+                "relpath": rel,
+                "sha256": _file_digest(path, "sha256"),
+            }
         )
     if not records:
         raise PolicyError(f"no {kind} RPMs provided for manifest")
@@ -1865,6 +1229,8 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
         pkg = entry.get("package")
         rel = entry.get("relpath")
         expected_sha = entry.get("sha256")
+        expected_arch = entry.get("arch")
+        want_arch = "noarch" if expected_kind == "noarch" else "aarch64"
         if (
             not isinstance(pkg, str)
             or pkg not in allowed_packages
@@ -1872,6 +1238,7 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
             or not rel
             or not isinstance(expected_sha, str)
             or not SHA256_HEX_RE.fullmatch(expected_sha)
+            or expected_arch != want_arch
         ):
             raise PolicyError(f"{mpath}: invalid entry {idx}: {entry!r}")
         if pkg in selected:
@@ -1897,13 +1264,7 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
 
 
 def stage_srpm(noarch_manifest, dest_dir):
-    """Copy only the fwlog SRPM NOARCH_MANIFEST records into new DEST_DIR.
-
-    Returns (copied path, sha256 of NOARCH_MANIFEST as read).  The manifest
-    is read once; its RPM and SRPM digests are verified, and the copy is
-    re-hashed.  build-aarch64-rpms.sh rebuilds from that copy only and binds
-    its manifest to the returned sha256.
-    """
+    """Copy only the fwlog SRPM NOARCH_MANIFEST records into new DEST_DIR."""
     mpath = Path(noarch_manifest)
     try:
         raw = mpath.read_bytes()
@@ -1938,12 +1299,7 @@ def stage_srpm(noarch_manifest, dest_dir):
 
 
 def select_checked_rpms(rpms_dir):
-    """Select board RPMs strictly from the checked manifest(s) under RPMS_DIR.
-
-    Never globs the directory; verifies JSON framing, entry count, safe paths,
-    every RPM's SHA-256 digest, and that noarch and aarch64 manifests belong
-    to the exact same build run_id.
-    """
+    """Select board RPMs strictly from the checked manifest(s) under RPMS_DIR."""
     base = Path(rpms_dir)
     noarch_manifest = base / "checked-rpms.json"
     selected, noarch_run_id, expect_aarch64, noarch_data = _load_rpm_manifest(
@@ -1993,10 +1349,7 @@ def select_checked_rpms(rpms_dir):
 
 
 def verify_rpmdb_list(root, packages_file):
-    """Cross-check a captured `rpm --root ROOT -qa` listing against librpm.
-
-    Fails closed if `rpm -qa` silently truncated, dropped, or altered any row.
-    """
+    """Cross-check a captured `rpm --root ROOT -qa` listing against librpm."""
     root = Path(root)
     if not any((root / cand).is_file() for cand in RPMDB_CANDIDATES):
         raise PolicyError(f"no rpm database found under {root}")
@@ -2037,11 +1390,7 @@ def check_absence(
     allow_basenames=(),
     recursive=False,
 ):
-    """Fail-closed filesystem absence check using os.scandir / os.walk(onerror=...).
-
-    Raises PolicyError on unreadable directories or files rather than treating
-    I/O errors as absence. Returns (ok, problems).
-    """
+    """Fail-closed filesystem absence check using os.scandir / os.walk(onerror=...)."""
     root = Path(root)
     problems = []
     allowed = set(allow_basenames)
@@ -2111,309 +1460,6 @@ def check_absence(
     return (not problems, problems)
 
 
-ESP_BASE_ENTRIES = frozenset(
-    (
-        "efi",
-        "efi/boot",
-        "efi/fedora",
-        "efi/boot/bootaa64.efi",
-        "efi/boot/fbaa64.efi",
-        "efi/fedora/bootaa64.csv",
-        "efi/fedora/grub.cfg",
-        "efi/fedora/grubaa64.efi",
-        "efi/fedora/mmaa64.efi",
-        "efi/fedora/shim.efi",
-        "efi/fedora/shimaa64.efi",
-    )
-)
-ESP_DTB_ENTRIES = frozenset(
-    (
-        "dtb",
-        "dtb/allwinner",
-        "dtb/allwinner/sun60i-a733-cubie-a7a.dtb",
-        "dtb/allwinner/sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb",
-    )
-)
-FSCK_FAT_FOOTER_RE = re.compile(r": (\d+) files, \d+/\d+ clusters$")
-
-
-ESP_DIRS = frozenset(("efi", "efi/boot", "efi/fedora", "dtb", "dtb/allwinner"))
-ESP_DTB = "dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
-ESP_DTB_MARK = ESP_DTB + ".cubie-a7a-dtb"
-PKG_DTB = "usr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
-PKG_DTB_PACKAGE = "cubie-a7a-dtb"
-PKG_DTB_VERSION = "usr/lib/cubie-a7a/dtb/VERSION"
-PKG_ESP_OVERRIDE = "usr/lib/cubie-a7a/dtb/esp-override"
-FW_DTB_STAMP = "var/lib/cubie-a7a/firmware-dtb-version"
-DTB_STAMP_RE = re.compile(rb"[0-9]{1,9}\n")
-
-
-def esp_image_entries(esp_img):
-    """{rel: 'dir'|'file'} of a FAT image, mdir cross-checked with fsck.fat.
-
-    mdir -/ -b marks directories with a trailing '/', kept as the type.
-    fsck.fat -n -l must list the same names and its positive
-    `<N> files, ... clusters` footer must match its own rows.
-    """
-    esp = str(esp_img)
-    r_mdir = subprocess.run(
-        ["mdir", "-/", "-b", "-i", esp, "::/"], capture_output=True, text=True
-    )
-    if r_mdir.returncode != 0 or r_mdir.stderr.strip():
-        raise PolicyError(
-            f"mdir failed on {esp}: {r_mdir.stderr.strip() or f'exit {r_mdir.returncode}'}"
-        )
-    mdir_entries = {}
-    for raw in r_mdir.stdout.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if not line.startswith("::/"):
-            raise PolicyError(f"malformed mdir row on {esp}: {raw!r}")
-        kind = "dir" if line.endswith("/") else "file"
-        rel = line[3:].rstrip("/").lower()
-        if not rel or rel in mdir_entries:
-            raise PolicyError(f"invalid or duplicate mdir entry on {esp}: {raw!r}")
-        mdir_entries[rel] = kind
-
-    r_fsck = subprocess.run(
-        ["fsck.fat", "-n", "-l", esp], capture_output=True, text=True
-    )
-    if r_fsck.returncode != 0 or r_fsck.stderr.strip():
-        raise PolicyError(
-            f"fsck.fat failed on {esp}: "
-            f"{r_fsck.stderr.strip() or r_fsck.stdout.strip() or f'exit {r_fsck.returncode}'}"
-        )
-    fsck_lines = [ln.strip() for ln in r_fsck.stdout.splitlines() if ln.strip()]
-    if not fsck_lines:
-        raise PolicyError(f"empty fsck.fat output on {esp}")
-    m_footer = FSCK_FAT_FOOTER_RE.search(fsck_lines[-1])
-    if not m_footer:
-        raise PolicyError(
-            f"incomplete fsck.fat listing on {esp}: missing summary footer"
-        )
-    footer_count = int(m_footer.group(1))
-    fsck_raw = []
-    for line in fsck_lines[:-1]:
-        if not line.startswith("Checking file /"):
-            continue
-        rest = line[len("Checking file /") :]
-        if not rest:
-            continue
-        rest = re.sub(r" \([^()]+\)$", "", rest)
-        fsck_raw.append(rest.rstrip("/").lower())
-    if len(fsck_raw) != footer_count:
-        raise PolicyError(
-            f"truncated fsck.fat listing on {esp}: "
-            f"saw {len(fsck_raw)} rows, footer reports {footer_count}"
-        )
-    # mkfs.fat -n EFI creates a root volume-label entry `/EFI`, so `/EFI`
-    # appears at most twice in fsck.fat (once as volume label, once as dir).
-    fsck_entries = set()
-    label_dup = 0
-    for item in fsck_raw:
-        if item in fsck_entries:
-            if item == "efi" and label_dup == 0:
-                label_dup += 1
-                continue
-            raise PolicyError(f"unexpected duplicate fsck.fat entry on {esp}: {item!r}")
-        fsck_entries.add(item)
-    if set(mdir_entries) != fsck_entries:
-        raise PolicyError(
-            f"ESP listing mismatch on {esp}: mdir={len(mdir_entries)}, "
-            f"fsck.fat={len(fsck_entries)}"
-        )
-    return mdir_entries
-
-
-def esp_image_reader(esp_img):
-    def read(rel):
-        r = subprocess.run(
-            ["mcopy", "-n", "-i", str(esp_img), f"::/{rel}", "-"],
-            capture_output=True,
-        )
-        if r.returncode != 0 or r.stderr.strip():
-            raise PolicyError(f"cannot read ::/{rel} from {esp_img}")
-        return r.stdout
-
-    return read
-
-
-def esp_dir_entries(esp_dir):
-    """{rel: 'dir'|'file'} of a staged ESP tree (the build's ROOT/boot/efi).
-
-    FAT holds only directories and regular files: a symlink or special file
-    is refused; names are compared case-insensitively, as on FAT.
-    """
-    base = Path(esp_dir)
-    entries = {}
-
-    def on_error(exc):
-        raise PolicyError(f"cannot traverse {exc.filename or base}: {exc}") from exc
-
-    for dirpath, dirnames, filenames in os.walk(base, onerror=on_error):
-        cur = Path(dirpath)
-        for name in sorted(dirnames) + sorted(filenames):
-            path = cur / name
-            rel = path.relative_to(base).as_posix()
-            mode = os.lstat(path).st_mode
-            if stat.S_ISDIR(mode):
-                kind = "dir"
-            elif stat.S_ISREG(mode):
-                kind = "file"
-            else:
-                raise PolicyError(f"ESP entry {rel} is neither a file nor a directory")
-            key = rel.lower()
-            if key in entries:
-                raise PolicyError(f"ESP entries collide on FAT: {rel}")
-            entries[key] = kind
-    return entries
-
-
-def esp_dir_reader(esp_dir):
-    base = Path(esp_dir)
-    lower = {}
-    for path in base.rglob("*"):
-        lower[path.relative_to(base).as_posix().lower()] = path
-
-    def read(rel):
-        path = lower.get(rel)
-        if path is None:
-            raise PolicyError(f"cannot read {rel} from {base}")
-        return path.read_bytes()
-
-    return read
-
-
-def _dtb_stamp(root, rel):
-    path = Path(root) / rel
-    try:
-        st = os.lstat(path)
-    except OSError as exc:
-        raise PolicyError(f"malformed DTB stamp {rel}: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
-        raise PolicyError(f"malformed DTB stamp {rel}: not a regular file")
-    data = path.read_bytes()
-    if not DTB_STAMP_RE.fullmatch(data):
-        raise PolicyError(f"malformed DTB stamp {rel}: {data[:32]!r}")
-    return int(data)
-
-
-def esp_expect_dtb(root):
-    """Whether cubie-a7a-install-dtb puts the DTB on the ESP; stamps validated first.
-
-    The DTB is on the ESP iff the package was built --with esp_override
-    (usr/lib/cubie-a7a/dtb/esp-override) or its stamp is newer than the
-    firmware's (var/lib/cubie-a7a/firmware-dtb-version, written by mkdevcard).
-    """
-    fw = _dtb_stamp(root, FW_DTB_STAMP)
-    pkg = _dtb_stamp(root, PKG_DTB_VERSION)
-    override = Path(root) / PKG_ESP_OVERRIDE
-    if override.is_symlink() or (override.exists() and not override.is_file()):
-        raise PolicyError(f"malformed {PKG_ESP_OVERRIDE}: not a regular file")
-    return override.is_file() or pkg > fw
-
-
-def _packaged_dtb_digest(root, ownership=None):
-    """The cubie-a7a-dtb package payload digest of its DTB, from ROOT's rpmdb."""
-    if ownership is not None:
-        index = {k: [v] for k, v in _recorded_ownership(ownership).items()}
-    else:
-        index = _live_ownership(root, wanted_paths={PKG_DTB})
-    owners = index.get(PKG_DTB) or []
-    if len(owners) != 1 or owners[0][0] != PKG_DTB_PACKAGE:
-        raise PolicyError(
-            f"{PKG_DTB} is not owned by exactly {PKG_DTB_PACKAGE}: "
-            f"{[o[0] for o in owners]}"
-        )
-    _pkg, digest, algo, linkto, _fedora = owners[0]
-    if linkto or RPM_ALGO.get(algo) != "sha256" or not SHA256_HEX_RE.fullmatch(digest):
-        raise PolicyError(f"{PKG_DTB_PACKAGE} records no sha256 for {PKG_DTB}")
-    return digest
-
-
-def esp_admit(root, entries, read, ownership=None):
-    """The one ESP admission rule, for mkdevcard (staged tree) and verify (image).
-
-    In order: the DTB stamps are validated (a malformed one is refused, never
-    read as "no DTB"); the entry set, with types, is exactly our build's
-    (the stock shim/grub layout, plus the DTB directories and files when
-    esp_expect_dtb); the ESP DTB's bytes match the cubie-a7a-dtb payload
-    digest; the marker holds that digest.  Returns the entry count.
-    """
-    expect_dtb = esp_expect_dtb(root)
-    expected = {
-        rel: ("dir" if rel in ESP_DIRS else "file")
-        for rel in (
-            ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
-        )
-    }
-    missing = sorted(set(expected) - set(entries))
-    extra = sorted(set(entries) - set(expected))
-    wrong = sorted(
-        f"{rel} is a {entries[rel]}, expected a {kind}"
-        for rel, kind in expected.items()
-        if rel in entries and entries[rel] != kind
-    )
-    if missing or extra or wrong:
-        parts = []
-        if missing:
-            parts.append(f"missing={missing}")
-        if extra:
-            parts.append(f"extra={extra}")
-        if wrong:
-            parts.append(f"wrong type={wrong}")
-        raise PolicyError(
-            f"ESP layout mismatch (DTB on the ESP: {expect_dtb}): {', '.join(parts)}"
-        )
-    if expect_dtb:
-        want = _packaged_dtb_digest(root, ownership)
-        dtb = read(ESP_DTB)
-        got = hashlib.sha256(dtb).hexdigest()
-        if got != want:
-            raise PolicyError(
-                f"ESP {ESP_DTB} sha256 {got} is not the packaged DTB's {want}"
-            )
-        mark = read(ESP_DTB_MARK)
-        if mark != (want + "\n").encode():
-            raise PolicyError(f"ESP {ESP_DTB_MARK} does not hold the DTB's digest")
-    return len(entries)
-
-
-def overlay_esp_entries(overlay):
-    """OVERLAY entries that would land on the ESP (our ESP is packages only)."""
-    base = Path(overlay) / "boot"
-    if not (base.exists() or base.is_symlink()):
-        return []
-    if base.is_symlink() or not base.is_dir():
-        return [str(base)]
-    efi = base / "efi"
-    if not (efi.exists() or efi.is_symlink()):
-        return []
-    if efi.is_symlink() or not efi.is_dir():
-        return [str(efi)]
-    return sorted(str(p) for p in efi.rglob("*"))
-
-
-def esp_check(esp_img, expect_dtb):
-    """Layout-only check of an ESP image (names, types, exact set) without stamps."""
-    entries = esp_image_entries(esp_img)
-    expected = ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
-    missing = sorted(expected - set(entries))
-    extra = sorted(set(entries) - expected)
-    wrong = sorted(
-        rel
-        for rel in expected & set(entries)
-        if entries[rel] != ("dir" if rel in ESP_DIRS else "file")
-    )
-    if missing or extra or wrong:
-        raise PolicyError(
-            f"ESP layout mismatch on {esp_img}: missing={missing}, extra={extra}, "
-            f"wrong type={wrong}"
-        )
-    return len(entries)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2424,28 +1470,23 @@ def main(argv=None):
     p.add_argument("root", type=Path)
     p.add_argument("--ownership", type=Path)
     p.add_argument("--report", type=Path)
-    p = sub.add_parser("repart-root")
+    p = sub.add_parser("unit-config")
     p.add_argument("root", type=Path)
-    p.add_argument("--grow-root", choices=("yes", "no"))
-    p = sub.add_parser("repart-dropin")
-    p.add_argument("unit", choices=REPART_UNITS)
-    p.add_argument("unit_file", type=Path)
-    p = sub.add_parser("repart-initramfs")
-    p.add_argument("img")
-    runner = p.add_mutually_exclusive_group()
-    runner.add_argument("--chroot", type=Path)
-    runner.add_argument("--run-build-ns", type=Path)
-    p.add_argument("--forbid-repart", action="store_true")
-    p = sub.add_parser("initramfs-check")
-    p.add_argument("img")
-    ic_runner = p.add_mutually_exclusive_group()
-    ic_runner.add_argument("--chroot", type=Path)
-    ic_runner.add_argument("--run-build-ns", type=Path)
-    p.add_argument("--require-path", action="append", default=[])
-    p.add_argument("--forbid-path", action="append", default=[])
-    p.add_argument("--file")
-    p.add_argument("--require-text", action="append", default=[])
-    p.add_argument("--forbid-text", action="append", default=[])
+    p.add_argument("unit")
+    p.add_argument("--fixture", type=Path, required=True)
+    p = sub.add_parser("unit-enabled")
+    p.add_argument("root", type=Path)
+    p.add_argument("unit")
+    p.add_argument("--state", choices=("enabled", "masked"), required=True)
+    p = sub.add_parser("initramfs-unpack")
+    p.add_argument("img", type=Path)
+    p.add_argument("dest", type=Path)
+    p = sub.add_parser("esp-staged")
+    p.add_argument("root", type=Path)
+    p.add_argument("--esp-dir", type=Path, required=True)
+    p.add_argument("--dtb-rpm", type=Path, required=True)
+    p = sub.add_parser("overlay-esp")
+    p.add_argument("overlay", type=Path)
     p = sub.add_parser("enabled-repos")
     p.add_argument("dirs", nargs="+", type=Path)
     p = sub.add_parser("dumpe2fs")
@@ -2474,18 +1515,6 @@ def main(argv=None):
     p = sub.add_parser("verify-rpmdb-list")
     p.add_argument("root", type=Path)
     p.add_argument("packages_file", type=Path)
-    p = sub.add_parser("esp-check")
-    p.add_argument("esp", type=Path)
-    dtb_grp = p.add_mutually_exclusive_group(required=True)
-    dtb_grp.add_argument("--expect-dtb", action="store_true")
-    dtb_grp.add_argument("--no-dtb", action="store_true")
-    p = sub.add_parser("esp-admit")
-    p.add_argument("--root", type=Path, required=True)
-    esp_src = p.add_mutually_exclusive_group(required=True)
-    esp_src.add_argument("--esp-img", type=Path)
-    esp_src.add_argument("--esp-dir", type=Path)
-    esp_src.add_argument("--overlay", type=Path)
-    p.add_argument("--ownership", type=Path)
     p = sub.add_parser("absence-check")
     p.add_argument("root", type=Path)
     p.add_argument(
@@ -2521,64 +1550,46 @@ def main(argv=None):
                 for pkg, rel, digest, algo, linkto in records:
                     fh.write(f"{pkg}\t{rel}\t{digest}\t{algo}\t{linkto}\n")
         return 1 if problems else 0
-    if a.cmd == "repart-root":
+    if a.cmd == "unit-config":
         try:
-            ok, problems = repart_root_ok(a.root, grow_root=a.grow_root)
+            ok, msg = unit_config(a.root, a.unit, a.fixture)
         except PolicyError as exc:
-            print(f"repart-root: {exc}", file=sys.stderr)
+            print(f"unit-config: {exc}", file=sys.stderr)
             return 1
-        for problem in problems:
-            print(problem, file=sys.stderr)
-        return 0 if ok else 1
-    if a.cmd == "repart-dropin":
-        try:
-            sys.stdout.write(repart_dropin_text(a.unit, a.unit_file.read_text()))
-        except (PolicyError, OSError) as exc:
-            print(f"repart-dropin: {exc}", file=sys.stderr)
+        if not ok:
+            print(f"unit-config: {msg}", file=sys.stderr)
             return 1
         return 0
-    if a.cmd == "repart-initramfs":
-        lsinitrd_cmd = None
-        archive_path = None
-        if a.chroot:
-            lsinitrd_cmd = ["chroot", str(a.chroot), "lsinitrd"]
-            archive_path = a.chroot / a.img.lstrip("/")
-        elif a.run_build_ns:
-            lsinitrd_cmd = [str(a.run_build_ns), "user", "lsinitrd"]
+    if a.cmd == "unit-enabled":
         try:
-            ok, problems = repart_initramfs_ok(
-                a.img,
-                lsinitrd_cmd=lsinitrd_cmd,
-                forbid_repart=a.forbid_repart,
-                archive_path=archive_path,
-            )
+            ok, msg = unit_enabled(a.root, a.unit, a.state)
         except PolicyError as exc:
-            print(f"repart-initramfs: {exc}", file=sys.stderr)
+            print(f"unit-enabled: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print(f"unit-enabled: {msg}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "initramfs-unpack":
+        try:
+            initramfs_unpack(a.img, a.dest)
+        except PolicyError as exc:
+            print(f"initramfs-unpack: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "esp-staged":
+        try:
+            ok, problems = esp_staged(a.root, a.esp_dir, a.dtb_rpm)
+        except PolicyError as exc:
+            print(f"esp-staged: {exc}", file=sys.stderr)
             return 1
         for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
-    if a.cmd == "initramfs-check":
-        lsinitrd_cmd = None
-        archive_path = None
-        if a.chroot:
-            lsinitrd_cmd = ["chroot", str(a.chroot), "lsinitrd"]
-            archive_path = a.chroot / a.img.lstrip("/")
-        elif a.run_build_ns:
-            lsinitrd_cmd = [str(a.run_build_ns), "user", "lsinitrd"]
-        ok, problems = initramfs_check(
-            a.img,
-            lsinitrd_cmd=lsinitrd_cmd,
-            archive_path=archive_path,
-            require_paths=a.require_path,
-            forbid_paths=a.forbid_path,
-            file_rel=a.file,
-            require_text=a.require_text,
-            forbid_text=a.forbid_text,
-        )
-        for problem in problems:
-            print(problem, file=sys.stderr)
-        return 0 if ok else 1
+    if a.cmd == "overlay-esp":
+        for hit in overlay_esp_entries(a.overlay):
+            print(hit)
+        return 0
     if a.cmd == "enabled-repos":
         try:
             ids = enabled_repo_ids(a.dirs)
@@ -2651,39 +1662,6 @@ def main(argv=None):
             verify_rpmdb_list(a.root, a.packages_file)
         except PolicyError as exc:
             print(f"verify-rpmdb-list: {exc}", file=sys.stderr)
-            return 1
-        return 0
-    if a.cmd == "esp-check":
-        try:
-            esp_check(a.esp, expect_dtb=a.expect_dtb)
-        except PolicyError as exc:
-            print(f"esp-check: {exc}", file=sys.stderr)
-            return 1
-        return 0
-    if a.cmd == "esp-admit":
-        try:
-            if a.overlay is not None:
-                hits = overlay_esp_entries(a.overlay)
-                if hits:
-                    raise PolicyError(
-                        f"OVERLAY writes the ESP (packages only): {hits[:5]}"
-                    )
-            elif a.esp_img is not None:
-                esp_admit(
-                    a.root,
-                    esp_image_entries(a.esp_img),
-                    esp_image_reader(a.esp_img),
-                    a.ownership,
-                )
-            else:
-                esp_admit(
-                    a.root,
-                    esp_dir_entries(a.esp_dir),
-                    esp_dir_reader(a.esp_dir),
-                    a.ownership,
-                )
-        except (PolicyError, OSError) as exc:
-            print(f"esp-admit: {exc}", file=sys.stderr)
             return 1
         return 0
     if a.cmd == "absence-check":
