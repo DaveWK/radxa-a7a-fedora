@@ -4,10 +4,11 @@
 # cubie-a7a-wifi-firmware: the AIC8800D80 Wi-Fi and Bluetooth firmware of the
 # Radxa Cubie A7A.
 #
-# The driver uses Fedora's linux-firmware files (aic/aic8800d80). This tool reports what the driver will load and, optionally,
-# installs a USB firmware set the user obtained (checked against the pinned
-# manifest, names and SHA256) as an override that takes precedence. It never
-# downloads anything. See WIFI-FIRMWARE.md.
+# The image carries no AIC8800 firmware (user opt-in only, DECISIONS
+# 2026-11-11). This tool reports what the driver will load and installs a USB
+# firmware set the user obtained (checked against the pinned manifest, names
+# and SHA256) as an override that takes precedence over any linux-firmware
+# copy. It never downloads anything. See WIFI-FIRMWARE.md.
 #
 #   cubie-a7a-wifi-firmware status
 #   cubie-a7a-wifi-firmware install <directory-or-.deb>
@@ -34,8 +35,8 @@ Usage: cubie-a7a-wifi-firmware status
        cubie-a7a-wifi-firmware install <directory-or-.deb>
        cubie-a7a-wifi-firmware remove
 
-The driver loads the AIC8800D80 Wi-Fi/Bluetooth firmware from linux-firmware
-($LFDIR). 'status' shows what it will load.
+The image carries no AIC8800 firmware. 'status' shows the override and any
+linux-firmware copy the driver would fall back to.
 'install' (optional) copies the files named in $MANIFEST
 from a directory or a Radxa aic8800-firmware .deb you obtained yourself into
 $FWDIR, after checking every SHA256; they take precedence over

@@ -17,9 +17,6 @@
 #   FIRST_BOOT=maintenance  grubenv next_entry is the default's ~maintenance
 #   GROW_ROOT=no            nothing grows the root: no repart config, no
 #                           x-systemd.growfs, repart/growfs masked and labelled
-#   AIC_OVERRIDE=yes        the card carries the user-override AIC8800 USB
-#                           firmware (via OVERLAY), every file matching the
-#                           driver package's manifest; default: none allowed
 set -uo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,7 +36,6 @@ FIRMWARE_DTB=${FIRMWARE_DTB:-}
 ESP=$W/esp.img
 BOOT_MODES=${BOOT_MODES:-}
 EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
-AIC_OVERRIDE=${AIC_OVERRIDE:-no}
 FIRST_BOOT=${FIRST_BOOT:-}
 GROW_ROOT=${GROW_ROOT:-yes}
 fail=0
@@ -211,27 +207,12 @@ for u in $units; do
 done
 check "no cockpit" bash -c "! grep -q '^cockpit' '$W/packages.txt'"
 check "CPU rendering: Mesa llvmpipe (libgallium), kms_swrast, EGL and GBM" bash -c "ls '$ROOT'/usr/lib64/libgallium-*.so '$ROOT'/usr/lib64/dri/kms_swrast_dri.so '$ROOT'/usr/lib64/libEGL_mesa.so.0 '$ROOT'/usr/lib64/libgbm.so.1 >/dev/null"
-# AIC8800D80 firmware: Fedora's linux-firmware (
-# WIFI-FIRMWARE.md). The image never carries the user override directory.
-check "AIC8800 firmware present from linux-firmware (aic/aic8800d80)" bash -c "grep -q '^linux-firmware-[0-9]*:' '$W/packages.txt' && for f in fw_patch_table_8800d80_u02 fw_adid_8800d80_u02 fw_patch_8800d80_u02 fmacfw_8800d80_u02; do ls '$ROOT'/usr/lib/firmware/aic/aic8800d80/\$f.bin* >/dev/null 2>&1 || exit 1; done"
-if [ "$AIC_OVERRIDE" = yes ]; then
-    # Card-only files (never in a repository or package): the five the chip
-    # needs at every start, and nothing that is not in the manifest.
-    man=$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest
-    ovr=$ROOT/usr/lib/firmware/aic8800_fw/USB/aic8800D80
-    check "AIC8800 override: the five required USB files, size and SHA256 as the manifest" bash -c "test -s '$man' && awk '\$4==\"required\"{print \$1, \$2, \$3}' '$man' | { n=0; while read -r f b h; do test \"\$(stat -c %s '$ovr'/\$f)\" = \$b && test \"\$(sha256sum <'$ovr'/\$f | cut -d' ' -f1)\" = \$h || exit 1; n=\$((n+1)); done; test \$n = 5; }"
-    check "AIC8800 override: every file in it is a manifest file with the manifest's SHA256" bash -c "for f in '$ovr'/*; do h=\$(awk -v n=\"\$(basename \"\$f\")\" '\$1==n{print \$3}' '$man'); test -n \"\$h\" && test \"\$(sha256sum <\"\$f\" | cut -d' ' -f1)\" = \"\$h\" || exit 1; done"
-    ovr_files=("$ovr"/*)
-    # An empty or missing directory lists nothing, not the literal pattern.
-    [ "${ovr_files[0]}" = "$ovr"'/*' ] && ovr_files=()
-    echo "  info  AIC8800 override files: ${ovr_files[*]##*/}"
-else
-    check "no user-override AIC8800 firmware in the image (aic8800_fw)" bash -c "! find '$ROOT/usr/lib/firmware' -path '*aic8800_fw*' -print -quit | grep -q ."
-fi
-f=$(find "$ROOT/usr/lib/firmware/aic/aic8800d80" -name 'fmacfw_8800d80_u02.bin*' -print -quit 2>/dev/null || :)
-if [ -n "$f" ] && [ "$(xz -dcf -- "$f" 2>/dev/null | grep -ac 'sdio_func1_h2d')" != 0 ]; then
-    echo "  info  linux-firmware's AIC8800D80 Wi-Fi image is the SDIO build: the USB chip stays unbound until a USB build is there (WIFI-FIRMWARE.md)"
-fi
+# AIC8800D80 firmware is user opt-in only (DECISIONS 2026-11-11): no firmware
+# file in any image, whether from linux-firmware or an overlay.  The check is
+# by path pattern and by the driver package's manifest names
+# (fedora/devcard-policy.py).  A user installs the chip's files after the
+# build with cubie-a7a-wifi-firmware (WIFI-FIRMWARE.md).
+check "no AIC8800 firmware in the image (user opt-in only)" python3 -I "$TOP/fedora/devcard-policy.py" aic-find "$ROOT"
 if grep -q '^cubie-a7a-aic8800-usb-' "$W/packages.txt"; then
     for m in aic_load_fw aic8800_fdrv; do
         check "DKMS $m built for $kver" bash -c "ls '$ROOT/usr/lib/modules/$kver/extra/$m.ko'* >/dev/null"

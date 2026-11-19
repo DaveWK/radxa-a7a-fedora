@@ -146,10 +146,11 @@ fi
 # host driver), cubie-a7a-display (HDMI, sunxidrm) and cubie-a7a-vdec (video
 # decoder, a733-cedrus) go in when they were built; cubie-a7a-hat loads them.
 # cubie-a7a-aic8800-usb (AIC8800D80 Wi-Fi/Bluetooth driver) goes in the same
-# way. Its firmware is Fedora's linux-firmware (aic/aic8800d80;
-# fedora/WIFI-FIRMWARE.md), in PACKAGES below and required by the driver
-# package; verify-devcard.sh checks it is there and that the image carries no
-# user-override firmware.
+# way. Its firmware is user opt-in only (DECISIONS 2026-11-11): the image
+# carries none, and a user installs the chip's files after the build with
+# cubie-a7a-wifi-firmware (fedora/WIFI-FIRMWARE.md).  linux-firmware's
+# aic/aic8800d80 is removed below and verify-devcard.sh rejects any AIC8800
+# file that is still there.
 for extra in cubie-a7a-npu cubie-a7a-rk1828 cubie-a7a-display cubie-a7a-vdec cubie-a7a-hat \
     cubie-a7a-aic8800-usb; do
     # shellcheck disable=SC2012 # RPM file names are plain
@@ -321,6 +322,13 @@ HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --force
     --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
     --setopt=keepcache=True --setopt=gpgcheck=True --setopt=localpkg_gpgcheck=False \
     --exclude="$exclude" $RELEASE_REPO_ARGS "${pkgs[@]}"
+
+# AIC8800D80 firmware is user opt-in only (DECISIONS 2026-11-11): no firmware
+# file in any image.  linux-firmware installs aic/aic8800d80; remove it.  The
+# user installs the chip's files after the build with cubie-a7a-wifi-firmware
+# (manifest-checked), and the post-overlay check below rejects any AIC8800
+# file that is still there.
+rm -rf "$ROOT"/usr/lib/firmware/aic/aic8800*
 
 # BOOT_MODES=protective: every kernel's maintenance and full entries, with
 # the arguments the board package added to all entries after the kernel's
@@ -536,6 +544,11 @@ if [ -n "$OVERLAY" ]; then
     chroot "$ROOT" ldconfig
     (cd "$OVERLAY" && find . -type f | LC_ALL=C sort | xargs sha256sum) >"$W/overlay.sha256"
 fi
+
+# No AIC8800 firmware may reach the image, from a package or an overlay
+# (DECISIONS 2026-11-11); verify-devcard.sh checks the built image the same way.
+python3 -I "$TOP/fedora/devcard-policy.py" aic-find "$ROOT" >/dev/null ||
+    { echo "mkdevcard: AIC8800 firmware in the image (user opt-in only)" >&2; exit 1; }
 
 # Firmware audit, a report only (never fails the build, removes nothing):
 # which firmware files in the root and initramfs are closed blobs, Realtek's

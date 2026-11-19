@@ -22,11 +22,9 @@
 # - esm.fex: the HDMI HDCP 2.x engine firmware sunxidrm asks for; HDCP 2.x
 #   stays off.
 # - aic/aic8800d80/* (linux-firmware, LICENSE.aic): AICSemi's AIC8800D80
-#   Wi-Fi/Bluetooth firmware, which cubie-a7a-aic8800-usb uses (Fedora's
-#   firmware, replacing the user opt-in;
-#   fedora/WIFI-FIRMWARE.md). Its Wi-Fi image is the SDIO build, which the
-#   driver refuses for the A7A's USB chip until a USB build is there. No open
-#   replacement exists.
+#   Wi-Fi/Bluetooth firmware. User opt-in only (DECISIONS 2026-11-11): the
+#   image build removes it and verify-devcard.sh rejects any AIC8800 file,
+#   by path pattern and by the manifest names. No open replacement exists.
 # Not on the card: aic8800_fw/* (the optional user-installed USB override,
 # cubie-a7a-wifi-firmware; never in an image).
 

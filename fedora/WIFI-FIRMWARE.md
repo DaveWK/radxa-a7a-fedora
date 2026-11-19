@@ -1,34 +1,31 @@
-# Cubie A7A Wi-Fi and Bluetooth firmware (Fedora's linux-firmware)
+# Cubie A7A Wi-Fi and Bluetooth firmware (user opt-in)
 
 The Cubie A7A's Wi-Fi 6 / Bluetooth 5 module (FCU760K, an AICSemi
 AIC8800D80 on USB behind the FE1.1S hub, port 4) runs vendor firmware that
 the host loads into it at every power-up.
 
-## Fedora's firmware
+## User opt-in only (DECISIONS 2026-11-11)
 
-> "Use Fedora's firmware."
+No AIC8800 firmware file is in any repository, package, image or bucket, and
+nothing downloads it. The image carries none: `mkdevcard.sh` removes
+linux-firmware's `aic/aic8800d80`, and `verify-devcard.sh` rejects any
+AIC8800 file by path pattern and by the manifest's names. Without the user's
+own files the driver logs one error and leaves the chip unbound in ROM mode.
 
-Fedora 45's `linux-firmware` (20261019) ships AICSemi AIC8800D80 firmware
-under `aic/aic8800d80/`, redistributable under its `LICENSE.aic`. This
-replaces the user opt-in of 2026-11-11:
+- The image installs `cubie-a7a-aic8800-usb` (the driver) and the Wi-Fi /
+  Bluetooth userspace, with no firmware dependency.
+- `cubie-a7a-wifi-firmware` is the **optional** installer: it copies a USB
+  firmware set you obtained yourself (checked against the manifest below)
+  into `/lib/firmware/aic8800_fw/USB/aic8800D80/`. Nothing requires it.
+- The driver (`aic_load_fw`) loads each file from that override directory,
+  and otherwise from `/lib/firmware/aic/aic8800d80/` (linux-firmware). The
+  image does not install that directory, so there is no fallback copy unless
+  you install linux-firmware yourself.
 
-- The image installs `cubie-a7a-aic8800-usb` together with `linux-firmware`,
-  and the driver package requires `linux-firmware`.
-- The driver (`aic_load_fw`) loads each file from the user override
-  directory `/lib/firmware/aic8800_fw/USB/aic8800D80/` if it is there, and
-  otherwise from linux-firmware's `/lib/firmware/aic/aic8800d80/`.
-- `cubie-a7a-wifi-firmware` stays, as an **optional** override: it installs
-  a USB firmware set you obtained yourself (checked against the manifest
-  below) into the override directory. Nothing requires it.
-- `verify-devcard.sh` checks that the linux-firmware files are in the image
-  (and that the override directory is not).
+## Note: linux-firmware's Wi-Fi image is the SDIO build
 
-None of our packages or repositories carries firmware, and nothing here
-downloads it.
-
-## Open issue: linux-firmware's Wi-Fi image is the SDIO build
-
-Checked 2026-11-12 against `linux-firmware-20261019-1.fc45`:
+If you install `linux-firmware` yourself, its AIC8800D80 files are the ones
+below. Checked 2026-11-12 against `linux-firmware-20261019-1.fc45`:
 
 | linux-firmware file | SHA256 (decompressed) | Bytes | Same as the USB set? |
 |---|---|---:|---|
@@ -43,11 +40,10 @@ does not ask for one. The USB chip cannot run an SDIO Wi-Fi image, and
 **refuses** an `fmacfw` from linux-firmware that is an SDIO build (one
 error naming the override directory and this file) instead of starting it;
 the chip stays unbound in ROM mode, as without firmware.
-`cubie-a7a-wifi-firmware status` and `verify-devcard.sh` report the same.
-Wi-Fi/Bluetooth therefore work out of the box only once linux-firmware
-carries a USB build of the D80 Wi-Fi image (or the user installs the
-optional override). Not tested on hardware: whether linux-firmware's
-Bluetooth patch set works over USB with a USB Wi-Fi image.
+`cubie-a7a-wifi-firmware status` reports the same. Wi-Fi/Bluetooth therefore
+need either a USB build of the D80 Wi-Fi image from the user's own override,
+or a linux-firmware that carries one. Not tested on hardware: whether
+linux-firmware's Bluetooth patch set works over USB with a USB Wi-Fi image.
 
 ## Licence of the override files: unclear
 
@@ -98,8 +94,8 @@ build and are not installed.
 
 ```sh
 # What is there: chip state (a69c:8d80 = ROM, no firmware; 8d81 = running),
-# drivers, each override file present/missing and its SHA256 match, the
-# linux-firmware files the driver uses for the rest (an SDIO Wi-Fi build is
+# drivers, each override file present/missing and its SHA256 match, any
+# linux-firmware files the driver would fall back to (an SDIO Wi-Fi build is
 # flagged), wlan/hci.
 cubie-a7a-wifi-firmware status
 
@@ -128,8 +124,10 @@ appears without a reboot. The driver also accepts `<name>.xz` or
   user-space fallback, no timeout), each from the override directory or
   else from linux-firmware's `aic/aic8800d80/`, and starts them; the chip
   re-enumerates as `a69c:8d81`, where `aic8800_fdrv` (Wi-Fi, `wlan0`) and
-  the mainline `btusb` (Bluetooth, `hci0`) bind. A file taken from
-  linux-firmware is logged (`... from linux-firmware`).
+  the mainline `btusb` (Bluetooth, `hci0`) bind. The image carries no
+  linux-firmware copy, so the override is what loads unless you install
+  linux-firmware yourself; a file taken from linux-firmware is logged
+  (`... from linux-firmware`).
 - A file in neither place, or an SDIO Wi-Fi image from linux-firmware: one
   error naming the paths and this document, probe fails with that error,
   the chip stays unbound in ROM mode. No retry loop; installing the files
