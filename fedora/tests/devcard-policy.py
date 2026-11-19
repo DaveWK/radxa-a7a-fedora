@@ -12,7 +12,9 @@ Run: python3 -I fedora/tests/devcard-policy.py
 
 import hashlib
 import importlib.util
+import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -138,6 +140,31 @@ def aic_overlay_other_firmware_allowed():
         assert policy.aic_overlay_inputs(overlay) == []
 
 
+def aic_overlay_refuses_manifest_names_outside_aic_dirs():
+    with fixture() as tmp:
+        overlay = tmp / "overlay"
+        bad_fw = overlay / "usr/lib/firmware/other/fmacfw_8800d80_u02.bin"
+        bad_fw_xz = overlay / "usr/lib/firmware/fw_patch_table_8800d80_u02.bin.xz"
+        bad_opt = overlay / "opt/vendor/fw_ble_scan_ad_filter.bin"
+        good_rtl = overlay / "usr/lib/firmware/rtl_nic/rtl8125b-2.fw"
+        good_opt = overlay / "opt/vendor/runtime/lib.so"
+        for p in (bad_fw, bad_fw_xz, bad_opt, good_rtl, good_opt):
+            write(p, "x")
+        hits = policy.aic_overlay_inputs(overlay)
+        assert hits == sorted([str(bad_fw), str(bad_fw_xz), str(bad_opt)]), hits
+        # Explicit --manifest adds custom entries outside AIC dirs too.
+        custom_man = tmp / "custom.manifest"
+        write(custom_man, "custom_aic_fw.bin 1 " + ("a" * 64) + " required\n")
+        bad_custom = overlay / "usr/lib/firmware/vendor/custom_aic_fw.bin.zst"
+        write(bad_custom, "y")
+        hits2 = policy.aic_overlay_inputs(overlay, manifest=custom_man)
+        assert str(bad_custom) in hits2, hits2
+        assert (
+            policy.main(["aic-overlay", str(overlay), "--manifest", str(custom_man)])
+            == 1
+        )
+
+
 def aic_provenance_fedora_owned_passes():
     with fixture() as root:
         f = root / "usr/lib/firmware/aic/aic8800d80/fw_patch_table_8800d80_u02.bin.xz"
@@ -256,6 +283,105 @@ def aic_provenance_symlink_outside_fails():
 def aic_provenance_missing_rpmdb_fails_closed():
     with fixture() as root:
         assert policy.main(["aic-provenance", str(root)]) == 1
+
+
+def _build_test_aic_rpm(work, name="fake-aic", vendor="Fedora Project"):
+    """Build a small noarch RPM owning an AIC8800 file, entirely under WORK."""
+    rb = work / f"rpmbuild-{name}"
+    for sub in ("SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS", "tmp"):
+        (rb / sub).mkdir(parents=True, exist_ok=True)
+    spec = rb / "SPECS" / f"{name}.spec"
+    spec.write_text(
+        f"Name: {name}\n"
+        "Version: 1.0\n"
+        "Release: 1\n"
+        "Summary: Fixture AIC package\n"
+        "License: MIT\n"
+        f"Vendor: {vendor}\n"
+        "BuildArch: noarch\n"
+        "%description\nFixture\n"
+        "%install\n"
+        "mkdir -p %{buildroot}/usr/lib/firmware/aic/aic8800d80\n"
+        "printf 'fixture-aic-bytes' > %{buildroot}/usr/lib/firmware/aic/aic8800d80/fmacfw_8800d80_u02.bin\n"
+        "%files\n"
+        "/usr/lib/firmware/aic/aic8800d80/fmacfw_8800d80_u02.bin\n"
+    )
+    subprocess.run(
+        [
+            "rpmbuild",
+            "--define",
+            f"_topdir {rb}",
+            "--define",
+            f"_tmppath {rb / 'tmp'}",
+            "-bb",
+            str(spec),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return next((rb / "RPMS").rglob(f"{name}-*.rpm"))
+
+
+def _rpmdb_fixture(work, blobs):
+    """Populate an isolated database with header blobs only; install nothing."""
+    root = work / "root"
+    root.mkdir()
+    subprocess.run(["rpm", "--root", root, "--initdb"], check=True)
+    db = root / "usr/lib/sysimage/rpm/rpmdb.sqlite"
+    with sqlite3.connect(db) as dst:
+        dst.executemany("INSERT INTO Packages(blob) VALUES(?)", blobs)
+    subprocess.run(["rpm", "--root", root, "--rebuilddb"], check=True)
+    return root
+
+
+def aic_provenance_offline_rpmdb_fedora_and_modified():
+    # Read the host's signed header verbatim, without querying the host with
+    # librpm. rpm and rpmkeys see only our disposable target root.
+    with fixture() as work:
+        db = Path("/usr/lib/sysimage/rpm/rpmdb.sqlite")
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as src:
+            rows = src.execute(
+                "SELECT blob FROM Packages JOIN Name USING(hnum) WHERE key='linux-firmware'"
+            ).fetchall()
+        assert rows, "need Fedora linux-firmware"
+        root = _rpmdb_fixture(work, rows)
+        rel = Path("usr/lib/firmware/aic/aic8800d80")
+        dst = root / rel
+        shutil.copytree(Path("/") / rel, dst)
+        problems, _ = policy.aic_problems(root)
+        assert problems, "a package whose key is absent must fail"
+        key = work / "fedora.asc"
+        for release in (44, 45, 46):
+            source = Path(
+                f"/usr/share/pki/rpm-gpg/RPM-GPG-KEY-fedora-{release}-primary"
+            )
+            if source.is_file():
+                shutil.copyfile(source, key)
+                subprocess.run(["rpmkeys", "--root", root, "--import", key], check=True)
+        problems, records = policy.aic_problems(root)
+        assert not problems and records, problems
+        with next(p for p in dst.iterdir() if p.is_file()).open("ab") as target:
+            target.write(b"changed")
+        problems, _ = policy.aic_problems(root)
+        assert any("modified" in p for p in problems), problems
+
+
+def aic_provenance_offline_unsigned():
+    import rpm
+
+    with fixture() as work:
+        unsigned = _build_test_aic_rpm(work)
+        ts = rpm.TransactionSet(str(work))
+        with unsigned.open("rb") as f:
+            header = ts.hdrFromFdno(f.fileno())
+        root = _rpmdb_fixture(work, [(header.unload(),)])
+        write(
+            root / "usr/lib/firmware/aic/aic8800d80/fmacfw_8800d80_u02.bin",
+            "fixture-aic-bytes",
+        )
+        problems, _ = policy.aic_problems(root)
+        assert len(problems) == 1 and "non-Fedora" in problems[0], problems
 
 
 def aic_provenance_report_written():
@@ -606,6 +732,10 @@ def main():
     case("aic-overlay: refuses symlink", aic_overlay_refuses_symlink)
     case("aic-overlay: missing directory", aic_overlay_missing_dir)
     case("aic-overlay: other firmware allowed", aic_overlay_other_firmware_allowed)
+    case(
+        "aic-overlay: refuses manifest names outside AIC dirs",
+        aic_overlay_refuses_manifest_names_outside_aic_dirs,
+    )
     case("aic-provenance: Fedora-owned files pass", aic_provenance_fedora_owned_passes)
     case("aic-provenance: clean root", aic_provenance_clean_root)
     case(
@@ -629,6 +759,14 @@ def main():
     case(
         "aic-provenance: missing rpmdb fails closed",
         aic_provenance_missing_rpmdb_fails_closed,
+    )
+    case(
+        "aic-provenance: offline rpmdb Fedora linux-firmware, modified & key-removed",
+        aic_provenance_offline_rpmdb_fedora_and_modified,
+    )
+    case(
+        "aic-provenance: offline rpmdb unsigned RPM fails",
+        aic_provenance_offline_unsigned,
     )
     case("aic-provenance: report written", aic_provenance_report_written)
     case("aic-manifest names", aic_manifest_names_cases)

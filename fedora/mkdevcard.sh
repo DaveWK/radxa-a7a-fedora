@@ -528,10 +528,15 @@ rm -rf "$ROOT"/var/cache/dnf/* "$ROOT"/var/lib/dnf/repos "$ROOT"/var/log/dnf* \
 # runtimes under /opt), copied over the root as root:root; systemd units in
 # it are enabled, and the dynamic linker cache is refreshed.
 if [ -n "$OVERLAY" ]; then
-    # Refuse AIC8800 firmware paths before the copy: only a Fedora package may
-    # put those files in an image (DECISIONS 2026-11-11; Dave 2026-11-19:
-    # linux-firmware's own files are fine, ours are not).
-    python3 -I "$TOP/fedora/devcard-policy.py" aic-overlay "$OVERLAY" >/dev/null ||
+    # Refuse AIC8800 firmware paths and manifest-named AIC files before the
+    # copy: only a Fedora package may put those files in an image (DECISIONS
+    # 2026-11-11; Dave 2026-11-19: linux-firmware's own files are fine, ours
+    # are not).
+    aic_overlay_args=(aic-overlay "$OVERLAY")
+    if [ -f "$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest" ]; then
+        aic_overlay_args+=(--manifest "$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest")
+    fi
+    python3 -I "$TOP/fedora/devcard-policy.py" "${aic_overlay_args[@]}" >/dev/null ||
         { echo "mkdevcard: OVERLAY carries AIC8800 firmware (user opt-in only)" >&2; exit 1; }
     cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/
     for u in "$OVERLAY"/usr/lib/systemd/system/*.service; do

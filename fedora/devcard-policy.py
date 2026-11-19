@@ -44,6 +44,7 @@ Commands:
 """
 
 import argparse
+import base64
 import hashlib
 import os
 import re
@@ -55,8 +56,21 @@ from pathlib import Path
 
 AIC_PATTERN = re.compile(r"aic8800", re.IGNORECASE)
 MANIFEST = "usr/share/cubie-a7a/aic8800-d80-usb.manifest"
+REPO_MANIFEST = (
+    Path(__file__).resolve().parent
+    / "rpm/cubie-a7a-aic8800-usb/aic8800-d80-usb.manifest"
+)
 FIRMWARE_PREFIXES = (("usr", "lib", "firmware"), ("lib", "firmware"))
 FIRMWARE = "usr/lib/firmware"
+# SHA-256 of the OpenPGP certificates (binary packets, not ASCII armor)
+# shipped as RPM-GPG-KEY-fedora-{44,45,46}-primary in Fedora's distribution
+# keys. A new release key needs independent review before admission. Neither
+# a key's self-declared user ID nor a short issuer ID is a trust anchor.
+FEDORA_CERTIFICATES = {
+    "ee42b9c07cf45061e59446506442fed9a68270e2a65b775d41b2549501fc4dbc",
+    "ecf2e6d384554b1ddd2b221d90dc1d5c96b351c2e16204c798f63d1213bdb414",
+    "b176af5099fa5f13452ad84d33821edcee235cd1d484018fe96daa39e54e6a50",
+}
 # Provenance, not path: Fedora's standard linux-firmware package owns
 # aic/aic8800d80 and is fine (Dave 2026-11-19); any unowned, modified or
 # non-Fedora file under an AIC firmware path is ours and forbidden
@@ -91,9 +105,9 @@ class PolicyError(RuntimeError):
     """A policy check could not be performed; callers must fail closed."""
 
 
-def aic_manifest_names(root):
-    """File names recorded in the driver package's manifest, in order."""
-    man = Path(root) / MANIFEST
+def _read_manifest_file(path):
+    """File names recorded in a manifest FILE, in order."""
+    man = Path(path)
     if not man.is_file():
         return []
     names = []
@@ -105,6 +119,30 @@ def aic_manifest_names(root):
         if parts:
             names.append(parts[0])
     return names
+
+
+def aic_manifest_names(root):
+    """File names recorded in the driver package's manifest, in order."""
+    return _read_manifest_file(Path(root) / MANIFEST)
+
+
+def _wanted_manifest_names(root=None, extra_manifest=None):
+    """Manifest-named AIC8800 files (raw, .xz, .zst) from root/repo/explicit."""
+    sources = []
+    if extra_manifest is not None:
+        extra = Path(extra_manifest)
+        if not extra.is_file():
+            raise PolicyError(f"manifest not found: {extra}")
+        sources.append(extra)
+    if root is not None:
+        sources.append(Path(root) / MANIFEST)
+    if REPO_MANIFEST.is_file():
+        sources.append(REPO_MANIFEST)
+    wanted = set()
+    for src in sources:
+        for name in _read_manifest_file(src):
+            wanted.update((name, name + ".xz", name + ".zst"))
+    return wanted
 
 
 def _firmware_rel(rel):
@@ -130,8 +168,9 @@ def _aic_root_rel(fw_rel):
     return head.startswith("aic") or bool(AIC_PATTERN.search(fw_rel))
 
 
-def aic_overlay_inputs(overlay):
-    """Overlay inputs that would land in an AIC8800 firmware path.
+def aic_overlay_inputs(overlay, manifest=None):
+    """Overlay inputs that would land in an AIC8800 firmware path or carry a
+    manifest-named AIC8800 file anywhere in the overlay.
 
     mkdevcard.sh refuses these before the overlay copy: only a Fedora package
     may put AIC8800 firmware in an image, and the overlay is ours.
@@ -140,12 +179,13 @@ def aic_overlay_inputs(overlay):
     hits = []
     if not base.is_dir():
         return hits
+    wanted = _wanted_manifest_names(root=base, extra_manifest=manifest)
     for path in base.rglob("*"):
         if not (path.is_file() or path.is_symlink()):
             continue
         rel = path.relative_to(base).as_posix()
         fw_rel = _firmware_rel(rel)
-        if fw_rel is not None and _aic_overlay_rel(fw_rel):
+        if (fw_rel is not None and _aic_overlay_rel(fw_rel)) or path.name in wanted:
             hits.append(str(path))
     return sorted(hits)
 
@@ -174,9 +214,7 @@ def aic_root_files(root):
     stray aic8800* or manifest-named file under firmware/.
     """
     root = Path(root)
-    wanted = set()
-    for name in aic_manifest_names(root):
-        wanted.update((name, name + ".xz", name + ".zst"))
+    wanted = _wanted_manifest_names(root=root)
     out = []
     for fw in _firmware_dirs(root):
         for path in fw.rglob("*"):
@@ -274,8 +312,39 @@ def _recorded_ownership(path):
     return index
 
 
-def _live_ownership(root):
-    """Index path -> (pkg, digest, algo, linkto, is_fedora) from ROOT's rpmdb."""
+def _load_fedora_keyring(ts):
+    """Build an rpm.keyring holding only trusted Fedora release signing keys
+    imported in the target root's rpmdb (``gpg-pubkey`` headers).
+    """
+    import rpm
+
+    keyring = rpm.keyring()
+    for hdr in ts.dbMatch("name", "gpg-pubkey"):
+        cert = rpm.pubkey(hdr["description"].encode("ascii"))
+        digest = hashlib.sha256(base64.b64decode(cert.base64())).hexdigest()
+        if digest in FEDORA_CERTIFICATES:
+            keyring.addKey(cert)
+    return keyring
+
+
+def _verify_fedora_header(hdr, verify_ts):
+    """Verify the installed header signature with the restricted target keyring."""
+    if not any(hdr[tag] for tag in ("openpgp", "rsaheader", "dsaheader")):
+        return False
+    try:
+        verify_ts.hdrCheck(hdr.unload())
+    except Exception:
+        return False
+    return True
+
+
+def _live_ownership(root, wanted_paths=None):
+    """Index path -> list[(pkg, digest, algo, linkto, is_fedora)] from ROOT's rpmdb.
+
+    When WANTED_PATHS is provided, only packages owning at least one path in
+    WANTED_PATHS undergo cryptographic header signature verification, while
+    still validating that ROOT has a readable non-empty rpmdb.
+    """
     root = Path(root)
     if not any((root / cand).is_file() for cand in RPMDB_CANDIDATES):
         raise PolicyError(f"no rpm database found under {root}")
@@ -285,26 +354,43 @@ def _live_ownership(root):
         raise PolicyError(f"python3-rpm is unavailable: {exc}") from exc
     try:
         ts = rpm.TransactionSet(str(root))
+        fedora_keyring = _load_fedora_keyring(ts)
+        verify_ts = rpm.TransactionSet(str(root))
+        verify_ts.setKeyring(fedora_keyring)
+        verify_ts.setVSFlags(0)
+        verify_ts.setVfyFlags(0)
+        verify_ts.setVfyLevel(rpm.RPMSIG_SIGNATURE_TYPE | rpm.RPMSIG_DIGEST_TYPE)
         index = {}
+        pkg_count = 0
         for hdr in ts.dbMatch():
+            pkg = str(hdr["name"] or "")
+            if pkg == "gpg-pubkey":
+                continue
             filenames = hdr["filenames"]
             if not filenames:
                 continue
+            pkg_count += 1
+            norm_names = [str(name).lstrip("/") for name in filenames]
+            if wanted_paths is not None and not any(
+                n in wanted_paths for n in norm_names
+            ):
+                continue
             raw_algo = hdr["filedigestalgo"]
             algo = int(raw_algo) if raw_algo is not None else DIGEST_ALGO_DEFAULT
-            pkg = str(hdr["name"])
-            vendor = str(hdr["vendor"] or "")
-            signed = bool(hdr["rsaheader"] or hdr["sigpgp"] or hdr["dsaheader"])
-            is_fedora = vendor == "Fedora Project" and signed
+            is_fedora = _verify_fedora_header(hdr, verify_ts)
             digests = hdr["filedigests"] or []
             linktos = hdr["filelinktos"] or []
-            for idx, name in enumerate(filenames):
+            for idx, rel in enumerate(norm_names):
+                if wanted_paths is not None and rel not in wanted_paths:
+                    continue
                 digest = str(digests[idx]).lower() if idx < len(digests) else ""
                 linkto = str(linktos[idx]) if idx < len(linktos) else ""
-                index[str(name).lstrip("/")] = (pkg, digest, algo, linkto, is_fedora)
+                index.setdefault(rel, []).append((pkg, digest, algo, linkto, is_fedora))
+    except PolicyError:
+        raise
     except Exception as exc:
         raise PolicyError(f"cannot read the rpm database under {root}: {exc}") from exc
-    if not index:
+    if pkg_count == 0:
         raise PolicyError(f"no installed packages found under {root}")
     return index
 
@@ -332,29 +418,45 @@ def aic_problems(root, ownership=None):
     """Every provenance problem in ROOT's AIC8800 firmware tree.
 
     Every file under usr/lib/firmware/aic* (and any stray aic8800* or
-    manifest-named firmware file) must be owned by a signed Fedora package
-    with a digest matching that package's recorded digest.  A symlink must
-    itself be owned by a Fedora package with a matching target, and resolve
-    inside ROOT to a Fedora-owned file with a matching digest.
+    manifest-named firmware file) must be owned by a package whose header
+    signature verifies offline against a trusted Fedora release signing key
+    imported in ROOT's rpmdb, with a digest matching that package's recorded
+    digest.  A symlink must itself be owned by a verified Fedora package with
+    a matching target, and resolve inside ROOT to a verified Fedora-owned file
+    with a matching digest.
     """
     root = Path(root)
+    root_res = root.resolve()
+    candidates = aic_root_files(root)
     if ownership:
-        index = _recorded_ownership(ownership)
+        raw_index = _recorded_ownership(ownership)
+        index = {rel: [entry] for rel, entry in raw_index.items()}
     else:
-        index = _live_ownership(root)
+        wanted_paths = set()
+        for path in candidates:
+            wanted_paths.add(path.relative_to(root).as_posix())
+            if path.is_symlink():
+                target = _resolve_within(root, path)
+                if target is not None:
+                    wanted_paths.add(target.relative_to(root_res).as_posix())
+        index = _live_ownership(root, wanted_paths=wanted_paths)
     problems = []
     records = []
-    root_res = root.resolve()
-    for path in aic_root_files(root):
+    for path in candidates:
         rel = path.relative_to(root).as_posix()
-        entry = index.get(rel)
-        if entry is None:
+        entries = index.get(rel)
+        if not entries:
             problems.append(f"{rel}: owned by no installed package")
             continue
-        pkg, digest, algo, linkto, is_fedora = entry
-        if not is_fedora:
-            problems.append(f"{rel}: owned by non-Fedora package {pkg}")
+        unverified = [e[0] for e in entries if not e[4]]
+        if unverified:
+            for pkg in unverified:
+                problems.append(
+                    f"{rel}: owned by unverified or non-Fedora package {pkg}"
+                )
             continue
+        entry = entries[0]
+        pkg, digest, algo, linkto, _is_fedora = entry
         if path.is_symlink():
             actual_link = os.readlink(path)
             if not linkto:
@@ -371,18 +473,21 @@ def aic_problems(root, ownership=None):
                 problems.append(f"{rel}: symlink does not resolve inside the image")
                 continue
             target_rel = target.relative_to(root_res).as_posix()
-            target_entry = index.get(target_rel)
-            if target_entry is None:
+            target_entries = index.get(target_rel)
+            if not target_entries:
                 problems.append(
                     f"{rel}: symlink target {target_rel} is owned by no package"
                 )
                 continue
-            if not target_entry[4]:
-                problems.append(
-                    f"{rel}: symlink target {target_rel} is owned by "
-                    f"non-Fedora package {target_entry[0]}"
-                )
+            bad_targets = [e[0] for e in target_entries if not e[4]]
+            if bad_targets:
+                for tpkg in bad_targets:
+                    problems.append(
+                        f"{rel}: symlink target {target_rel} is owned by "
+                        f"unverified or non-Fedora package {tpkg}"
+                    )
                 continue
+            target_entry = target_entries[0]
             problems.extend(_digest_problems(target, rel, target_entry))
             records.append((pkg, rel, target_entry[1], target_entry[2], linkto))
             continue
@@ -791,6 +896,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("aic-overlay")
     p.add_argument("overlay", type=Path)
+    p.add_argument("--manifest", type=Path)
     p = sub.add_parser("aic-provenance")
     p.add_argument("root", type=Path)
     p.add_argument("--ownership", type=Path)
@@ -815,7 +921,11 @@ def main(argv=None):
     p.add_argument("path", type=Path)
     a = ap.parse_args(argv)
     if a.cmd == "aic-overlay":
-        hits = aic_overlay_inputs(a.overlay)
+        try:
+            hits = aic_overlay_inputs(a.overlay, manifest=a.manifest)
+        except PolicyError as exc:
+            print(f"aic-overlay: {exc}", file=sys.stderr)
+            return 1
         for hit in hits:
             print(hit)
         return 1 if hits else 0
