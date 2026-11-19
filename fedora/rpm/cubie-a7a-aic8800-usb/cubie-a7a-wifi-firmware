@@ -354,7 +354,13 @@ case $cmd in
 esac
 [ -r "$MANIFEST" ] && [ -n "$(entries)" ] || die "manifest $MANIFEST missing or empty"
 case $cmd in
-status) [ $# = 0 ] || { usage >&2; exit 2; }; cmd_status ;;
+status)
+    [ $# = 0 ] || {
+        usage >&2
+        exit 2
+    }
+    cmd_status
+    ;;
 install) cmd_install "$@" ;;
 remove) cmd_remove "$@" ;;
 *)

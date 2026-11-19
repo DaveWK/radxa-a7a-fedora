@@ -176,7 +176,10 @@ default_id() {
 # Root block device (root=UUID=... on the kernel command line).
 root_dev() {
     local r
-    [ -z "${CUBIE_A7A_ROOT_DEV:-}" ] || { echo "$CUBIE_A7A_ROOT_DEV"; return; }
+    [ -z "${CUBIE_A7A_ROOT_DEV:-}" ] || {
+        echo "$CUBIE_A7A_ROOT_DEV"
+        return
+    }
     r=$(tr ' ' '\n' <"$CMDLINE" | sed -n 's/^root=//p' | tail -1)
     case "$r" in
     UUID=*) blkid -U "${r#UUID=}" ;;

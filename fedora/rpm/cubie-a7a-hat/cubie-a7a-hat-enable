@@ -128,7 +128,10 @@ for m in $modules; do
         echo "$m: skipped ($why)"
         continue
     fi
-    modinfo "$m" >/dev/null 2>&1 || { echo "$m: not built for $(uname -r), skipped"; continue; }
+    modinfo "$m" >/dev/null 2>&1 || {
+        echo "$m: not built for $(uname -r), skipped"
+        continue
+    }
     if why=$(blocked "$m"); then
         echo "$m: skipped ($why)"
         continue
@@ -166,7 +169,10 @@ display_enable() {
         return 0
         ;;
     esac
-    modinfo sunxidrm >/dev/null 2>&1 || { echo "sunxidrm: not built for $(uname -r), skipped"; return 0; }
+    modinfo sunxidrm >/dev/null 2>&1 || {
+        echo "sunxidrm: not built for $(uname -r), skipped"
+        return 0
+    }
     if why=$(blocked sunxidrm); then
         echo "sunxidrm: skipped ($why)"
         return 0
@@ -194,7 +200,10 @@ display_enable() {
         i=$((i + 1))
     done
     for c in /sys/class/drm/card*-HDMI-A-*; do
-        [ -e "$c" ] || { echo "sunxidrm: no HDMI connector after 20 s (not bound)"; continue; }
+        [ -e "$c" ] || {
+            echo "sunxidrm: no HDMI connector after 20 s (not bound)"
+            continue
+        }
         echo "${c##*/}: $(cat "$c/status") $(head -1 "$c/modes" 2>/dev/null)"
     done
     dmesg | grep -i -E 'sunxi-drm|sunxidrm|\[drm\]|hdmi|tcon|display-engine' | tail -20
@@ -215,7 +224,10 @@ vdec_enable() {
         return 0
         ;;
     esac
-    modinfo a733-cedrus >/dev/null 2>&1 || { echo "a733-cedrus: not built for $(uname -r), skipped"; return 0; }
+    modinfo a733-cedrus >/dev/null 2>&1 || {
+        echo "a733-cedrus: not built for $(uname -r), skipped"
+        return 0
+    }
     if why=$(blocked a733-cedrus); then
         echo "a733-cedrus: skipped ($why)"
         return 0
@@ -243,7 +255,10 @@ vdec_enable() {
         for n in /sys/class/video4linux/video*; do
             [ "$(cat "$n/name" 2>/dev/null)" = a733-cedrus ] && vdev=/dev/${n##*/}
         done
-        [ -n "$vdev" ] || { sleep 1; i=$((i + 1)); }
+        [ -n "$vdev" ] || {
+            sleep 1
+            i=$((i + 1))
+        }
     done
     if [ -z "$vdev" ]; then
         echo "a733-cedrus: no video device after 10 s (not bound)"

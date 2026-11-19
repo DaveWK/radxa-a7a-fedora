@@ -47,7 +47,10 @@ while getopts c:o:t:s:n:h opt; do
     t) LIMIT=$OPTARG ;;
     s) SIZE=$OPTARG ;;
     n) FRAMES=$OPTARG ;;
-    *) sed -n '4,36s/^# \{0,1\}//p' "$0"; exit 2 ;;
+    *)
+        sed -n '4,36s/^# \{0,1\}//p' "$0"
+        exit 2
+        ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -74,13 +77,17 @@ for n in /sys/class/video4linux/video*; do
     a733-cedrus-jpeg) jdev=/dev/${n##*/} ;;
     esac
 done
-[ -n "$dev" ] || { say "no a733-cedrus video device (is the module loaded? modprobe a733-cedrus)"; exit 2; }
+[ -n "$dev" ] || {
+    say "no a733-cedrus video device (is the module loaded? modprobe a733-cedrus)"
+    exit 2
+}
 
 say "cubie-a7a-vdec-selftest $(date -Is) kernel $(uname -r)"
 say "device $dev${jdev:+, JPEG $jdev}; module $(modinfo -F version a733-cedrus 2>/dev/null) srcversion $(cat /sys/module/a733_cedrus/srcversion 2>/dev/null)"
 for p in /sys/module/a733_cedrus/parameters/*; do
     [ -e "$p" ] && printf '%s=%s ' "${p##*/}" "$(cat "$p")"
-done | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"
+done | tee -a "$SUMMARY"
+echo | tee -a "$SUMMARY"
 dmesg 2>/dev/null | grep -E 'a733-cedrus|1c0e000' | grep -E 'codecs offered|VE version|decoder IP' | tail -3 | tee -a "$SUMMARY"
 
 fmts=$(v4l2-ctl -d "$dev" --list-formats-out 2>/dev/null)
@@ -100,7 +107,10 @@ offered() {
 # the user's registry cache was written are there.
 export GST_REGISTRY=$OUT/gst-registry.bin
 have() { gst-inspect-1.0 --exists "$1" 2>/dev/null; }
-features=$( { gst-inspect-1.0 v4l2codecs; gst-inspect-1.0 video4linux2; } 2>/dev/null)
+features=$({
+    gst-inspect-1.0 v4l2codecs
+    gst-inspect-1.0 video4linux2
+} 2>/dev/null)
 hwdec() {
     local pat
     case $1 in
@@ -110,7 +120,10 @@ hwdec() {
     esac
     echo "$features" | grep -o -E "^ *$pat" | tr -d ' ' | head -1
 }
-first() { for e in "$@"; do have "$e" && { echo "$e"; return; }; done; }
+first() { for e in "$@"; do have "$e" && {
+    echo "$e"
+    return
+}; done; }
 swdec() {
     case $1 in
     mpeg2) first avdec_mpeg2video mpeg2dec ;;
@@ -166,7 +179,10 @@ clipfor() {
     if [ -n "$CLIPDIR" ]; then
         for f in "$CLIPDIR/$c".*; do
             case $f in *.md5) continue ;; esac
-            [ -f "$f" ] && { echo "$f"; return; }
+            [ -f "$f" ] && {
+                echo "$f"
+                return
+            }
         done
     fi
     generate "$c"
@@ -245,9 +261,15 @@ for c in "$@"; do
         continue
     fi
     hw=$(hwdec "$c")
-    [ -n "$hw" ] || { say "$c: SKIP no GStreamer element for the device (gst-inspect-1.0 v4l2codecs)"; continue; }
+    [ -n "$hw" ] || {
+        say "$c: SKIP no GStreamer element for the device (gst-inspect-1.0 v4l2codecs)"
+        continue
+    }
     clip=$(clipfor "$c")
-    [ -n "$clip" ] || { say "$c: SKIP no clip and no encoder here (give one with -c)"; continue; }
+    [ -n "$clip" ] || {
+        say "$c: SKIP no clip and no encoder here (give one with -c)"
+        continue
+    }
     ref=
     [ -f "$clip.md5" ] && ref=$(python3 -I -c 'import sys
 with open(sys.argv[1]) as f:
@@ -255,9 +277,15 @@ with open(sys.argv[1]) as f:
 print(parts[0] if parts else "")' "$clip.md5")
     sw=
     [ -n "$ref" ] || sw=$(swdec "$c")
-    [ -n "$ref$sw" ] || { say "$c: SKIP no software decoder and no $clip.md5"; continue; }
+    [ -n "$ref$sw" ] || {
+        say "$c: SKIP no software decoder and no $clip.md5"
+        continue
+    }
     read -r cw ch <<<"$(dims "$clip")"
-    [ -n "${cw:-}" ] || { cw=$W; ch=$H; }
+    [ -n "${cw:-}" ] || {
+        cw=$W
+        ch=$H
+    }
     mode=exact
     case $c in mpeg2 | jpeg) mode=close ;; esac
 
