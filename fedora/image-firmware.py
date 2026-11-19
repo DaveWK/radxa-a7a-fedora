@@ -214,6 +214,7 @@ class Debugfs:
     _EXT4_FL_ENCRYPT = 0x00800
     _EXT4_FL_INLINE_DATA = 0x10000000
     _EXT4_FT_CSUM = 0xDE
+    _ROOT_INO = 2
     _MODE_TO_FT = {
         stat.S_IFREG: 1,
         stat.S_IFDIR: 2,
@@ -422,157 +423,193 @@ class Debugfs:
         self._check_result(r, request)
         return r.stdout
 
-    def _stat_optional(self, path):
+    def _ls_ino(self, ino, path):
+        """{name: (mode, size, ino)} of directory inode INO (PATH for messages).
+
+        Listed by inode (`ls -l -p <INO>`, `stat <INO>`), so no name lookup
+        happens here; the listing must carry its stat sentinel, `.` naming INO
+        itself, `..`, the inode's link count of subdirectories, and match the
+        raw ext4 directory blocks.  Any debugfs error fails.
+        """
+        if ino in self.cache:
+            return self.cache[ino]
+        script = f"ls -l -p <{ino}>\nstat <{ino}>\n"
         r = subprocess.run(
-            ["debugfs", "-R", f'stat "{path}"', self.dev],
+            ["debugfs", "-f", "-", self.dev],
+            input=script,
             capture_output=True,
             text=True,
             env={**os.environ, "LC_ALL": "C"},
         )
-        diags = self._stderr_diagnostics(r.stderr)
-        if any("File not found by ext2_lookup" in d for d in diags):
-            return None
-        self._check_result(r, f'stat "{path}"')
-        return r.stdout
+        self._check_result(r, f"ls -l -p <{ino}> ({path})")
+        ls_rows = []
+        stat_lines = []
+        ls_seen = False
+        in_stat = False
+        for line in r.stdout.splitlines():
+            if not in_stat:
+                if line.startswith("debugfs: ls -l -p "):
+                    ls_seen = True
+                    continue
+                if line.startswith("debugfs: stat "):
+                    in_stat = True
+                    continue
+                if line:
+                    ls_rows.append(line)
+            else:
+                stat_lines.append(line)
+        if not ls_seen or not in_stat:
+            raise InputError(
+                f"{self.label}: incomplete debugfs listing for {path} (missing stat sentinel)"
+            )
+        stat_text = "\n".join(stat_lines)
+        m_type = re.search(r"Inode:\s+(\d+)\s+Type:\s+(\S+)", stat_text)
+        m_links = re.search(r"Links:\s+(\d+)", stat_text)
+        if (
+            not m_type
+            or int(m_type.group(1)) != ino
+            or m_type.group(2) != "directory"
+            or not m_links
+        ):
+            raise InputError(f"{self.label}: invalid debugfs stat sentinel for {path}")
+        stat_links = int(m_links.group(1))
+
+        entries = {}
+        ls_check = {}
+        self_seen = False
+        parent_seen = False
+        child_dirs = 0
+        for line in ls_rows:
+            f = line.split("/")
+            # /inode/mode/uid/gid/name/size/
+            if len(f) != 8 or f[0] != "" or f[-1] != "" or not f[1].isdigit():
+                raise InputError(
+                    f"{self.label}: malformed debugfs listing row at {path}: {line!r}"
+                )
+            if f[1] == "0" and f[5] == "":
+                continue
+            if f[5] == ".":
+                self_seen = int(f[1]) == ino
+                continue
+            if f[5] == "..":
+                parent_seen = True
+                continue
+            child_ino = int(f[1])
+            mode = int(f[2], 8)
+            size = int(f[6]) if f[6].isdigit() else 0
+            ft = self._MODE_TO_FT.get(stat.S_IFMT(mode))
+            if ft is None:
+                raise InputError(
+                    f"{self.label}: unsupported mode {oct(mode)} for {path}/{f[5]}"
+                )
+            if f[5] in entries:
+                raise InputError(
+                    f"{self.label}: duplicate debugfs listing row {f[5]!r} in {path}"
+                )
+            entries[f[5]] = (mode, size, child_ino)
+            ls_check[f[5]] = (child_ino, ft)
+            if stat.S_ISDIR(mode):
+                child_dirs += 1
+        if not self_seen or not parent_seen:
+            raise InputError(
+                f"{self.label}: incomplete debugfs listing for {path} (missing . or ..)"
+            )
+        if stat_links >= 2 and child_dirs + 2 != stat_links:
+            raise InputError(
+                f"{self.label}: incomplete debugfs listing for {path} "
+                f"(saw {child_dirs} subdirs, inode Links={stat_links})"
+            )
+        raw_entries = self._raw_dir_entries(ino, stat_text, path)
+        if ls_check != raw_entries:
+            raise InputError(
+                f"{self.label}: debugfs listing mismatch for {path} "
+                f"(ls={len(ls_check)} entries, raw ext4 dir={len(raw_entries)})"
+            )
+        self.cache[ino] = entries
+        return entries
+
+    def lookup(self, path):
+        """(mode, size, ino) of PATH, walking inode by inode from the root.
+
+        None only when a reconciled parent listing lacks the name; a name the
+        parent lists is always read by its inode, so a lookup error fails
+        instead of reading as absence.  Symlinks are not followed: a symlink
+        ancestor is returned as itself (its mode tells the caller).
+        """
+        if path.strip("/") == "":
+            return (stat.S_IFDIR | 0o755, 0, self._ROOT_INO)
+        listing = self._ls_ino(self._ROOT_INO, "/")
+        cur = ""
+        parts = [p for p in path.strip("/").split("/") if p]
+        for i, name in enumerate(parts):
+            cur += "/" + name
+            if name not in listing:
+                return None
+            mode, size, child = listing[name]
+            if i == len(parts) - 1 or not stat.S_ISDIR(mode):
+                if i != len(parts) - 1:
+                    if stat.S_ISLNK(mode):
+                        return (mode, size, child)
+                    raise InputError(f"{self.label}: {cur} is not a directory")
+                return (mode, size, child)
+            listing = self._ls_ino(child, cur)
+        raise InputError(f"{self.label}: cannot look up {path}")
 
     def ls(self, path):
-        """{name: (mode, size)} of a directory, None when it does not exist."""
-        if path not in self.cache:
-            if path != "/" and self._stat_optional(path) is None:
-                self.cache[path] = None
-                return None
-            script = f'ls -l -p "{path}"\nstat "{path}"\n'
-            r = subprocess.run(
-                ["debugfs", "-f", "-", self.dev],
-                input=script,
-                capture_output=True,
-                text=True,
-                env={**os.environ, "LC_ALL": "C"},
-            )
-            self._check_result(r, f'ls -l -p "{path}"')
-            ls_rows = []
-            stat_lines = []
-            ls_seen = False
-            in_stat = False
-            for line in r.stdout.splitlines():
-                if not in_stat:
-                    if line.startswith("debugfs: ls -l -p "):
-                        ls_seen = True
-                        continue
-                    if line.startswith("debugfs: stat "):
-                        in_stat = True
-                        continue
-                    if line:
-                        ls_rows.append(line)
-                else:
-                    stat_lines.append(line)
-            if not ls_seen or not in_stat:
-                raise InputError(
-                    f"{self.label}: incomplete debugfs listing for {path} (missing stat sentinel)"
-                )
-            stat_text = "\n".join(stat_lines)
-            m_type = re.search(r"Inode:\s+(\d+)\s+Type:\s+(\S+)", stat_text)
-            m_links = re.search(r"Links:\s+(\d+)", stat_text)
-            if not m_type or m_type.group(2) != "directory" or not m_links:
-                raise InputError(
-                    f"{self.label}: invalid debugfs stat sentinel for {path}"
-                )
-            stat_ino = int(m_type.group(1))
-            stat_links = int(m_links.group(1))
-
-            entries = {}
-            ls_check = {}
-            self_seen = False
-            parent_seen = False
-            child_dirs = 0
-            for line in ls_rows:
-                f = line.split("/")
-                # /inode/mode/uid/gid/name/size/
-                if len(f) != 8 or f[0] != "" or f[-1] != "" or not f[1].isdigit():
-                    raise InputError(
-                        f"{self.label}: malformed debugfs listing row at {path}: {line!r}"
-                    )
-                if f[1] == "0" and f[5] == "":
-                    continue
-                if f[5] == ".":
-                    self_seen = int(f[1]) == stat_ino
-                    continue
-                if f[5] == "..":
-                    parent_seen = True
-                    continue
-                child_ino = int(f[1])
-                mode = int(f[2], 8)
-                size = int(f[6]) if f[6].isdigit() else 0
-                ft = self._MODE_TO_FT.get(stat.S_IFMT(mode))
-                if ft is None:
-                    raise InputError(
-                        f"{self.label}: unsupported mode {oct(mode)} for {path}/{f[5]}"
-                    )
-                entries[f[5]] = (mode, size)
-                ls_check[f[5]] = (child_ino, ft)
-                if (mode & 0o170000) == 0o040000:
-                    child_dirs += 1
-            if not self_seen or not parent_seen:
-                raise InputError(
-                    f"{self.label}: incomplete debugfs listing for {path} (missing . or ..)"
-                )
-            if stat_links >= 2 and child_dirs + 2 != stat_links:
-                raise InputError(
-                    f"{self.label}: incomplete debugfs listing for {path} "
-                    f"(saw {child_dirs} subdirs, inode Links={stat_links})"
-                )
-            raw_entries = self._raw_dir_entries(stat_ino, stat_text, path)
-            if ls_check != raw_entries:
-                raise InputError(
-                    f"{self.label}: debugfs listing mismatch for {path} "
-                    f"(ls={len(ls_check)} entries, raw ext4 dir={len(raw_entries)})"
-                )
-            self.cache[path] = entries
-        return self.cache[path]
+        """{name: (mode, size)} of a directory, None when its parent lacks it."""
+        found = self.lookup(path)
+        if found is None:
+            return None
+        mode, _size, ino = found
+        if not stat.S_ISDIR(mode):
+            raise InputError(f"{self.label}: {path} is not a directory")
+        listing = self._ls_ino(ino, path)
+        return {name: (m, sz) for name, (m, sz, _i) in listing.items()}
 
     def mode(self, path):
-        parent, name = path.rsplit("/", 1)
-        listing = self.ls(parent or "/")
-        if listing is None or name not in listing:
-            return None
-        return listing[name][0]
+        found = self.lookup(path)
+        return None if found is None else found[0]
 
     def walk(self, scan_dirs, notes):
         entries = []
         for d in scan_dirs:
-            parts = d.split("/")
-            skip = False
-            for i in range(len(parts)):
-                sub = "/" + "/".join(parts[: i + 1])
-                m = self.mode(sub)
-                if m is None:
-                    skip = True
-                    break
-                if (m & 0o170000) == 0o120000:
-                    notes.append(f"{self.label}: /{d} not scanned, {sub} is a symlink")
-                    skip = True
-                    break
-            if skip:
+            found = self.lookup("/" + d)
+            if found is None:
                 continue
-            todo = [""]
+            cur = ""
+            symlink = False
+            for name in d.split("/"):
+                cur += "/" + name
+                m = self.mode(cur)
+                if m is None:
+                    break
+                if stat.S_ISLNK(m):
+                    notes.append(f"{self.label}: /{d} not scanned, {cur} is a symlink")
+                    symlink = True
+                    break
+            if symlink:
+                continue
+            mode, _size, ino = found
+            if not stat.S_ISDIR(mode):
+                raise InputError(f"{self.label}: /{d} is not a directory")
+            todo = [("", ino)]
             while todo:
-                rel = todo.pop()
-                listing = self.ls(f"/{d}/{rel}".rstrip("/")) or {}
-                for name, (m, _sz) in sorted(listing.items()):
+                rel, dino = todo.pop()
+                listing = self._ls_ino(dino, f"/{d}/{rel}".rstrip("/"))
+                for name, (m, _sz, cino) in sorted(listing.items()):
                     child = f"{rel}/{name}".lstrip("/")
-                    if (m & 0o170000) == 0o040000:
-                        todo.append(child)
+                    if stat.S_ISDIR(m):
+                        todo.append((child, cino))
                     else:
                         entries.append((d, child))
         return entries
 
     def dump(self, path, dest):
-        parent, name = path.rsplit("/", 1)
-        listing = self.ls(parent or "/")
-        if listing is None or name not in listing:
-            raise InputError(f"{self.label}: cannot locate {path}")
-        expected_size = listing[name][1]
-        self.run(f'dump "{path}" "{dest}"')
+        found = self.lookup(path)
+        if found is None or not stat.S_ISREG(found[0]):
+            raise InputError(f"{self.label}: cannot locate regular file {path}")
+        expected_size = found[1]
+        self.run(f'dump <{found[2]}> "{dest}"')
         if not os.path.isfile(dest) or os.path.getsize(dest) != expected_size:
             raise InputError(
                 f"{self.label}: incomplete dump of {path} "

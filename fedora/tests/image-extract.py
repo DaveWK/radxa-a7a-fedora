@@ -36,8 +36,13 @@ FAILURES = []
 ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 ROOT_TYPE = "B921B045-1DF0-41C3-AF44-4C6F280D3FAE"
 
+# A7A_TEST_ONLY=fn1,fn2 runs only the named test functions (red/green runs).
+ONLY = {n for n in os.environ.get("A7A_TEST_ONLY", "").split(",") if n}
+
 
 def case(name, fn):
+    if ONLY and fn.__name__ not in ONLY:
+        return
     try:
         fn()
     except AssertionError as exc:
@@ -416,8 +421,9 @@ def test_image_firmware_truncation_and_list_refusal():
         assert ctrl.returncode == 1, (ctrl.returncode, ctrl.stdout, ctrl.stderr)
 
         # Case 1 (S0-7a): debugfs wrapper drops a regular-file row (rtl8125b-2.fw)
-        # from ls -l -p "/usr/lib/firmware/rtl_nic" while KEEPING the trailing
-        # `debugfs: stat` sentinel intact (exit 0, banner-only stderr).
+        # from the rtl_nic listing (by path or by inode) while KEEPING the
+        # trailing `debugfs: stat` sentinel intact (exit 0, banner-only stderr).
+        rtl_ino = _debugfs_ino(root_img, "/usr/lib/firmware/rtl_nic")
         inject_dbg = work / "inject-dbg.log"
         dbg_wrap = work / "bin-dbg/debugfs"
         dbg_wrap.parent.mkdir()
@@ -431,6 +437,7 @@ def test_image_firmware_truncation_and_list_refusal():
             "stdin_bytes = sys.stdin.buffer.read() if not sys.stdin.isatty() else b''\n"
             "res = subprocess.run([real] + args, input=stdin_bytes, capture_output=True)\n"
             "is_rtl_ls = b'ls -l -p \"/usr/lib/firmware/rtl_nic\"' in stdin_bytes\n"
+            f"is_rtl_ls = is_rtl_ls or b'ls -l -p <{rtl_ino}>' in stdin_bytes\n"
             "if is_rtl_ls and res.returncode == 0:\n"
             "    lines = res.stdout.splitlines(keepends=True)\n"
             "    kept = [ln for ln in lines if b'/rtl8125b-2.fw/' not in ln]\n"
@@ -551,6 +558,110 @@ def test_image_firmware_truncation_and_list_refusal():
             r_list.returncode,
             r_list.stdout,
             r_list.stderr,
+        )
+
+
+def _debugfs_ino(fs_img, path):
+    out = subprocess.run(
+        ["debugfs", "-R", f'stat "{path}"', str(fs_img)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    m = re.search(r"Inode:\s+(\d+)", out)
+    assert m, out
+    return int(m.group(1))
+
+
+def _fw_fixture_disk(work):
+    """GPT disk whose root holds an allowed file and a forbidden rtl_nic subtree."""
+    stage = work / "stage"
+    (stage / "usr/lib/firmware/open").mkdir(parents=True)
+    (stage / "usr/lib/firmware/open/a_allowed.fw").write_text("ok\n")
+    (stage / "usr/lib/firmware/rtl_nic/sub").mkdir(parents=True)
+    (stage / "usr/lib/firmware/rtl_nic/rtl8125b-2.fw").write_text("blob\n")
+    (stage / "usr/lib/firmware/rtl_nic/sub/rtl8168h-2.fw").write_text("blob\n")
+    allow_file = work / "allow.txt"
+    allow_file.write_text("open/a_allowed.fw\n")
+    root_img = work / "root.img"
+    subprocess.run(["truncate", "-s", "8M", str(root_img)], check=True)
+    subprocess.run(["mkfs.ext4", "-q", "-d", str(stage), str(root_img)], check=True)
+    disk = work / "disk.img"
+    sectors = root_img.stat().st_size // 512
+    total = (34816 + sectors + 2048) * 512
+    subprocess.run(["truncate", "-s", str(total), str(disk)], check=True)
+    subprocess.run(
+        ["sfdisk", "--quiet", "--no-reread", "--no-tell-kernel", str(disk)],
+        input=f"label: gpt\nfirst-lba: 34\nstart=34816, size={sectors}, type={ROOT_TYPE}\n",
+        text=True,
+        check=True,
+    )
+    with disk.open("r+b") as dst:
+        dst.seek(34816 * 512)
+        dst.write(root_img.read_bytes())
+    return disk, root_img, allow_file
+
+
+def test_image_firmware_lookup_error_is_not_absence():
+    """F6 B3 (Sol's S0-7a subtree): 'File not found' on a listed name fails."""
+    fw_tool = here.parent / "image-firmware.py"
+    real_debugfs = shutil.which("debugfs")
+    assert real_debugfs, "need debugfs"
+    with tempfile.TemporaryDirectory(prefix="a7a-fw-lookup-") as td:
+        work = Path(td)
+        disk, root_img, allow_file = _fw_fixture_disk(work)
+        check = [
+            sys.executable,
+            "-I",
+            str(fw_tool),
+            "check",
+            "--image",
+            str(disk),
+            "--allow",
+            str(allow_file),
+        ]
+        ctrl = subprocess.run(check, capture_output=True, text=True)
+        assert ctrl.returncode == 1 and "rtl8168h-2.fw" in ctrl.stdout, (
+            ctrl.returncode,
+            ctrl.stdout,
+            ctrl.stderr,
+        )
+        rtl_ino = _debugfs_ino(root_img, "/usr/lib/firmware/rtl_nic")
+        inject = work / "inject.log"
+        wrap = work / "bin/debugfs"
+        wrap.parent.mkdir()
+        # Any request naming the rtl_nic subtree (by path or by inode) answers
+        # "File not found by ext2_lookup", as a failing lookup would, with
+        # exit 0 and only the banner plus that message on stderr.
+        wrap.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            f"real = {real_debugfs!r}\n"
+            "args = sys.argv[1:]\n"
+            "stdin_bytes = sys.stdin.buffer.read() if '-f' in args else b''\n"
+            "req = stdin_bytes + ' '.join(args).encode()\n"
+            f"keys = (b'/usr/lib/firmware/rtl_nic\"', b'<{rtl_ino}>')\n"
+            "if any(k in req for k in keys):\n"
+            f"    open({str(inject)!r}, 'a').write(f'injected:not-found:{{args!r}}\\n')\n"
+            "    sys.stderr.write('debugfs 1.47.3 (8-Jul-2025)\\n')\n"
+            "    sys.stderr.write('/usr/lib/firmware/rtl_nic: File not found by ext2_lookup\\n')\n"
+            "    sys.exit(0)\n"
+            "res = subprocess.run([real] + args, input=stdin_bytes, capture_output=True)\n"
+            "sys.stdout.buffer.write(res.stdout)\n"
+            "sys.stderr.buffer.write(res.stderr)\n"
+            "sys.exit(res.returncode)\n"
+        )
+        wrap.chmod(0o755)
+        r = subprocess.run(
+            check,
+            env={**os.environ, "PATH": f"{wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert inject.is_file() and "injected:not-found:" in inject.read_text()
+        assert r.returncode == 2, (
+            f"a lookup error on a listed subtree read as absence "
+            f"(rc={r.returncode}):\n{r.stdout}\n{r.stderr}"
         )
 
 
@@ -847,6 +958,10 @@ def main():
     case(
         "image-firmware: reject truncated debugfs/lsinitrd and refuse check --list (S0-7)",
         test_image_firmware_truncation_and_list_refusal,
+    )
+    case(
+        "image-firmware: lookup error on a listed subtree fails, never absence (F6 B3)",
+        test_image_firmware_lookup_error_is_not_absence,
     )
     case(
         "selinux-label --verify: reject silently truncated debugfs -f (S0-13)",
