@@ -31,7 +31,11 @@ import os
 import re
 import sys
 
-series, tree, out = sys.argv[1], os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3])
+series, tree, out = (
+    sys.argv[1],
+    os.path.abspath(sys.argv[2]),
+    os.path.abspath(sys.argv[3]),
+)
 assert re.fullmatch(r"[0-9]+\.[0-9]+", series), series
 copied = []
 

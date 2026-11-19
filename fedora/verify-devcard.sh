@@ -341,11 +341,15 @@ if [ "$BOOT_MODES" = protective ]; then
     echo "  default entry adds: $dargs"
     has_all() { # words line
         local w
-        for w in $1; do case " $2 " in *" $w "*) ;; *) return 1 ;; esac; done
+        for w in $1; do case " $2 " in *" $w "*) ;; *) return 1 ;; esac done
     }
     strip() { # line words
         local o="" w x k
-        for w in $1; do k=1; for x in $2; do [ "$w" = "$x" ] && k=0; done; [ $k = 1 ] && o="$o $w"; done
+        for w in $1; do
+            k=1
+            for x in $2; do [ "$w" = "$x" ] && k=0; done
+            [ $k = 1 ] && o="$o $w"
+        done
         echo "${o# }"
     }
     check "/etc/kernel/cmdline carries the protective options (new kernels' default entry)" has_all "$dargs" "$(cat "$ROOT/etc/kernel/cmdline")"

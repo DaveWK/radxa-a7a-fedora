@@ -174,17 +174,35 @@ OVERLAY=${OVERLAY:-}
 EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
 read -ra EXTRA_PKGS <<<"$EXTRA_PACKAGES"
 BOOT_MODES=${BOOT_MODES:-}
-case "$BOOT_MODES" in '' | protective) ;; *) echo "invalid BOOT_MODES" >&2; exit 2 ;; esac
+case "$BOOT_MODES" in '' | protective) ;; *)
+    echo "invalid BOOT_MODES" >&2
+    exit 2
+    ;;
+esac
 FIRST_BOOT=${FIRST_BOOT:-}
 case "$FIRST_BOOT" in '') ;; maintenance) [ "$BOOT_MODES" = protective ] || {
     echo "FIRST_BOOT=maintenance needs BOOT_MODES=protective" >&2
     exit 2
-} ;; *) echo "invalid FIRST_BOOT" >&2; exit 2 ;; esac
+} ;; *)
+    echo "invalid FIRST_BOOT" >&2
+    exit 2
+    ;;
+esac
 GROW_ROOT=${GROW_ROOT:-yes}
-case "$GROW_ROOT" in yes | no) ;; *) echo "invalid GROW_ROOT" >&2; exit 2 ;; esac
+case "$GROW_ROOT" in yes | no) ;; *)
+    echo "invalid GROW_ROOT" >&2
+    exit 2
+    ;;
+esac
 ROOT_MIN_MIB=${ROOT_MIN_MIB:-0}
-[[ $ROOT_MIN_MIB =~ ^[0-9]+$ ]] || { echo "invalid ROOT_MIN_MIB" >&2; exit 2; }
-[ -z "$OVERLAY" ] || [ -d "$OVERLAY" ] || { echo "OVERLAY $OVERLAY is not a directory" >&2; exit 2; }
+[[ $ROOT_MIN_MIB =~ ^[0-9]+$ ]] || {
+    echo "invalid ROOT_MIN_MIB" >&2
+    exit 2
+}
+[ -z "$OVERLAY" ] || [ -d "$OVERLAY" ] || {
+    echo "OVERLAY $OVERLAY is not a directory" >&2
+    exit 2
+}
 # XZ=no leaves the compression to the caller (the build guest).
 XZ=${XZ:-yes}
 

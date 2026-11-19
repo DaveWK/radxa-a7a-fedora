@@ -37,7 +37,10 @@ while getopts m:n:o:l: opt; do
 done
 shift $((OPTIND - 1))
 [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "npu-capture: give the command to run after --" >&2; exit 2; }
+[ $# -gt 0 ] || {
+    echo "npu-capture: give the command to run after --" >&2
+    exit 2
+}
 
 cap=/sys/kernel/debug/vipcore_capture
 [ -w $cap/control ] || {
