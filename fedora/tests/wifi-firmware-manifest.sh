@@ -197,6 +197,28 @@ else
     bad "S0-12: silent truncation of manifest entries() accepted (rc=$rc): $out"
 fi
 
+# Should-fix 4c: remove validates the entire manifest stream BEFORE deleting anything.
+mkdir -p "$tmp/fw-remove"
+printf 'aaa' >"$tmp/fw-remove/first.bin"
+printf 'bbb' >"$tmp/fw-remove/second.bin"
+rm -f "$tmp/inject-entries.log" "$tmp/entries-call-count"
+# Set counter to 1 so call 1 (check_manifest) succeeds and call 2 (cmd_remove) truncates.
+printf '1\n' >"$tmp/entries-call-count"
+out=$(env PATH="$tmp/bin:$PATH" \
+    CUBIE_A7A_WIFI_MANIFEST="$tmp/two.manifest" \
+    CUBIE_A7A_WIFI_FWDIR="$tmp/fw-remove" \
+    CUBIE_A7A_LINUX_FWDIR="$tmp/lf" \
+    CUBIE_A7A_SYSFS="$tmp/sysfs" \
+    "$script" remove 2>&1)
+rc=$?
+if [ ! -s "$tmp/inject-entries.log" ]; then
+    bad "Should-fix 4c: remove truncation fault was never injected"
+elif [ "$rc" -ne 0 ] && [ -f "$tmp/fw-remove/first.bin" ] && [ -f "$tmp/fw-remove/second.bin" ]; then
+    ok "Should-fix 4c: remove deletes nothing when manifest stream is truncated"
+else
+    bad "Should-fix 4c: remove deleted files before validating stream (rc=$rc, first=$(test -e "$tmp/fw-remove/first.bin" && echo yes || echo no), second=$(test -e "$tmp/fw-remove/second.bin" && echo yes || echo no)): $out"
+fi
+
 if [ "$fail" -gt 0 ]; then
     echo "$fail test(s) FAILED ($pass passed)"
     exit 1

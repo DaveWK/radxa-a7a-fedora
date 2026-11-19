@@ -391,27 +391,40 @@ cmd_install() {
 }
 
 cmd_remove() {
-    local name size sha role f n=0 d seen=0 end_count=""
+    local name size sha role f n=0 d seen=0 end_count="" extra=0
+    local -a names=()
     [ $# = 0 ] || {
         usage >&2
         exit 2
     }
     [ -n "${CUBIE_A7A_WIFI_FWDIR:-}" ] || [ "$(id -u)" = 0 ] || die "remove needs root"
+    # Validate the entire manifest entry stream before deleting anything.
     while read -r name size sha role; do
-        if [ "$name" = "#END" ]; then
-            end_count=$size
+        if [ -n "$end_count" ]; then
+            extra=1
             break
         fi
+        if [ "$name" = "#END" ]; then
+            [[ $size =~ ^[0-9]+$ ]] || die "manifest #END count invalid: $size"
+            end_count=$size
+            continue
+        fi
+        [ -n "$name" ] && [[ $name =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] && [[ $name != *".."* ]] ||
+            die "manifest entry stream invalid name: $name"
         seen=$((seen + 1))
+        names+=("$name")
+    done < <(entries)
+    [ "$extra" = 0 ] || die "manifest entry stream has trailing lines after #END"
+    [ -n "$end_count" ] && [ "$seen" = "$end_count" ] && [ "$seen" -gt 0 ] ||
+        die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
+    for name in "${names[@]}"; do
         for f in "$FWDIR/$name" "$FWDIR/$name.xz" "$FWDIR/$name.zst"; do
             if [ -e "$f" ] || [ -L "$f" ]; then
                 rm -f -- "$f"
                 n=$((n + 1))
             fi
         done
-    done < <(entries)
-    [ -n "$end_count" ] && [ "$seen" = "$end_count" ] ||
-        die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
+    done
     # Empty directories only; files this tool did not install stay.
     d=$FWDIR
     for _ in 1 2 3; do
