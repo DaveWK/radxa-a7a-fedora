@@ -41,7 +41,8 @@ export BUILD_SYS CACHE DIST RELEASEVER REPOSDIR SRPM
 set -euo pipefail
 mkdir -p "$BUILD_SYS"/{proc,dev,run,var/lib/dnf,work/tmp}
 if [ ! -x "$BUILD_SYS/usr/bin/rpmbuild" ]; then
-    dnf5 -y -q install --use-host-config --installroot="$BUILD_SYS" --forcearch=aarch64 --releasever="$RELEASEVER" \
+    # The caller's TMPDIR is a host path, not a path inside the build root.
+    env -u TMPDIR dnf5 -y -q install --use-host-config --installroot="$BUILD_SYS" --forcearch=aarch64 --releasever="$RELEASEVER" \
         --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$CACHE" \
         --setopt=persistdir=/var/lib/dnf --setopt=countme=False --setopt=keepcache=True \
         --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
@@ -51,7 +52,7 @@ fi
 mount -t proc proc "$BUILD_SYS/proc"
 for n in null zero random urandom full; do touch "$BUILD_SYS/dev/$n"; mount --bind "/dev/$n" "$BUILD_SYS/dev/$n"; done
 mount -t tmpfs tmpfs "$BUILD_SYS/run"
-chroot "$BUILD_SYS" rpmbuild --define "_topdir /work" --define "_tmppath /work/tmp" \
+env -u TMPDIR chroot "$BUILD_SYS" rpmbuild --define "_topdir /work" --define "_tmppath /work/tmp" \
     --define "dist $DIST" --define 'debug_package %{nil}' --rebuild "/sources/${SRPM##*/}"
 NS
 shopt -s nullglob globstar dotglob

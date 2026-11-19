@@ -42,7 +42,7 @@ mounted=1
 for address in 127.0.0.1 192.0.2.10; do
     target_report=$REPORT
     if [ "$address" = 127.0.0.1 ]; then target_report=$REPORT.loopback; fi
-    chroot "$ROOT" /usr/sbin/sshd -h "${KEYDIR#"$ROOT"}/hostkey" -T -C "user=root,host=client.example,addr=$address" >"$target_report"
+    env -u TMPDIR chroot "$ROOT" /usr/sbin/sshd -h "${KEYDIR#"$ROOT"}/hostkey" -T -C "user=root,host=client.example,addr=$address" >"$target_report"
     for expected in 'permitrootlogin yes' 'passwordauthentication yes' 'kbdinteractiveauthentication no' 'allowusers root' 'authenticationmethods any' 'permitemptypasswords no'; do
         grep -qixF "$expected" "$target_report"
     done

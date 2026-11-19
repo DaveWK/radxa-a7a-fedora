@@ -115,6 +115,7 @@ for t in unshare dnf5 mkfs.ext4 mkfs.fat fsck.fat mcopy sfdisk openssl xz debugf
     command -v $t >/dev/null || die "$t not found"
 done
 python3 -I -c 'import selinux' 2>/dev/null || die "python3-libselinux not found"
+python3 -I -c 'import rpm' 2>/dev/null || die "python3-rpm not found"
 # On an aarch64 host (the image builder's QEMU guest) the target's scriptlets
 # run natively; elsewhere they need qemu-aarch64 binfmt.
 if [ "$(uname -m)" != aarch64 ]; then
@@ -361,7 +362,8 @@ echo '%_install_langs en_US' >"$W/rpm-home/.rpmmacros"
 # sealed copy directory is not enabled as a DNF repo. Fedora repos retain signature
 # checking, and their solver candidates must not replace any selected board RPM.
 read -ra release_repos <<<"$RELEASE_REPO_ARGS"
-HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --forcearch=aarch64 --releasever="$RELEASEVER" \
+# The caller's TMPDIR is a host path, not a path inside the image root.
+HOME=$W/rpm-home env -u TMPDIR dnf5 -y install --use-host-config --installroot="$ROOT" --forcearch=aarch64 --releasever="$RELEASEVER" \
     --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$DNF_CACHE" \
     --setopt=persistdir=/var/lib/dnf --setopt=countme=False \
     --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
@@ -373,7 +375,7 @@ python3 -I "$TOP/fedora/devcard-policy.py" check-installed-rpms "$ROOT" "$RPM_RE
 # the arguments the board package added to all entries after the kernel's
 # own kernel-install run.
 if [ "$BOOT_MODES" = protective ]; then
-    chroot "$ROOT" /usr/local/bin/cubie-a7a-bootmode sync
+    env -u TMPDIR chroot "$ROOT" /usr/local/bin/cubie-a7a-bootmode sync
 fi
 
 # Record the kernel set before overlays. Admit only the final staged trees.
@@ -515,8 +517,8 @@ set prefix=(\$dev)/boot/grub2
 export \$prefix
 configfile \$prefix/grub.cfg
 EOF
-chroot "$ROOT" grub2-editenv /boot/grub2/grubenv create
-chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set boot_success=0
+env -u TMPDIR chroot "$ROOT" grub2-editenv /boot/grub2/grubenv create
+env -u TMPDIR chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set boot_success=0
 if [ "$BOOT_MODES" = protective ]; then
     # GRUB boots saved_entry: the newest kernel's protective entry.
     def=$(
@@ -528,11 +530,11 @@ if [ "$BOOT_MODES" = protective ]; then
         done | sort -V | tail -1
     )
     [ -n "$def" ] || { echo "mkdevcard: no protective BLS default" >&2; exit 1; }
-    chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "saved_entry=$def"
+    env -u TMPDIR chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "saved_entry=$def"
     # FIRST_BOOT=maintenance: GRUB boots this once and clears it (grub.cfg).
     if [ "$FIRST_BOOT" = maintenance ]; then
         [ -f "$ROOT/boot/loader/entries/$def~maintenance.conf" ]
-        chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "next_entry=$def~maintenance"
+        env -u TMPDIR chroot "$ROOT" grub2-editenv /boot/grub2/grubenv set "next_entry=$def~maintenance"
     fi
     systemctl --root="$ROOT" enable cubie-a7a-bootmode-ro.service >/dev/null
     # A rw boot clears a next_entry GRUB could not (read-only firmware
@@ -584,7 +586,7 @@ python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
 # DNF scriptlets can create provisional images before provenance is available.
 # Rebuild the exact images we will ship from the verified firmware tree.
 while IFS= read -r k; do
-    chroot "$ROOT" dracut --force --kver "$k" "/boot/initramfs-$k.img"
+    env -u TMPDIR chroot "$ROOT" dracut --force --kver "$k" "/boot/initramfs-$k.img"
 done <"$W/kernel.txt"
 python3 -I "$TOP/fedora/initramfs-policy.py" capture-digest "$ROOT" "$W/kernel.txt" "$W/initramfs-digests.json"
 
@@ -617,7 +619,7 @@ if [ -n "$OVERLAY" ]; then
         [ -e "$u" ] || continue
         systemctl --root="$ROOT" enable "$(basename "$u")" >/dev/null
     done
-    chroot "$ROOT" ldconfig
+    env -u TMPDIR chroot "$ROOT" ldconfig
     (cd "$OVERLAY" && find . -type f | LC_ALL=C sort | xargs sha256sum) >"$W/overlay.sha256"
     # The overlay may have replaced the rpmdb after the post-DNF check.
     python3 -I "$TOP/fedora/devcard-policy.py" check-installed-rpms "$ROOT" "$RPM_RECORDS"
@@ -642,7 +644,7 @@ while IFS= read -r k; do
     done
 done <"$W/kernel.txt"
 
-chroot "$ROOT" rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}\n' \
+env -u TMPDIR chroot "$ROOT" rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}\n' \
     | sort >"$W/packages.txt"
 umount -R "$ROOT/run" "$ROOT/proc" || :
 for n in null zero random urandom full tty; do umount "$ROOT/dev/$n"; rm -f "$ROOT/dev/$n"; done

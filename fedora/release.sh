@@ -84,12 +84,12 @@ cubie_check_root_kmods() {
     boot=$(cubie_boot_kmods "$version")
     read -ra board <<<"${boot%% -- *}"
     for module in "${board[@]}" dwmac-sun55i; do
-        path=$(chroot "$root" modinfo -k "$version" -n "$module") || return 1
+        path=$(env -u TMPDIR chroot "$root" modinfo -k "$version" -n "$module") || return 1
         case "$path" in
         "/lib/modules/$version/extra/"* | "/usr/lib/modules/$version/extra/"*) ;;
         *) return 1 ;;
         esac
-        chroot "$root" test -f "$path" || return 1
+        env -u TMPDIR chroot "$root" test -f "$path" || return 1
     done
     case "$version" in
     7.2.* | 7.3.*) ;;

@@ -38,32 +38,36 @@ def root_selection(work, source):
     (work / "kernel.txt").write_text(f"{version}\n")
     for module in ("sun60i-a733-serdes", "sun60i-a733-pcie", "sun55i-pck600"):
         (extra / f"{module}.ko").touch()
-    stub = r"""
-chroot() {
-    [[ $1 == "$ROOT" ]] || return 99
-    case "$2" in
-    modinfo)
-        [[ $3 == -k && $5 == -n ]] || return 99
-        if [[ $6 == dwmac-sun55i && $MODE == wrong-selection ]]; then
-            printf '/lib/modules/%s/kernel/%s.ko.zst\n' "$4" "$6"
-        else
-            printf '/lib/modules/%s/extra/%s.ko.zst\n' "$4" "$6"
-        fi
-        ;;
-    test)
-        [[ $3 == -f && $4 == /lib/modules/*/extra/*.ko.zst && $MODE != missing-file ]]
-        ;;
-    *) return 99 ;;
-    esac
-}
-"""
+    stubs = work / "stubs"
+    stubs.mkdir()
+    chroot = stubs / "chroot"
+    chroot.write_text(r"""#!/usr/bin/env bash
+[[ ! -v TMPDIR ]] || exit 98
+[[ $1 == "$ROOT" ]] || exit 99
+case "$2" in
+modinfo)
+    [[ $3 == -k && $5 == -n ]] || exit 99
+    if [[ $6 == dwmac-sun55i && $MODE == wrong-selection ]]; then
+        printf '/lib/modules/%s/kernel/%s.ko.zst\n' "$4" "$6"
+    else
+        printf '/lib/modules/%s/extra/%s.ko.zst\n' "$4" "$6"
+    fi
+    ;;
+test)
+    [[ $3 == -f && $4 == /lib/modules/*/extra/*.ko.zst && $MODE != missing-file ]]
+    ;;
+*) exit 99 ;;
+esac
+""")
+    chroot.chmod(0o755)
 
     def launch(mode):
         return subprocess.run(
             ["bash", "-s", "--", "fixture-package", "--", "fixture-exclude"],
-            input=prologue + stub + module_loop,
+            input=prologue + module_loop,
             env={
-                "PATH": os.environ["PATH"],
+                "PATH": f"{stubs}:{os.environ['PATH']}",
+                "TMPDIR": str(work),
                 "TOP": str(FEDORA.parent),
                 "ROOT": str(root),
                 "W": str(work),
@@ -146,7 +150,7 @@ def cases(work):
     stage = (FEDORA / "mkdevcard.sh").read_text()
     order = [
         'devcard-policy.py" aic-provenance',
-        'chroot "$ROOT" dracut --force',
+        'env -u TMPDIR chroot "$ROOT" dracut --force',
         'initramfs-policy.py" capture-digest',
         'initramfs-policy.py" overlay',
         'cp -a --no-preserve=ownership "$OVERLAY"',

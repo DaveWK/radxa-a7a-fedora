@@ -35,7 +35,7 @@ Each kernel module directory keeps its upstream licence headers and a
 Requirements on a Fedora 45 host: `rpm-build`, `dtc`, `cpp`, `make`,
 `systemd-rpm-macros`, `createrepo_c`, `dnf5`, `util-linux` (`unshare`), `e2fsprogs`,
 `dosfstools` (including `fsck.fat`), `mtools`, `openssl`, `xz`, `git`,
-`python3-libselinux`, and
+`python3-libselinux`, `python3-rpm`, and
 `qemu-user-static-aarch64` with its binfmt handler (the `F` flag) on x86_64
 hosts.
 
