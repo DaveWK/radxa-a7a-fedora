@@ -12,6 +12,7 @@ Run: python3 -I fedora/tests/image-extract.py
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -103,6 +104,15 @@ def make_image(root, overlay_repart_initramfs=False):
         check=True,
         stderr=subprocess.DEVNULL,
     )
+    # Match this rootless test user's ownership even on mkfs-created entries,
+    # so rdump MUST succeed without an ownership-error exception.
+    for entry in ("/", "/lost+found"):
+        for field, value in (("uid", os.getuid()), ("gid", os.getgid())):
+            subprocess.run(
+                ["debugfs", "-w", "-R", f"sif {entry} {field} {value}", root_img],
+                check=True,
+                capture_output=True,
+            )
     esp_img = root / "esp.part"
     subprocess.run(["truncate", "-s", "1M", str(esp_img)], check=True)
     subprocess.run(
@@ -193,7 +203,76 @@ def test_grow_root_no_catches_post_overlay_initramfs_from_img():
         assert any("systemd-repart" in p for p in problems), problems
 
 
+def test_silent_partial_extraction():
+    with tempfile.TemporaryDirectory(prefix="a7a-extract-") as td:
+        work = Path(td)
+        _, image, _ = make_image(work)
+        wrapper = work / "bin/debugfs"
+        wrapper.parent.mkdir()
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'"{shutil.which("debugfs")}" "$@" || exit $?\n'
+            'if [ "$2" = "rdump / ." ]; then : > etc/motd; fi\n'
+        )
+        wrapper.chmod(0o755)
+        res = subprocess.run(
+            [sys.executable, "-I", str(tool), "extract-root", image, work / "out"],
+            env={**os.environ, "PATH": f"{wrapper.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode != 0 and "size" in res.stderr, res.stderr
+
+
+def test_verifier_rejects_damaged_inode():
+    with tempfile.TemporaryDirectory(prefix="a7a-verifier-") as td:
+        work = Path(td)
+        disk, root, _ = make_image(work)
+
+        # Flip one inode checksum bit, leaving GPT, the directory tree and
+        # unrelated files intact. The fixture has ext4 metadata checksums.
+        def info(command):
+            return subprocess.check_output(
+                ["debugfs", "-R", command, root], stderr=subprocess.DEVNULL, text=True
+            )
+
+        block, offset = re.search(
+            r"located at block (\d+), offset (0x[0-9a-f]+)", info("imap /etc/motd")
+        ).groups()
+        blocksize = int(re.search(r"Block size:\s+(\d+)", info("stats")).group(1))
+        pos = 34816 * 512 + int(block) * blocksize + int(offset, 16) + 0x7C
+        with disk.open("r+b") as image:
+            image.seek(pos)
+            value = image.read(1)[0]
+            image.seek(pos)
+            image.write(bytes([value ^ 1]))
+        # Sentinel stops even a broken verifier at the first post-extraction
+        # operation. A generic later failure is NOT evidence for this gate.
+        sentinel = work / "bin/rpm"
+        sentinel.parent.mkdir()
+        sentinel.write_text("#!/bin/sh\necho reached-rpm >&2\nexit 1\n")
+        sentinel.chmod(0o755)
+        result = subprocess.run(
+            [here.parent / "verify-devcard.sh", disk, work / "verify"],
+            env={**os.environ, "PATH": f"{sentinel.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            result.returncode != 0
+            and "cannot read the root filesystem" in result.stderr
+            and "reached-rpm" not in result.stderr
+        ), result.stderr
+
+
 def main():
+    case(
+        "extract-root: reject a silent short extraction", test_silent_partial_extraction
+    )
+    case(
+        "verify-devcard rejects a corrupted inode before querying RPM",
+        test_verifier_rejects_damaged_inode,
+    )
     case("partitions: GPT rows", test_partitions)
     case(
         "extract-partition: bytes come from IMG", test_extract_partition_bound_to_image

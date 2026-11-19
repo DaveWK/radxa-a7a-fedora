@@ -21,6 +21,9 @@ Reads only; never mounts and never modifies IMG.
 
 import argparse
 import json
+import os
+import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -72,21 +75,97 @@ def extract_partition(img, out, wanted_type):
     return 0
 
 
+def _debugfs(image, command, cwd=None):
+    result = subprocess.run(
+        ["debugfs", "-R", command, str(image)],
+        cwd=cwd,
+        capture_output=True,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    # The normal version banner is on stderr. Any other diagnostic matters:
+    # e2fsprogs can return success even after an inode read/rdump failure.
+    diagnostics = result.stderr.splitlines()
+    if diagnostics and re.fullmatch(rb"debugfs [0-9.]+ \([^()]+\)", diagnostics[0]):
+        diagnostics.pop(0)
+    if result.returncode or diagnostics:
+        raise ValueError(
+            os.fsdecode(b"\n".join(diagnostics)) or f"debugfs exit {result.returncode}"
+        )
+    return result.stdout
+
+
+def _inventory(image):
+    # ls -l -p is slash-delimited. Traverse by inode number, never by
+    # interpolating untrusted filenames into debugfs commands.
+    directories = [(2, Path())]
+    seen = set()
+    entries = {}
+    while directories:
+        ino, parent = directories.pop()
+        if ino in seen:
+            raise ValueError(f"repeated directory inode {ino}")
+        seen.add(ino)
+        rows = _debugfs(image, f"ls -l -p <{ino}>").splitlines()
+        self_seen = False
+        for row in filter(None, rows):
+            fields = row.split(b"/")
+            if len(fields) != 8 or fields[0] or fields[-1]:
+                raise ValueError(f"incomplete directory listing at {parent}: {row!r}")
+            child, mode, _, _, name, size = fields[1:-1]
+            if child == b"0" and not name:
+                continue  # unused directory record
+            if not name or int(child) < 1:
+                raise ValueError(f"invalid directory record: {row!r}")
+            if name == b".":
+                self_seen = int(child) == ino
+                continue
+            if name == b"..":
+                continue
+            path = parent / os.fsdecode(name)
+            if path in entries:
+                raise ValueError(f"duplicate directory entry {path}")
+            kind = stat.S_IFMT(int(mode, 8))
+            entries[path] = (
+                kind,
+                int(size) if kind in (stat.S_IFREG, stat.S_IFLNK) else None,
+            )
+            if kind == stat.S_IFDIR:
+                directories.append((int(child), path))
+        if not self_seen:
+            raise ValueError(f"incomplete directory listing at {parent}")
+    return entries
+
+
 def extract_root(partition_img, dest):
+    image = Path(partition_img).resolve()
     dest = Path(dest)
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
-    result = subprocess.run(
-        ["debugfs", "-R", f"rdump / {dest}", str(partition_img)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr)
-        return result.returncode
-    if not any(dest.iterdir()):
-        sys.stderr.write(f"extract-root: {partition_img} yielded an empty tree\n")
+    try:
+        expected = _inventory(image)
+        if not expected:
+            raise ValueError("empty filesystem")
+        # A fixed destination token avoids quoting debugfs commands. Preserve
+        # ownership in the builder's user namespace (or real root); never
+        # silently accept a failed metadata operation when run outside it.
+        output = _debugfs(image, "rdump / .", cwd=dest)
+        if output.strip():
+            raise ValueError(os.fsdecode(output))
+        pending = [dest]
+        while pending:
+            for path in pending.pop().iterdir():
+                status = path.lstat()
+                kind = stat.S_IFMT(status.st_mode)
+                size = status.st_size if kind in (stat.S_IFREG, stat.S_IFLNK) else None
+                if expected.pop(path.relative_to(dest), None) != (kind, size):
+                    raise ValueError(f"unexpected type or size at {path}")
+                if kind == stat.S_IFDIR:
+                    pending.append(path)
+        if expected:
+            raise ValueError(f"missing extracted path {next(iter(expected))}")
+    except (OSError, ValueError) as exc:
+        print(f"extract-root: {image}: {exc}", file=sys.stderr)
         return 1
     return 0
 
