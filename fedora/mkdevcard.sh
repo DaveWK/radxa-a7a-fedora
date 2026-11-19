@@ -583,8 +583,8 @@ fi
 # package and match that package's recorded digest: provenance, not path.
 # Fedora's linux-firmware owns aic/aic8800d80 and passes; an unowned file
 # (overlay addition), a modified file (overlay replacement) or a non-Fedora
-# package fails (DECISIONS 2026-11-11; Dave 2026-11-19: the standard
-# linux-firmware package is fine).
+# package fails. Our own images carry AIC8800 firmware only from Fedora's
+# standard linux-firmware package; anything else is a user opt-in.
 python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
     --report "$W/aic-provenance.tsv" >/dev/null ||
     { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
@@ -605,9 +605,8 @@ if [ -n "$OVERLAY" ]; then
         python3 -I "$TOP/fedora/staged-root-policy.py" overlay "$OVERLAY"
     fi
     # Refuse AIC8800 firmware paths and manifest-named AIC files before the
-    # copy: only a Fedora package may put those files in an image (DECISIONS
-    # 2026-11-11; Dave 2026-11-19: linux-firmware's own files are fine, ours
-    # are not).
+    # copy: only a Fedora package may put those files in an image
+    # (linux-firmware's own files are accepted; overlay copies are not).
     aic_overlay_args=(aic-overlay "$OVERLAY")
     if [ -f "$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest" ]; then
         aic_overlay_args+=(--manifest "$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest")

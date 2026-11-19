@@ -167,7 +167,7 @@ fi
   no stale regulator and a later request gets a fresh one instead of
   disabling the same regulator twice.  Host model extended with
   --fail-disable (fedora/tests/pinctrl-bank-supply.py).  Board check
-  pending (row B / task-000057)
+  pending (on-board check not yet run)
 
 * Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-3
 - pinctrl-sun60i-a733 (built for 7.2 and 7.3 kernels): backport of
