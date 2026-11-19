@@ -110,7 +110,7 @@ die() {
     exit 1
 }
 for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3 \
-    systemctl zstd cpio rpm; do
+    systemctl zstd cpio rpm ssh-keygen; do
     command -v $t >/dev/null || die "$t not found"
 done
 [ -x /usr/lib/systemd/systemd ] || die "systemd manager for staged loader not found"
@@ -574,6 +574,16 @@ rm -f "$ROOT/dev/fd"
 # file belongs here.
 find "$ROOT/dev" -mindepth 1 -type f -delete
 find "$ROOT/dev" -mindepth 1 -empty -type d -delete
+# The target sshd never starts a listener; its disposable key is removed
+# before the final staged checks and packing. This still runs in the builder
+# namespace, after overlays and after removing the original dev/null mount.
+"$TOP/fedora/check-sshd.sh" "$ROOT" "$W/effective-sshd.txt"
+root_policy_args=()
+if [ "$BOOT_MODES" = protective ]; then
+    default_args=$("$TOP/fedora/bootmodes/cubie-a7a-bootmode" default-args)
+    root_policy_args+=(--default-args "$default_args" --first-boot "$FIRST_BOOT")
+fi
+python3 -I "$TOP/fedora/staged-root-policy.py" staged "$ROOT" "${root_policy_args[@]}"
 STAGE1
 
 # --- build-time policy checks (staged trees, the real tools) -------------------
@@ -655,6 +665,9 @@ mkfs.ext4 -q -L "$RELEASE_LABEL" -U "$ROOT_UUID" -E root_owner=0:0 -d "$ROOT" "$
 # unlabeled root freezes systemd when booted enforcing, before any relabel.
 python3 -I "$TOP/fedora/selinux-label.py" "$ROOT" "$rootimg" "$W/selinux"
 python3 -I "$TOP/fedora/selinux-label.py" --verify "$ROOT" "$rootimg" "$W/selinux-verify"
+packed_policy_args=()
+[ "$BOOT_MODES" != protective ] || packed_policy_args+=(--protective)
+python3 -I "$TOP/fedora/staged-root-policy.py" packed "$rootimg" "${packed_policy_args[@]}"
 STAGE2
 
 # --- stage 3: disk image ------------------------------------------------------
