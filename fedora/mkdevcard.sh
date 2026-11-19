@@ -109,7 +109,8 @@ die() {
     echo "mkdevcard: $*" >&2
     exit 1
 }
-for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3; do
+for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3 \
+    systemd-analyze systemctl lsinitrd rpm; do
     command -v $t >/dev/null || die "$t not found"
 done
 python3 -I -c 'import selinux' 2>/dev/null || die "python3-libselinux not found"
@@ -137,6 +138,7 @@ fi
 # non-Fedora AIC firmware, never the standard linux-firmware files.
 BOARD_RPMS=()
 BOARD_UNITS=(cubie-a7a-dtb.service)
+DTB_RPM=
 rpm_rows=$(python3 -I "$TOP/fedora/devcard-policy.py" select-rpms "$RPMDIR") ||
     die "cannot select checked board RPMs from $RPMDIR (run fedora/build-rpms.sh)"
 while IFS=$'\t' read -r pkg rpm_path; do
@@ -145,9 +147,11 @@ while IFS=$'\t' read -r pkg rpm_path; do
     case $pkg in
     cubie-a7a-fwlog) BOARD_UNITS+=(a7a-fwlog.service) ;;
     cubie-a7a-hat) BOARD_UNITS+=(cubie-a7a-hat.service) ;;
+    cubie-a7a-dtb) DTB_RPM=$rpm_path ;;
     esac
 done <<<"$rpm_rows"
 ((${#BOARD_RPMS[@]} >= 2)) || die "checked RPM manifest in $RPMDIR is incomplete"
+[ -n "$DTB_RPM" ] || die "the checked RPM manifest lacks cubie-a7a-dtb"
 # Wi-Fi and Bluetooth userspace, in every image (Wi-Fi out of the box),
 # whether or not the driver package was built: NetworkManager
 # manages wlan0 only with its Wi-Fi plugin (without it the device shows as
@@ -407,20 +411,31 @@ fi
 # that repeats the unit's own ExecStart with --discard=no (systemd 262:
 # "systemd-repart --dry-run=no" and "systemd-repart"). Written whatever
 # GROW_ROOT says: a masked unit ignores the drop-in, and it is in place if
-# the mask is ever lifted. devcard-policy.py repart-dropin writes the bytes
-# (refusing a stock command other than the pinned one), and the same
-# repart-root rule checks them here and in verify-devcard.sh.
+# the mask is ever lifted. The drop-in bytes are pinned by the unit-config
+# check below (systemd-analyze cat-config against fedora/fixtures/units/).
+mkdir -p "$ROOT/etc/systemd/system/systemd-repart.service.d" \
+    "$ROOT/etc/systemd/system/systemd-repart@.service.d"
 for u in systemd-repart.service systemd-repart@.service; do
     unit=$ROOT/usr/lib/systemd/system/$u
     if [ ! -f "$unit" ]; then
         [ "$u" = systemd-repart.service ] && [ "$GROW_ROOT" = yes ] &&
             { echo "mkdevcard: GROW_ROOT=yes but the image has no $u" >&2; exit 1; }
+        rm -rf "$ROOT/etc/systemd/system/$u.d"
         continue
     fi
-    mkdir -p "$ROOT/etc/systemd/system/$u.d"
-    python3 -I "$TOP/fedora/devcard-policy.py" repart-dropin "$u" "$unit" \
-        >"$ROOT/etc/systemd/system/$u.d/10-cubie-a7a-no-discard.conf" ||
-        { echo "mkdevcard: $u: ExecStart is not the pinned systemd-repart command; adapt the no-discard drop-in" >&2; exit 1; }
+    {
+        printf '%s\n' \
+            '# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of' \
+            '# the first partition holds the boot firmware, so systemd-repart must not' \
+            "# discard it. The unit's own command line, plus --discard=no." \
+            '[Service]' \
+            'ExecStart='
+        if [ "$u" = systemd-repart.service ]; then
+            printf '%s\n' 'ExecStart=systemd-repart --dry-run=no --discard=no'
+        else
+            printf '%s\n' 'ExecStart=systemd-repart --discard=no'
+        fi
+    } >"$ROOT/etc/systemd/system/$u.d/10-cubie-a7a-no-discard.conf"
 done
 
 # GRUB: BLS entries from kernel-install; grub.cfg as Fedora writes it, minus
@@ -517,10 +532,12 @@ if [ -n "$OVERLAY" ]; then
     fi
     python3 -I "$TOP/fedora/devcard-policy.py" "${aic_overlay_args[@]}" >/dev/null ||
         { echo "mkdevcard: OVERLAY carries AIC8800 firmware (user opt-in only)" >&2; exit 1; }
-    # The ESP holds the packages' files only (devcard-policy.py esp-admit, the
-    # rule verify-devcard.sh applies): an overlay may not write boot/efi.
-    python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --overlay "$OVERLAY" ||
-        { echo "mkdevcard: OVERLAY writes the ESP (boot/efi)" >&2; exit 1; }
+    # The ESP holds the packages' files only (devcard-policy.py esp-staged, the
+    # rule the build manifest verifies): an overlay may not write boot/efi.
+    esp_overlay_hits=$(python3 -I "$TOP/fedora/devcard-policy.py" overlay-esp "$OVERLAY") ||
+        { echo "mkdevcard: cannot inspect OVERLAY's ESP entries" >&2; exit 1; }
+    [ -z "$esp_overlay_hits" ] ||
+        { echo "mkdevcard: OVERLAY writes the ESP (boot/efi): $esp_overlay_hits" >&2; exit 1; }
     cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/
     for u in "$OVERLAY"/usr/lib/systemd/system/*.service; do
         [ -e "$u" ] || continue
@@ -540,27 +557,8 @@ python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
     --report "$W/aic-provenance.tsv" >/dev/null ||
     { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
 
-# The ESP as it will be copied: the same admission verify-devcard.sh runs on
-# the image (DTB stamps, exact entries and types, DTB bytes against the
-# cubie-a7a-dtb payload digest, the marker).
-python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --esp-dir "$ROOT/boot/efi" ||
-    { echo "mkdevcard: the ESP (boot/efi) is not our build's" >&2; exit 1; }
-
-# The no-discard drop-ins were written before the overlay.  Re-check the final
-# root and the final initramfs, so an overlay cannot drop a drop-in or replace
-# an initramfs with one that runs systemd-repart without --discard=no (the
-# unpartitioned gap in front of the first partition holds the boot firmware).
-# The same rule verify-devcard.sh applies (devcard-policy.py repart-root and
-# repart-initramfs): a build that would fail verify fails here.
-python3 -I "$TOP/fedora/devcard-policy.py" repart-root --grow-root "$GROW_ROOT" "$ROOT" ||
-    { echo "mkdevcard: the systemd-repart configuration is not the pinned one (--discard=no protection, GROW_ROOT=$GROW_ROOT)" >&2; exit 1; }
-repart_initramfs_args=()
-[ "$GROW_ROOT" = yes ] || repart_initramfs_args+=(--forbid-repart)
-for k in $(cat "$W/kernel.txt"); do
-    python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs \
-        --chroot "$ROOT" "${repart_initramfs_args[@]}" "/boot/initramfs-$k.img" ||
-        { echo "mkdevcard: initramfs-$k.img: systemd-repart is not the pinned configuration" >&2; exit 1; }
-done
+# The ESP, the no-discard drop-ins and the initramfs are all checked from the
+# parent shell after STAGE1 (the staged root is final once the overlay is in).
 
 # Firmware audit, a report only (never fails the build, removes nothing):
 # which firmware files in the root and initramfs are closed blobs, Realtek's
@@ -585,6 +583,82 @@ find "$ROOT/dev" -mindepth 1 -type f -delete
 find "$ROOT/dev" -mindepth 1 -empty -type d -delete
 STAGE1
 
+# --- build-time policy checks (staged trees, the real tools) -------------------
+# These run on the final root and unpacked initramfs, before any packing, using
+# systemd's own resolution and dracut's own reader; a deviation fails the build.
+# There is no fallback when a tool is missing (devcard-policy.py fails closed).
+UNITS_FIXTURES=$TOP/fedora/fixtures/units
+# The no-discard drop-ins, resolved by systemd (symlinks, usr-merge, drop-ins):
+python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$ROOT" systemd-repart.service \
+    --fixture "$UNITS_FIXTURES/root-systemd-repart.service.cat-config" ||
+    {
+        echo "mkdevcard: systemd-repart.service is not the pinned configuration" >&2
+        exit 1
+    }
+python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$ROOT" systemd-repart@.service \
+    --fixture "$UNITS_FIXTURES/root-systemd-repart@.service.cat-config" ||
+    {
+        echo "mkdevcard: systemd-repart@.service is not the pinned configuration" >&2
+        exit 1
+    }
+# GROW_ROOT=yes: the main unit enabled (our build resolves it as static, via the
+# systemd package's sysinit.target.wants link, which unit-enabled accepts);
+# GROW_ROOT=no: exactly masked.
+unit_state=enabled
+[ "$GROW_ROOT" = yes ] || unit_state=masked
+python3 -I "$TOP/fedora/devcard-policy.py" unit-enabled "$ROOT" systemd-repart.service --state "$unit_state" ||
+    {
+        echo "mkdevcard: systemd-repart.service is not $unit_state (GROW_ROOT=$GROW_ROOT)" >&2
+        exit 1
+    }
+
+# The initramfs set must equal the kernels in kernel.txt, and each initramfs
+# (unpacked with dracut's own lsinitrd) must carry no systemd-repart unit.
+python3 -I - "$ROOT/boot" "$W/kernel.txt" <<'PY' || exit 1
+import sys
+from pathlib import Path
+
+boot = Path(sys.argv[1])
+kernels = Path(sys.argv[2]).read_text().split()
+have = sorted(p.name for p in boot.glob("initramfs-*.img"))
+want = sorted(f"initramfs-{k}.img" for k in kernels)
+if have != want:
+    sys.stderr.write(f"mkdevcard: initramfs set {have} != kernels {want}\n")
+    sys.exit(1)
+PY
+while read -r k; do
+    img="$ROOT/boot/initramfs-$k.img"
+    unpack="$W/initramfs-$k-unpacked"
+    python3 -I "$TOP/fedora/devcard-policy.py" initramfs-unpack "$img" "$unpack" ||
+        {
+            echo "mkdevcard: cannot unpack $img (dracut)" >&2
+            exit 1
+        }
+    python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$unpack" systemd-repart.service \
+        --fixture "$UNITS_FIXTURES/initramfs-systemd-repart.service.cat-config" ||
+        {
+            echo "mkdevcard: initramfs-$k.img carries systemd-repart.service" >&2
+            exit 1
+        }
+    python3 -I "$TOP/fedora/devcard-policy.py" unit-config "$unpack" systemd-repart@.service \
+        --fixture "$UNITS_FIXTURES/initramfs-systemd-repart@.service.cat-config" ||
+        {
+            echo "mkdevcard: initramfs-$k.img carries systemd-repart@.service" >&2
+            exit 1
+        }
+    rm -rf "$unpack"
+done <"$W/kernel.txt"
+
+# The ESP, on the staged tree before mtools, bound to the built cubie-a7a-dtb
+# RPM's own file list (stamps first; DTB, VERSION and esp-override from rpm -qp
+# --dump; the exact entry set with types). The manifest records these bytes.
+python3 -I "$TOP/fedora/devcard-policy.py" esp-staged --root "$ROOT" \
+    --esp-dir "$ROOT/boot/efi" --dtb-rpm "$DTB_RPM" ||
+    {
+        echo "mkdevcard: the ESP (boot/efi) is not our build's (RPM-bound)" >&2
+        exit 1
+    }
+
 # --- stage 2: filesystem images (same user namespace mapping) ----------------
 ROOT_KIB=$(du -sk --apparent-size "$ROOT" | cut -f1)
 ROOT_MIB=$(((ROOT_KIB * 13 / 10) / 1024 + 512))
@@ -598,8 +672,10 @@ mkfs.fat -F 32 -n EFI -i "$ESP_ID" -C "$esp" $((ESP_MIB * 1024)) >/dev/null
 # FAT keeps no owners or modes; copy the tree, then leave /boot/efi empty
 # as the mount point.
 mcopy -s -p -m -i "$esp" "$ROOT"/boot/efi/* ::
-python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --esp-img "$esp" || {
-    echo "mkdevcard: esp.img is not our build's ESP" >&2
+# Record the staged ESP (file names, types, sha256) for the build manifest
+# before boot/efi is emptied as the mount point; verify re-reads it with mtools.
+python3 -I "$TOP/fedora/devcard-manifest.py" esp-model "$ROOT/boot/efi" "$W/esp-model.json" || {
+    echo "mkdevcard: cannot record the staged ESP for the build manifest" >&2
     exit 1
 }
 find "$ROOT/boot/efi" -mindepth 1 -delete
@@ -660,5 +736,22 @@ firmware fs  $(grep '^image-firmware: ' "$W/firmware-audit.txt" | tail -1 | sed 
 extra pkgs   ${EXTRA_PACKAGES:-none}
 boot modes   ${BOOT_MODES:-single entry per kernel}${FIRST_BOOT:+; first boot: $FIRST_BOOT (one-shot)}
 root growth  $([ "$GROW_ROOT" = yes ] && echo "on first boot (repart + growfs)" || echo "never (repart and growfs masked)"); root $ROOT_MIB MiB
+EOF
+
+# The build manifest proves this image is exactly what this build produced: the
+# GPT, the sha256 of each partition's bytes and of the firmware gap, the whole
+# image, the ESP files (from the staged-tree model captured before mtools), the
+# initramfs files, the DTB stamps, the pinned-unit fixture digests and the RPM
+# set. verify-devcard.sh recomputes every value and requires exact equality.
+MANIFEST_PATH="$OUT.devcard-manifest.json"
+manifest_sha=$(python3 -I "$TOP/fedora/devcard-manifest.py" write "$OUT" "$ROOT" \
+    "$RPMDIR" "$TOP/fedora/fixtures/units" "$MANIFEST_PATH" \
+    --esp-model "$W/esp-model.json") ||
+    die "cannot write the build manifest"
+cat >>"$W/manifest.txt" <<EOF
+manifest    $MANIFEST_PATH sha256 $manifest_sha
+EOF
+cat >>"$OUT.sha256" <<EOF
+manifest sha256 $manifest_sha ($MANIFEST_PATH)
 EOF
 cat "$OUT.sha256" "$W/manifest.txt"
