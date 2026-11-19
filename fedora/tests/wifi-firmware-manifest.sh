@@ -202,8 +202,8 @@ mkdir -p "$tmp/fw-remove"
 printf 'aaa' >"$tmp/fw-remove/first.bin"
 printf 'bbb' >"$tmp/fw-remove/second.bin"
 rm -f "$tmp/inject-entries.log" "$tmp/entries-call-count"
-# Set counter to 1 so call 1 (check_manifest) succeeds and call 2 (cmd_remove) truncates.
-printf '1\n' >"$tmp/entries-call-count"
+# Inject at the first remove stream read (the stub truncates from count 3 on).
+printf '2\n' >"$tmp/entries-call-count"
 out=$(env PATH="$tmp/bin:$PATH" \
     CUBIE_A7A_WIFI_MANIFEST="$tmp/two.manifest" \
     CUBIE_A7A_WIFI_FWDIR="$tmp/fw-remove" \
@@ -236,7 +236,7 @@ mode = os.environ.get("WIFI_F6_INJECT", "")
 if b'print(f"#END {count}")' in stdin_bytes and res.returncode == 0 and mode:
     calls = (int(count_path.read_text()) if count_path.is_file() else 0) + 1
     count_path.write_text(str(calls))
-    if calls >= 2:  # call 1 is check_manifest's; call 2 is remove's producer
+    if calls == 1 or mode == "duplicate":
         out = res.stdout
         with log_path.open("a") as fh:
             fh.write(f"injected:{mode}:call={calls}\\n")
@@ -250,6 +250,11 @@ if b'print(f"#END {count}")' in stdin_bytes and res.returncode == 0 and mode:
         if mode == "exit1":
             sys.stdout.buffer.write(out)
             sys.exit(1)
+        if mode == "duplicate":
+            first, second, end = out.splitlines()
+            duplicate = first.split(b" ", 1)[0] + b" " + second.split(b" ", 1)[1]
+            sys.stdout.buffer.write(b"\\n".join((first, duplicate, end)) + b"\\n")
+            sys.exit(0)
 sys.stdout.buffer.write(res.stdout)
 sys.stderr.buffer.write(res.stderr)
 sys.exit(res.returncode)
@@ -271,6 +276,11 @@ f6_remove() { # NAME MODE MANIFEST
     if [ -n "$mode" ] && [ ! -s "$tmp/inject-f6.log" ]; then
         bad "$name: fault was never injected"
     elif [ "$rc" -ne 0 ] && [ -f "$tmp/fw-f6/first.bin" ] && [ -f "$tmp/fw-f6/second.bin" ]; then
+        if [ "$mode" = duplicate ] &&
+            { [[ $out != *"duplicate name"* ]] || [ "$(cat "$tmp/f6-call-count")" != 1 ]; }; then
+            bad "$name: did not reject the duplicate from exactly one snapshot: $out"
+            return
+        fi
         ok "$name"
     else
         bad "$name: remove deleted files or exited 0 (rc=$rc): $out"
@@ -278,6 +288,7 @@ f6_remove() { # NAME MODE MANIFEST
 }
 f6_remove "F6: remove refuses when the stream producer exits nonzero" exit1 "$tmp/two.manifest"
 f6_remove "F6: remove validates every field of its own snapshot (bad sha256)" badsha "$tmp/two.manifest"
+f6_remove "F8: remove rejects duplicate names in its single snapshot" duplicate "$tmp/two.manifest"
 printf 'first.bin 3 %s required\nsecond.bin 3 %s required' "$sha_first" "$sha_b" >"$tmp/unterminated.manifest"
 f6_remove "F6: remove refuses a manifest whose last line is unterminated" "" "$tmp/unterminated.manifest"
 # Control: the same manifest, terminated, is removed.

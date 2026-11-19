@@ -400,6 +400,7 @@ cmd_install() {
 cmd_remove() {
     local name size sha role f n=0 d seen=0 end_count="" extra=0
     local -a names=()
+    local -A seen_names=()
     [ $# = 0 ] || {
         usage >&2
         exit 2
@@ -422,6 +423,8 @@ cmd_remove() {
         fi
         [ -n "$name" ] && [[ $name =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] && [[ $name != *".."* ]] ||
             die "manifest entry stream invalid name: $name"
+        [[ ! -v seen_names[$name] ]] || die "manifest entry stream duplicate name: $name"
+        seen_names[$name]=1
         [[ $size =~ ^[0-9]+$ ]] && [[ $sha =~ ^[0-9a-fA-F]{64}$ ]] ||
             die "manifest entry stream invalid size or sha256 for $name"
         case $role in
@@ -466,16 +469,19 @@ case $cmd in
     exit 0
     ;;
 esac
-check_manifest
 case $cmd in
 status)
+    check_manifest
     [ $# = 0 ] || {
         usage >&2
         exit 2
     }
     cmd_status
     ;;
-install) cmd_install "$@" ;;
+install)
+    check_manifest
+    cmd_install "$@"
+    ;;
 remove) cmd_remove "$@" ;;
 *)
     usage >&2
