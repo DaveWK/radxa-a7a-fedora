@@ -1971,13 +1971,23 @@ ESP_DTB_ENTRIES = frozenset(
 FSCK_FAT_FOOTER_RE = re.compile(r": (\d+) files, \d+/\d+ clusters$")
 
 
-def esp_check(esp_img, expect_dtb):
-    """Verify the full ESP entry set with mdir, fsck.fat and our exact file list.
+ESP_DIRS = frozenset(("efi", "efi/boot", "efi/fedora", "dtb", "dtb/allwinner"))
+ESP_DTB = "dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
+ESP_DTB_MARK = ESP_DTB + ".cubie-a7a-dtb"
+PKG_DTB = "usr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
+PKG_DTB_PACKAGE = "cubie-a7a-dtb"
+PKG_DTB_VERSION = "usr/lib/cubie-a7a/dtb/VERSION"
+PKG_ESP_OVERRIDE = "usr/lib/cubie-a7a/dtb/esp-override"
+FW_DTB_STAMP = "var/lib/cubie-a7a/firmware-dtb-version"
+DTB_STAMP_RE = re.compile(rb"[0-9]{1,9}\n")
 
-    Cross-checks `mdir -/ -b` against independent `fsck.fat -n -l` (requiring
-    its positive `<N> files, ... clusters` footer to match the emitted rows)
-    and compares the verified entry set against the exact paths our build
-    places on the ESP. Anything missing or extra is refused.
+
+def esp_image_entries(esp_img):
+    """{rel: 'dir'|'file'} of a FAT image, mdir cross-checked with fsck.fat.
+
+    mdir -/ -b marks directories with a trailing '/', kept as the type.
+    fsck.fat -n -l must list the same names and its positive
+    `<N> files, ... clusters` footer must match its own rows.
     """
     esp = str(esp_img)
     r_mdir = subprocess.run(
@@ -1987,17 +1997,18 @@ def esp_check(esp_img, expect_dtb):
         raise PolicyError(
             f"mdir failed on {esp}: {r_mdir.stderr.strip() or f'exit {r_mdir.returncode}'}"
         )
-    mdir_entries = set()
+    mdir_entries = {}
     for raw in r_mdir.stdout.splitlines():
         line = raw.strip()
         if not line:
             continue
         if not line.startswith("::/"):
             raise PolicyError(f"malformed mdir row on {esp}: {raw!r}")
+        kind = "dir" if line.endswith("/") else "file"
         rel = line[3:].rstrip("/").lower()
         if not rel or rel in mdir_entries:
             raise PolicyError(f"invalid or duplicate mdir entry on {esp}: {raw!r}")
-        mdir_entries.add(rel)
+        mdir_entries[rel] = kind
 
     r_fsck = subprocess.run(
         ["fsck.fat", "-n", "-l", esp], capture_output=True, text=True
@@ -2041,22 +2052,200 @@ def esp_check(esp_img, expect_dtb):
                 continue
             raise PolicyError(f"unexpected duplicate fsck.fat entry on {esp}: {item!r}")
         fsck_entries.add(item)
-    if mdir_entries != fsck_entries:
+    if set(mdir_entries) != fsck_entries:
         raise PolicyError(
             f"ESP listing mismatch on {esp}: mdir={len(mdir_entries)}, "
             f"fsck.fat={len(fsck_entries)}"
         )
-    expected = ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
-    missing = sorted(expected - mdir_entries)
-    extra = sorted(mdir_entries - expected)
-    if missing or extra:
+    return mdir_entries
+
+
+def esp_image_reader(esp_img):
+    def read(rel):
+        r = subprocess.run(
+            ["mcopy", "-n", "-i", str(esp_img), f"::/{rel}", "-"],
+            capture_output=True,
+        )
+        if r.returncode != 0 or r.stderr.strip():
+            raise PolicyError(f"cannot read ::/{rel} from {esp_img}")
+        return r.stdout
+
+    return read
+
+
+def esp_dir_entries(esp_dir):
+    """{rel: 'dir'|'file'} of a staged ESP tree (the build's ROOT/boot/efi).
+
+    FAT holds only directories and regular files: a symlink or special file
+    is refused; names are compared case-insensitively, as on FAT.
+    """
+    base = Path(esp_dir)
+    entries = {}
+
+    def on_error(exc):
+        raise PolicyError(f"cannot traverse {exc.filename or base}: {exc}") from exc
+
+    for dirpath, dirnames, filenames in os.walk(base, onerror=on_error):
+        cur = Path(dirpath)
+        for name in sorted(dirnames) + sorted(filenames):
+            path = cur / name
+            rel = path.relative_to(base).as_posix()
+            mode = os.lstat(path).st_mode
+            if stat.S_ISDIR(mode):
+                kind = "dir"
+            elif stat.S_ISREG(mode):
+                kind = "file"
+            else:
+                raise PolicyError(f"ESP entry {rel} is neither a file nor a directory")
+            key = rel.lower()
+            if key in entries:
+                raise PolicyError(f"ESP entries collide on FAT: {rel}")
+            entries[key] = kind
+    return entries
+
+
+def esp_dir_reader(esp_dir):
+    base = Path(esp_dir)
+    lower = {}
+    for path in base.rglob("*"):
+        lower[path.relative_to(base).as_posix().lower()] = path
+
+    def read(rel):
+        path = lower.get(rel)
+        if path is None:
+            raise PolicyError(f"cannot read {rel} from {base}")
+        return path.read_bytes()
+
+    return read
+
+
+def _dtb_stamp(root, rel):
+    path = Path(root) / rel
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise PolicyError(f"malformed DTB stamp {rel}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise PolicyError(f"malformed DTB stamp {rel}: not a regular file")
+    data = path.read_bytes()
+    if not DTB_STAMP_RE.fullmatch(data):
+        raise PolicyError(f"malformed DTB stamp {rel}: {data[:32]!r}")
+    return int(data)
+
+
+def esp_expect_dtb(root):
+    """Whether cubie-a7a-install-dtb puts the DTB on the ESP; stamps validated first.
+
+    The DTB is on the ESP iff the package was built --with esp_override
+    (usr/lib/cubie-a7a/dtb/esp-override) or its stamp is newer than the
+    firmware's (var/lib/cubie-a7a/firmware-dtb-version, written by mkdevcard).
+    """
+    fw = _dtb_stamp(root, FW_DTB_STAMP)
+    pkg = _dtb_stamp(root, PKG_DTB_VERSION)
+    override = Path(root) / PKG_ESP_OVERRIDE
+    if override.is_symlink() or (override.exists() and not override.is_file()):
+        raise PolicyError(f"malformed {PKG_ESP_OVERRIDE}: not a regular file")
+    return override.is_file() or pkg > fw
+
+
+def _packaged_dtb_digest(root, ownership=None):
+    """The cubie-a7a-dtb package payload digest of its DTB, from ROOT's rpmdb."""
+    if ownership is not None:
+        index = {k: [v] for k, v in _recorded_ownership(ownership).items()}
+    else:
+        index = _live_ownership(root, wanted_paths={PKG_DTB})
+    owners = index.get(PKG_DTB) or []
+    if len(owners) != 1 or owners[0][0] != PKG_DTB_PACKAGE:
+        raise PolicyError(
+            f"{PKG_DTB} is not owned by exactly {PKG_DTB_PACKAGE}: "
+            f"{[o[0] for o in owners]}"
+        )
+    _pkg, digest, algo, linkto, _fedora = owners[0]
+    if linkto or RPM_ALGO.get(algo) != "sha256" or not SHA256_HEX_RE.fullmatch(digest):
+        raise PolicyError(f"{PKG_DTB_PACKAGE} records no sha256 for {PKG_DTB}")
+    return digest
+
+
+def esp_admit(root, entries, read, ownership=None):
+    """The one ESP admission rule, for mkdevcard (staged tree) and verify (image).
+
+    In order: the DTB stamps are validated (a malformed one is refused, never
+    read as "no DTB"); the entry set, with types, is exactly our build's
+    (the stock shim/grub layout, plus the DTB directories and files when
+    esp_expect_dtb); the ESP DTB's bytes match the cubie-a7a-dtb payload
+    digest; the marker holds that digest.  Returns the entry count.
+    """
+    expect_dtb = esp_expect_dtb(root)
+    expected = {
+        rel: ("dir" if rel in ESP_DIRS else "file")
+        for rel in (
+            ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
+        )
+    }
+    missing = sorted(set(expected) - set(entries))
+    extra = sorted(set(entries) - set(expected))
+    wrong = sorted(
+        f"{rel} is a {entries[rel]}, expected a {kind}"
+        for rel, kind in expected.items()
+        if rel in entries and entries[rel] != kind
+    )
+    if missing or extra or wrong:
         parts = []
         if missing:
             parts.append(f"missing={missing}")
         if extra:
             parts.append(f"extra={extra}")
-        raise PolicyError(f"ESP layout mismatch on {esp}: {', '.join(parts)}")
-    return len(mdir_entries)
+        if wrong:
+            parts.append(f"wrong type={wrong}")
+        raise PolicyError(
+            f"ESP layout mismatch (DTB on the ESP: {expect_dtb}): {', '.join(parts)}"
+        )
+    if expect_dtb:
+        want = _packaged_dtb_digest(root, ownership)
+        dtb = read(ESP_DTB)
+        got = hashlib.sha256(dtb).hexdigest()
+        if got != want:
+            raise PolicyError(
+                f"ESP {ESP_DTB} sha256 {got} is not the packaged DTB's {want}"
+            )
+        mark = read(ESP_DTB_MARK)
+        if mark != (want + "\n").encode():
+            raise PolicyError(f"ESP {ESP_DTB_MARK} does not hold the DTB's digest")
+    return len(entries)
+
+
+def overlay_esp_entries(overlay):
+    """OVERLAY entries that would land on the ESP (our ESP is packages only)."""
+    base = Path(overlay) / "boot"
+    if not (base.exists() or base.is_symlink()):
+        return []
+    if base.is_symlink() or not base.is_dir():
+        return [str(base)]
+    efi = base / "efi"
+    if not (efi.exists() or efi.is_symlink()):
+        return []
+    if efi.is_symlink() or not efi.is_dir():
+        return [str(efi)]
+    return sorted(str(p) for p in efi.rglob("*"))
+
+
+def esp_check(esp_img, expect_dtb):
+    """Layout-only check of an ESP image (names, types, exact set) without stamps."""
+    entries = esp_image_entries(esp_img)
+    expected = ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
+    missing = sorted(expected - set(entries))
+    extra = sorted(set(entries) - expected)
+    wrong = sorted(
+        rel
+        for rel in expected & set(entries)
+        if entries[rel] != ("dir" if rel in ESP_DIRS else "file")
+    )
+    if missing or extra or wrong:
+        raise PolicyError(
+            f"ESP layout mismatch on {esp_img}: missing={missing}, extra={extra}, "
+            f"wrong type={wrong}"
+        )
+    return len(entries)
 
 
 def main(argv=None):
@@ -2119,6 +2308,13 @@ def main(argv=None):
     dtb_grp = p.add_mutually_exclusive_group(required=True)
     dtb_grp.add_argument("--expect-dtb", action="store_true")
     dtb_grp.add_argument("--no-dtb", action="store_true")
+    p = sub.add_parser("esp-admit")
+    p.add_argument("--root", type=Path, required=True)
+    esp_src = p.add_mutually_exclusive_group(required=True)
+    esp_src.add_argument("--esp-img", type=Path)
+    esp_src.add_argument("--esp-dir", type=Path)
+    esp_src.add_argument("--overlay", type=Path)
+    p.add_argument("--ownership", type=Path)
     p = sub.add_parser("absence-check")
     p.add_argument("root", type=Path)
     p.add_argument(
@@ -2281,6 +2477,32 @@ def main(argv=None):
             esp_check(a.esp, expect_dtb=a.expect_dtb)
         except PolicyError as exc:
             print(f"esp-check: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "esp-admit":
+        try:
+            if a.overlay is not None:
+                hits = overlay_esp_entries(a.overlay)
+                if hits:
+                    raise PolicyError(
+                        f"OVERLAY writes the ESP (packages only): {hits[:5]}"
+                    )
+            elif a.esp_img is not None:
+                esp_admit(
+                    a.root,
+                    esp_image_entries(a.esp_img),
+                    esp_image_reader(a.esp_img),
+                    a.ownership,
+                )
+            else:
+                esp_admit(
+                    a.root,
+                    esp_dir_entries(a.esp_dir),
+                    esp_dir_reader(a.esp_dir),
+                    a.ownership,
+                )
+        except (PolicyError, OSError) as exc:
+            print(f"esp-admit: {exc}", file=sys.stderr)
             return 1
         return 0
     if a.cmd == "absence-check":

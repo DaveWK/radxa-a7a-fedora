@@ -126,14 +126,13 @@ check "shim in EFI/fedora" mtype -i "$ESP" ::/EFI/fedora/shimaa64.efi
 uuid=$(sed -n 's/^UUID=\([^ ]*\) *\/ .*/\1/p' "$ROOT/etc/fstab")
 check "EFI/fedora/grub.cfg finds root UUID $uuid" bash -c "mtype -i '$ESP' ::/EFI/fedora/grub.cfg | grep -q '$uuid'"
 check "boot/grub2/grub.cfg sets root to UUID $uuid" bash -c "'$TOP/fedora/run-build-ns.sh' user cat '$ROOT/boot/grub2/grub.cfg' | grep -q -- '--set=root $uuid'"
-fwstamp=$(cat "$ROOT/var/lib/cubie-a7a/firmware-dtb-version")
-pkgstamp=$(cat "$ROOT/usr/lib/cubie-a7a/dtb/VERSION")
-if [ "$fwstamp" -lt "$pkgstamp" ]; then
-    check "ESP DTB override present and full ESP layout matches (firmware stamp $fwstamp < package $pkgstamp)" \
-        python3 -I "$TOP/fedora/devcard-policy.py" esp-check "$ESP" --expect-dtb
+# The admission mkdevcard.sh runs at build: DTB stamps validated first, the
+# exact entry set with types, the DTB's bytes against the cubie-a7a-dtb
+# payload digest, and the marker.
+if out=$(python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --esp-img "$ESP" 2>&1); then
+    ok "ESP is our build's (stamps, exact entries and types, DTB bytes and marker)"
 else
-    check "no DTB override on the ESP and full ESP layout matches (firmware DTB is current)" \
-        python3 -I "$TOP/fedora/devcard-policy.py" esp-check "$ESP" --no-dtb
+    bad "ESP is our build's: $out"
 fi
 
 echo "== kernel, BLS, initramfs"

@@ -517,6 +517,10 @@ if [ -n "$OVERLAY" ]; then
     fi
     python3 -I "$TOP/fedora/devcard-policy.py" "${aic_overlay_args[@]}" >/dev/null ||
         { echo "mkdevcard: OVERLAY carries AIC8800 firmware (user opt-in only)" >&2; exit 1; }
+    # The ESP holds the packages' files only (devcard-policy.py esp-admit, the
+    # rule verify-devcard.sh applies): an overlay may not write boot/efi.
+    python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --overlay "$OVERLAY" ||
+        { echo "mkdevcard: OVERLAY writes the ESP (boot/efi)" >&2; exit 1; }
     cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/
     for u in "$OVERLAY"/usr/lib/systemd/system/*.service; do
         [ -e "$u" ] || continue
@@ -535,6 +539,12 @@ fi
 python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
     --report "$W/aic-provenance.tsv" >/dev/null ||
     { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
+
+# The ESP as it will be copied: the same admission verify-devcard.sh runs on
+# the image (DTB stamps, exact entries and types, DTB bytes against the
+# cubie-a7a-dtb payload digest, the marker).
+python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --esp-dir "$ROOT/boot/efi" ||
+    { echo "mkdevcard: the ESP (boot/efi) is not our build's" >&2; exit 1; }
 
 # The no-discard drop-ins were written before the overlay.  Re-check the final
 # root and the final initramfs, so an overlay cannot drop a drop-in or replace
@@ -587,6 +597,10 @@ mkfs.fat -F 32 -n EFI -i "$ESP_ID" -C "$esp" $((ESP_MIB * 1024)) >/dev/null
 # FAT keeps no owners or modes; copy the tree, then leave /boot/efi empty
 # as the mount point.
 mcopy -s -p -m -i "$esp" "$ROOT"/boot/efi/* ::
+python3 -I "$TOP/fedora/devcard-policy.py" esp-admit --root "$ROOT" --esp-img "$esp" || {
+    echo "mkdevcard: esp.img is not our build's ESP" >&2
+    exit 1
+}
 find "$ROOT/boot/efi" -mindepth 1 -delete
 truncate -s "${ROOT_MIB}M" "$rootimg"
 mkfs.ext4 -q -L "$RELEASE_LABEL" -U "$ROOT_UUID" -E root_owner=0:0 -d "$ROOT" "$rootimg"

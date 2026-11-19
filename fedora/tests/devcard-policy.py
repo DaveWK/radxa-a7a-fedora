@@ -1559,6 +1559,188 @@ def repart_initramfs_cases():
         assert not ok, "missing initramfs must fail closed"
 
 
+ESP_BASE_FILES = (
+    "EFI/BOOT/BOOTAA64.EFI",
+    "EFI/BOOT/fbaa64.efi",
+    "EFI/fedora/BOOTAA64.CSV",
+    "EFI/fedora/grub.cfg",
+    "EFI/fedora/grubaa64.efi",
+    "EFI/fedora/mmaa64.efi",
+    "EFI/fedora/shim.efi",
+    "EFI/fedora/shimaa64.efi",
+)
+DTB_BYTES = b"\xd0\x0d\xfe\xed packaged dtb\n"
+
+
+def _esp_root(work, fw="0\n", pkg="8\n"):
+    """A root with DTB stamps, the packaged DTB and its recorded payload digest."""
+    root = work / "root"
+    write(root / "var/lib/cubie-a7a/firmware-dtb-version", fw)
+    write(root / "usr/lib/cubie-a7a/dtb/VERSION", pkg)
+    dtb = root / "usr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
+    dtb.parent.mkdir(parents=True)
+    dtb.write_bytes(DTB_BYTES)
+    own = work / "ownership.tsv"
+    own.write_text(
+        f"cubie-a7a-dtb\tusr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb\t"
+        f"{hashlib.sha256(DTB_BYTES).hexdigest()}\t8\t\t0\n"
+    )
+    return root, own
+
+
+def _esp_tree(work, dtb=True, dtb_bytes=DTB_BYTES, mark=None):
+    src = work / "esp"
+    for rel in ESP_BASE_FILES:
+        write(src / rel, "ok\n")
+    if dtb:
+        d = src / "dtb/allwinner"
+        d.mkdir(parents=True)
+        (d / "sun60i-a733-cubie-a7a.dtb").write_bytes(dtb_bytes)
+        digest = hashlib.sha256(DTB_BYTES).hexdigest() if mark is None else mark
+        (d / "sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb").write_text(digest + "\n")
+    return src
+
+
+def _esp_img(work, src):
+    esp = work / "esp.img"
+    subprocess.run(
+        ["mkfs.fat", "-F", "32", "-n", "EFI", "-C", str(esp), "34000"],
+        check=True,
+        capture_output=True,
+    )
+    items = [str(p) for p in sorted(src.iterdir())]
+    subprocess.run(
+        ["mcopy", "-s", "-p", "-m", "-i", str(esp), *items, "::"],
+        check=True,
+        capture_output=True,
+    )
+    return esp
+
+
+def _admit(root, own, **src):
+    ((key, value),) = src.items()
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(here.parent / "devcard-policy.py"),
+            "esp-admit",
+            "--root",
+            str(root),
+            f"--{key.replace('_', '-')}",
+            str(value),
+            "--ownership",
+            str(own),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def esp_admission_cases():
+    """F6 B4: one ESP admission at build (staged tree) and verify (image)."""
+    assert shutil.which("mkfs.fat") and shutil.which("mcopy")
+    # Our build's layouts pass in both modes.
+    for fw, dtb in (("0\n", True), ("8\n", False), ("9\n", False)):
+        with fixture() as work:
+            root, own = _esp_root(work, fw=fw)
+            src = _esp_tree(work, dtb=dtb)
+            r = _admit(root, own, esp_dir=src)
+            assert r.returncode == 0, (fw, r.stderr)
+            r = _admit(root, own, esp_img=_esp_img(work, src))
+            assert r.returncode == 0, (fw, r.stderr)
+    # esp_override: the DTB is expected even with a current firmware stamp.
+    with fixture() as work:
+        root, own = _esp_root(work, fw="8\n")
+        write(root / "usr/lib/cubie-a7a/dtb/esp-override", "")
+        r = _admit(root, own, esp_dir=_esp_tree(work, dtb=False))
+        assert r.returncode == 1 and "missing=" in r.stderr, r.stderr
+    # Malformed stamps are refused, never read as "no DTB".
+    for fw, pkg in (("8x\n", "8\n"), ("", "8\n"), ("0\n", "eight\n"), (None, "8\n")):
+        with fixture() as work:
+            root, own = _esp_root(work, fw="0\n" if fw is None else fw, pkg=pkg)
+            if fw is None:
+                (root / "var/lib/cubie-a7a/firmware-dtb-version").unlink()
+            src = _esp_tree(work, dtb=False)
+            for mode in ("esp_dir", "esp_img"):
+                arg = src if mode == "esp_dir" else _esp_img(work, src)
+                r = _admit(root, own, **{mode: arg})
+                assert r.returncode == 1 and "malformed DTB stamp" in r.stderr, (
+                    fw,
+                    pkg,
+                    mode,
+                    r.stderr,
+                )
+                if mode == "esp_img":
+                    arg.unlink()
+    # Wrong entry types: a directory where a file belongs (and the reverse).
+    with fixture() as work:
+        root, own = _esp_root(work)
+        src = _esp_tree(work)
+        (src / "EFI/fedora/grub.cfg").unlink()
+        (src / "EFI/fedora/grub.cfg").mkdir()
+        write(src / "EFI/fedora/grub.cfg/x", "")
+        for mode in ("esp_dir", "esp_img"):
+            arg = src if mode == "esp_dir" else _esp_img(work, src)
+            r = _admit(root, own, **{mode: arg})
+            assert r.returncode == 1 and (
+                "wrong type" in r.stderr or "extra" in r.stderr
+            ), (
+                mode,
+                r.stderr,
+            )
+    with fixture() as work:
+        root, own = _esp_root(work)
+        src = _esp_tree(work)
+        dtb = src / "dtb/allwinner/sun60i-a733-cubie-a7a.dtb"
+        dtb.unlink()
+        dtb.mkdir()
+        esp = _esp_img(work, src)
+        r = _admit(root, own, esp_img=esp)
+        assert r.returncode == 1 and "wrong type" in r.stderr, r.stderr
+    # The right path with the wrong DTB bytes, and a marker that disagrees.
+    for kw, needle in (
+        ({"dtb_bytes": b"\xd0\x0d\xfe\xed other dtb\n"}, "is not the packaged DTB"),
+        ({"mark": "0" * 64}, "does not hold the DTB's digest"),
+    ):
+        with fixture() as work:
+            root, own = _esp_root(work)
+            src = _esp_tree(work, **kw)
+            for mode in ("esp_dir", "esp_img"):
+                arg = src if mode == "esp_dir" else _esp_img(work, src)
+                r = _admit(root, own, **{mode: arg})
+                assert r.returncode == 1 and needle in r.stderr, (kw, mode, r.stderr)
+    # Build time: an extra ESP file, and an OVERLAY that writes boot/efi.
+    with fixture() as work:
+        root, own = _esp_root(work)
+        src = _esp_tree(work)
+        write(src / "EFI/fedora/extra.efi", "x")
+        r = _admit(root, own, esp_dir=src)
+        assert r.returncode == 1 and "extra=" in r.stderr, r.stderr
+        overlay = work / "overlay"
+        write(overlay / "boot/efi/EFI/fedora/grub.cfg", "x")
+        r = _admit(root, own, overlay=overlay)
+        assert r.returncode == 1 and "OVERLAY writes the ESP" in r.stderr, r.stderr
+        clean = work / "overlay-clean"
+        write(clean / "opt/vendor/x", "x")
+        r = _admit(root, own, overlay=clean)
+        assert r.returncode == 0, r.stderr
+    # mkdevcard.sh calls the admission before the overlay copy, on the staged
+    # tree, and on esp.img before the tree is emptied; verify on the image.
+    mk = (here.parent / "mkdevcard.sh").read_text()
+    i_overlay = mk.index('esp-admit --root "$ROOT" --overlay "$OVERLAY"')
+    i_cp = mk.index('cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/')
+    i_dir = mk.index('esp-admit --root "$ROOT" --esp-dir "$ROOT/boot/efi"')
+    i_mcopy = mk.index('mcopy -s -p -m -i "$esp" "$ROOT"/boot/efi/* ::')
+    i_img = mk.index('esp-admit --root "$ROOT" --esp-img "$esp"')
+    i_del = mk.index('find "$ROOT/boot/efi" -mindepth 1 -delete')
+    assert i_overlay < i_cp < i_dir < i_mcopy < i_img < i_del
+    vd = (here.parent / "verify-devcard.sh").read_text()
+    assert 'esp-admit --root "$ROOT" --esp-img "$ESP"' in vd
+    assert "esp-check" not in vd
+
+
 def esp_check_cases():
     """Step 0 mdir: full ESP layout cross-checked with fsck.fat rejects prefixes and extras."""
     assert shutil.which("mkfs.fat") and shutil.which("mcopy")
@@ -1782,6 +1964,10 @@ def main():
     case(
         "verify-rpmdb-list: silent rpm -qa truncation fails closed (S0-8)",
         verify_rpmdb_list_cases,
+    )
+    case(
+        "esp-admit: stamps, entry types, DTB bytes and marker at build and verify (F6 B4)",
+        esp_admission_cases,
     )
     case(
         "esp-check: mdir + fsck.fat + exact ESP layout rejects prefixes and extras (Step 0)",
