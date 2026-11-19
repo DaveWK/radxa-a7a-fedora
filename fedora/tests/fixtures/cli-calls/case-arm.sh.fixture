@@ -1,0 +1,3 @@
+case "$mode" in
+    build) python3 -I "$TOP/fedora/devcard-policy.py" passwd-sole-root "$path" --unexpected ;;
+esac

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Check the repository callers against the actual, parse-only Python CLIs."""
+"""Check repository callers against the actual Python CLI parsers.
+
+runpy runs imports and module-level code. The sentinel stops the target after
+argparse parses the sample, before the selected CLI action.
+"""
 
 import argparse
 import ast
@@ -110,15 +114,43 @@ def target_for(word, source, programs):
     return matches[0] if len(matches) == 1 else ""
 
 
-def shell_words(text):
-    lexer = shlex.shlex(text, posix=True, punctuation_chars="();<>|&")
-    lexer.whitespace_split = True
-    words = []
-    for word in lexer:
-        if word and all(char in STOP for char in word):
-            break
-        words.append(word)
-    return words
+def shell_contexts(text):
+    """Quote state at each unescaped character, before shlex removes quotes."""
+    quote = None
+    escaped = False
+    for position, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        yield position, quote
+        if char == "\\" and quote != "'":
+            escaped = True
+        elif char == quote:
+            quote = None
+        elif quote is None and char in "\"'":
+            quote = char
+
+
+def shell_spans(text):
+    """Split argv from syntax and retain raw spans for the coverage check."""
+    start = 0
+    for position, quote in shell_contexts(text):
+        if quote is not None:
+            continue
+        char = text[position]
+        if not (char.isspace() or char in STOP):
+            continue
+        if char == "(":
+            raise ValueError("unquoted parenthesis in argv")
+        if position > start:
+            (word,) = shlex.split(text[start:position])
+            yield word, start, position
+        if char in STOP:
+            return
+        start = position + 1
+    if start != len(text):
+        (word,) = shlex.split(text[start:])
+        yield word, start, len(text)
 
 
 def word_values(word):
@@ -172,22 +204,79 @@ def manual_call(path, line, detail):
         target, variants, reason = UNRESOLVED[(path, line)]
     except KeyError:
         raise ValueError(f"{path}:{line}: unlisted unresolved call: {detail}") from None
+    if not variants or not reason:
+        raise ValueError(f"{path}:{line}: manual override lacks argv samples or reason")
     return Call(path, line, target, variants, "unresolved/sample", reason)
 
 
 def shell_calls(path, source, programs, used_manual, used_forwarded):
     aliases = {}
+    used_aliases = set()
     arrays = defaultdict(list)
     heredoc_end = None
+    spec_prose = False
+    names = {PurePosixPath(program).name for program in programs}
+    basename = re.compile(
+        r"(?<![\w.-])(?:" + "|".join(map(re.escape, sorted(names))) + r")(?![\w.-])"
+    )
+
+    def unresolved(line, detail):
+        if len(mentions) > 1:
+            raise ValueError(
+                f"{path}:{line}: multiple unresolved Python references; "
+                f"split into separately inventoried calls: {detail}"
+            )
+        call = manual_call(path, line, detail)
+        used_manual.add((path, line))
+        return call
+
+    def alias_name(word):
+        ref = VARIABLE.fullmatch(word)
+        return (ref[1] or ref[2]) if ref else ""
+
     for line, text in logical_lines(source):
         if heredoc_end:
             if text.strip() == heredoc_end:
                 heredoc_end = None
             continue
+        if path.endswith(".spec"):
+            section = re.match(
+                r"^\s*%(description|changelog|files|package|prep|build|install|check"
+                r"|clean|generate_buildrequires|(?:pre|post)\w*"
+                r"|(?:transfile|file)?trigger\w*|verifyscript)\b",
+                text,
+            )
+            if section:
+                spec_prose = section[1] in {"description", "changelog", "files"}
+            if spec_prose:
+                continue
         if PurePosixPath(path).name == "Makefile" or path.endswith(".mk"):
             # A simple make variable is not a shell command substitution.
             text = re.sub(r"(?<!\$)\$\(([A-Za-z_]\w*)\)", r"${\1}", text)
+        contexts = dict(shell_contexts(text))
+        for pos, quote in contexts.items():
+            if (
+                text[pos] == "#"
+                and quote is None
+                and (pos == 0 or text[pos - 1].isspace() or text[pos - 1] in STOP)
+            ):
+                text = text[:pos]
+                break
+        mentions = {match.start(): match[0] for match in basename.finditer(text)}
+        for match in VARIABLE.finditer(text):
+            alias = (match[1] or match[2]).split("[", 1)[0]
+            if alias in aliases:
+                mentions[match.start()] = match[0]
+
+        def cover(begin, end):
+            for pos in tuple(mentions):
+                if begin <= pos < end:
+                    del mentions[pos]
+
         if match := ARRAY_ASSIGN.fullmatch(text):
+            if mentions:
+                yield unresolved(line, "repository Python reference in command array")
+                continue
             name, operator, value = match.groups()
             args = tuple(shlex.split(value))
             if operator == "+=":
@@ -197,52 +286,87 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
             continue
         if match := ASSIGN.fullmatch(text):
             name, value = match.groups()
-            if target := target_for(value.strip("\"'"), path, programs):
-                aliases[name] = target
+            target = target_for(value.strip("\"'"), path, programs)
+            if target and name not in aliases and len(mentions) == 1:
+                aliases[name] = (target, line)
+            elif mentions or name in aliases:
+                yield unresolved(line, "ambiguous repository Python command assignment")
             continue
         for start in COMMAND_START.finditer(text):
-            command = text[start.end() :]
+            pos = start.start()
+            if pos and (
+                pos not in contexts
+                or (
+                    contexts[pos] is not None
+                    and not (contexts[pos] == '"' and text.startswith("$(", pos))
+                )
+            ):
+                continue
+            offset = start.end()
+            command = text[offset:]
             while prefix := PREFIX.match(command):
+                offset += prefix.end()
                 command = command[prefix.end() :]
             first = re.match(rf"({WORD}|\$\(PYTHON\))(?:\s|$)", command)
             if not first:
                 continue
             word = first[1].strip("\"'")
-            target = target_for(word, path, programs) or aliases.get(word.strip("${}"))
+            alias = alias_name(word)
+            target = target_for(word, path, programs) or aliases.get(alias, ("", 0))[0]
             interpreter = PYTHON.fullmatch(word)
             if not interpreter and not target:
                 continue
             tail = command[first.end() :]
+            arg_offset = offset + first.end()
             if interpreter and re.match(r"^(?:-[IBEsS]+\s+)*(?:-c|-)(?:\s|$)", tail):
                 yield Call(path, line, "interpreter", (), "not a CLI", "inline Python")
                 if marker := re.search(r"<<-?\s*['\"]?(\w+)", tail):
                     heredoc_end = marker[1]
                 continue
             try:
-                words = shell_words(tail)
+                tokens = list(shell_spans(tail))
+                begin = offset + first.start(1)
+                end = offset + first.end(1)
                 if interpreter:
-                    while words and re.fullmatch(r"-[IBEsSu]+", words[0]):
-                        words.pop(0)
-                    if not words:
+                    while tokens and re.fullmatch(r"-[IBEsSu]+", tokens[0][0]):
+                        tokens.pop(0)
+                    if not tokens:
                         raise ValueError("no script argument")
-                    script = words.pop(0)
-                    target = target_for(script, path, programs) or aliases.get(
-                        script.strip("${}")
+                    script, begin, end = tokens.pop(0)
+                    begin += arg_offset
+                    end += arg_offset
+                    alias = alias_name(script)
+                    target = (
+                        target_for(script, path, programs)
+                        or aliases.get(alias, ("", 0))[0]
                     )
                     if not target:
                         raise ValueError(f"unresolved script {script!r}")
                 reason, forwarded = FORWARDED.get((path, line), ("", ()))
                 if forwarded:
                     used_forwarded.add((path, line))
-                variants = expand(words, arrays, forwarded)
+                variants = expand([token[0] for token in tokens], arrays, forwarded)
                 if not variants:
                     raise ValueError("no representative argv")
             except ValueError as exc:
-                yield manual_call(path, line, exc)
-                used_manual.add((path, line))
+                yield unresolved(line, exc)
+                mentions.clear()
             else:
+                cover(begin, end)
+                if alias in aliases:
+                    used_aliases.add(alias)
                 category = "unresolved/sample" if forwarded else "CLI"
                 yield Call(path, line, target, variants, category, reason)
+        if mentions:
+            yield unresolved(
+                line,
+                "repository Python reference outside a resolved call: "
+                + ", ".join(mentions.values()),
+            )
+    for alias in sorted(aliases.keys() - used_aliases):
+        line = aliases[alias][1]
+        yield manual_call(path, line, f"unused repository Python alias {alias}")
+        used_manual.add((path, line))
 
 
 def expression(node):
@@ -455,14 +579,54 @@ def check_argv(target, argv):
     return "program returned without reaching the parser sentinel"
 
 
+def fixture_failures():
+    target = "fedora/devcard-policy.py"
+    folder = Path(__file__).parent / "fixtures" / "cli-calls"
+    for name, fails_in_inventory in (
+        ("case-arm.sh.fixture", True),
+        ("array-command.sh.fixture", True),
+        ("quoted-operator.sh.fixture", False),
+    ):
+        path = folder / name
+        try:
+            calls = list(
+                shell_calls(
+                    path.relative_to(ROOT).as_posix(),
+                    path.read_text(),
+                    {target},
+                    set(),
+                    set(),
+                )
+            )
+        except ValueError as exc:
+            if fails_in_inventory and "unlisted unresolved call:" in str(exc):
+                print(f"Fixture {name}: PASS (inventory rejected unresolved form)")
+            else:
+                yield f"fixture {name}: unexpected inventory error: {exc}"
+            continue
+        if fails_in_inventory:
+            yield f"fixture {name}: unresolved form did not raise an inventory error"
+            continue
+        argv = ("passwd-sole-root", "/stub/path", "|", "--unexpected")
+        actual = [(call.target, variant) for call in calls for variant in call.variants]
+        if actual != [(target, argv)]:
+            yield f"fixture {name}: quoted operator or trailing option lost: {actual!r}"
+            continue
+        message = check_argv(target, argv)
+        if "unrecognized arguments: | --unexpected" not in message:
+            yield f"fixture {name}: real parser did not reject the full argv: {message!r}"
+        else:
+            print(f"Fixture {name}: PASS (parser rejected | --unexpected)")
+
+
 def main():
+    failures = list(fixture_failures())
     calls = inventory()
     counts = Counter(call.category for call in calls)
     inline = sum(call.note == "inline Python" for call in calls)
     loads = sum(call.note == "module load" for call in calls)
     cli = counts["CLI"] + counts["unresolved/sample"]
     print(f"Inventory: {cli} CLI calls, {inline} inline Python, {loads} module loads")
-    failures = []
     if cli < MIN_CLI_CALLS or inline < MIN_INLINE_CALLS or loads < MIN_MODULE_LOADS:
         failures.append("inventory dropped below the pinned minimum")
     for call in calls:

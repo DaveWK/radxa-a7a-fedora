@@ -1,0 +1,2 @@
+cmd=(python3 -I "$TOP/fedora/devcard-policy.py" passwd-sole-root)
+"${cmd[@]}" "$path" --unexpected
