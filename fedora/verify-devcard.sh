@@ -5,7 +5,8 @@
 # firmware, boot chain files, initramfs contents, image policy. Reads only.
 # Not a board test.
 #
-# Usage: fedora/verify-devcard.sh [IMAGE] [WORK_DIR]
+# Usage: fedora/verify-devcard.sh [--compare-staging] [IMAGE] [WORK_DIR]
+# --compare-staging also checks the optional build records from WORK_DIR.
 #
 # Set as for the build (mkdevcard.sh), to check what it added:
 #   FEDORA_RELEASE=45|rawhide  the release (fedora/release.sh): default
@@ -22,6 +23,11 @@ set -uo pipefail
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
+compare_staging=no
+if [[ ${1:-} == --compare-staging ]]; then
+    compare_staging=yes
+    shift
+fi
 IMG=${1:-$TOP/build/image/a7a-fedora$RELEASE_SUFFIX-dev.img}
 W=${2:-$TOP/build/fedora/devcard$RELEASE_SUFFIX}
 KERNEL_VERSION=${KERNEL_VERSION:-}
@@ -83,7 +89,7 @@ check() {
     shift
     if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what"; fi
 }
-if [ -f "$W/root.img" ]; then
+if [[ $compare_staging == yes && -f $W/root.img ]]; then
     check "staging root.img is byte-identical to IMG's root partition" cmp "$W/root.img" "$ROOT_IMG"
 fi
 
@@ -203,7 +209,7 @@ check "systemd pets WDT0 (16 s, the sunxi_wdt maximum)" grep -qx 'RuntimeWatchdo
 check "an oops panics, a panic reboots after 10 s (sysctl.d)" bash -c "grep -qx 'kernel.panic_on_oops = 1' '$ROOT/usr/lib/sysctl.d/60-cubie-a7a-panic.conf' && grep -qx 'kernel.panic = 10' '$ROOT/usr/lib/sysctl.d/60-cubie-a7a-panic.conf'"
 check "RTL8125B firmware present" bash -c "ls '$ROOT'/usr/lib/firmware/rtl_nic/rtl8125b-2.fw* >/dev/null"
 # Closed-firmware audit: a report, not a check (fedora/image-firmware.py).
-if [ -s "$W/firmware-audit.txt" ]; then
+if [[ $compare_staging == yes && -s $W/firmware-audit.txt ]]; then
     echo "  info  firmware audit (report only): $(grep '^image-firmware: ' "$W/firmware-audit.txt" | tail -1)"
 fi
 
@@ -277,7 +283,7 @@ check "no Wi-Fi connection profile in the image (nothing auto-connects)" bash -c
 for pkg in $EXTRA_PACKAGES; do
     check "$pkg installed (EXTRA_PACKAGES)" grep -q "^$pkg-[0-9]" "$PACKAGES"
 done
-if [ -s "$W/overlay.sha256" ]; then
+if [[ $compare_staging == yes && -s $W/overlay.sha256 ]]; then
     check "overlay files in the root as built ($(wc -l <"$W/overlay.sha256") files)" "$TOP/fedora/run-build-ns.sh" user bash -c "cd '$(realpath "$ROOT")' && sha256sum --quiet -c '$(realpath "$W/overlay.sha256")'"
 fi
 # check-sshd.sh runs the target sshd (qemu-user) in the private namespace.
