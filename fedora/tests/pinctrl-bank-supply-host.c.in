@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Host model for the per-bank supply bookkeeping of pinctrl-sunxi:
+ * sunxi_pmx_request() and sunxi_pmx_free() are pasted in verbatim from
+ * fedora/kmods/cubie-a7a-kmods/pinctrl/pinctrl-sunxi.c and run by threads
+ * that call them the way the pinctrl core does (pinctrl-bank-supply.py).
+ *
+ * What is modelled:
+ * - the callers. drivers/pinctrl/pinmux.c serialises per pin only
+ *   (desc->mux_lock, dropped before .request/.free are called), so each
+ *   thread owns its pins and all threads share one bank:
+ *     mux threads   request with no lock held (pinctrl_commit_state), free
+ *                   under a global mutex (pinctrl_free: pinctrl_list_mutex)
+ *     gpio threads  request and free under one mutex (pctldev->mutex,
+ *                   pinctrl_gpio_request/free)
+ * - refcount_t with the saturation semantics of include/linux/refcount.h,
+ *   counting the two "use-after-free" warnings instead of printing them
+ * - the regulator consumer calls: handles are never really freed, so a use
+ *   of a put handle is counted instead of crashing; regulator_get() and
+ *   regulator_enable() sleep a little, as the real ones can
+ *
+ * Not modelled: the kernel's mutex, scheduler or memory allocator. A clean
+ * run shows the bookkeeping is balanced under these interleavings; it is
+ * not a proof.
+ */
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ---- counters ---------------------------------------------------------- */
+static atomic_long ev_underflow, ev_add_on_zero, ev_null_handle, ev_stale_handle,
+	ev_put_enabled, ev_unbalanced_disable, ev_supply_off_in_use;
+static atomic_long live_handles, rdev_use_count;
+
+/* ---- kernel shims ------------------------------------------------------ */
+#define PINS_PER_BANK 32
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define WARN_ON_ONCE(c) (c)
+#define IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095)
+#define PTR_ERR(p) ((long)(p))
+#define dev_err(dev, ...) ((void)(dev))
+#define dev_err_probe(dev, err, ...) ((void)(dev), (int)(err))
+
+struct device { int unused; };
+
+#define REFCOUNT_SATURATED (INT_MIN_ / 2)
+#define INT_MIN_ (-2147483647 - 1)
+typedef struct { atomic_int refs; } refcount_t;
+
+static void refcount_set(refcount_t *r, int n)
+{
+	atomic_store(&r->refs, n);
+}
+
+static void refcount_inc(refcount_t *r)
+{
+	int old = atomic_fetch_add(&r->refs, 1);
+
+	if (old == 0) {
+		atomic_fetch_add(&ev_add_on_zero, 1);
+		atomic_store(&r->refs, REFCOUNT_SATURATED);
+	} else if (old < 0 || old + 1 < 0) {
+		atomic_store(&r->refs, REFCOUNT_SATURATED);
+	}
+}
+
+static int refcount_dec_and_test(refcount_t *r)
+{
+	int old = atomic_fetch_sub(&r->refs, 1);
+
+	if (old > 0 && old == 1)
+		return 1;
+	if (old <= 0 || old - 1 < 0) {
+		atomic_fetch_add(&ev_underflow, 1);
+		atomic_store(&r->refs, REFCOUNT_SATURATED);
+	}
+	return 0;
+}
+
+struct mutex { pthread_mutex_t m; };
+
+static void mutex_init(struct mutex *lock)
+{
+	pthread_mutex_init(&lock->m, NULL);
+}
+
+static void mutex_lock(struct mutex *lock)
+{
+	pthread_mutex_lock(&lock->m);
+}
+
+static void mutex_unlock(struct mutex *lock)
+{
+	pthread_mutex_unlock(&lock->m);
+}
+
+static inline struct mutex *mutex_guard_enter(struct mutex *lock)
+{
+	mutex_lock(lock);
+	return lock;
+}
+
+static inline void mutex_guard_exit(struct mutex **lock)
+{
+	mutex_unlock(*lock);
+}
+
+#define guard(name) \
+	__attribute__((cleanup(name##_guard_exit), unused)) struct name *guard_var = name##_guard_enter
+
+/* ---- regulator model --------------------------------------------------- */
+#define REG_LIVE 0x5245474cu
+#define REG_PUT  0xdeadbeefu
+struct regulator {
+	atomic_uint magic;
+	atomic_int enable_count;
+};
+
+static unsigned int jitter_us;
+
+static void jitter(void)
+{
+	static _Thread_local unsigned int seed;
+
+	if (!jitter_us)
+		return;
+	if (!seed)
+		seed = (unsigned int)(unsigned long)pthread_self() | 1;
+	usleep(rand_r(&seed) % jitter_us);
+}
+
+static struct regulator *regulator_get(struct device *dev, const char *id)
+{
+	struct regulator *reg = calloc(1, sizeof(*reg));
+
+	(void)dev;
+	(void)id;
+	if (!reg)
+		abort();
+	jitter();
+	atomic_store(&reg->magic, REG_LIVE);
+	atomic_fetch_add(&live_handles, 1);
+	return reg;
+}
+
+static int reg_usable(struct regulator *reg)
+{
+	if (!reg) {
+		atomic_fetch_add(&ev_null_handle, 1);
+		return 0;
+	}
+	if (atomic_load(&reg->magic) != REG_LIVE) {
+		atomic_fetch_add(&ev_stale_handle, 1);
+		return 0;
+	}
+	return 1;
+}
+
+static int regulator_enable(struct regulator *reg)
+{
+	if (!reg_usable(reg))
+		return -EINVAL;
+	jitter();
+	atomic_fetch_add(&reg->enable_count, 1);
+	atomic_fetch_add(&rdev_use_count, 1);
+	return 0;
+}
+
+static int regulator_disable(struct regulator *reg)
+{
+	if (!reg_usable(reg))
+		return -EINVAL;
+	if (atomic_fetch_sub(&reg->enable_count, 1) <= 0) {
+		atomic_fetch_add(&reg->enable_count, 1);
+		atomic_fetch_add(&ev_unbalanced_disable, 1);
+		return -EIO;
+	}
+	atomic_fetch_sub(&rdev_use_count, 1);
+	return 0;
+}
+
+static void regulator_put(struct regulator *reg)
+{
+	if (!reg_usable(reg))
+		return;
+	if (atomic_load(&reg->enable_count))
+		atomic_fetch_add(&ev_put_enabled, 1);
+	/* Kept allocated on purpose: a later use is counted, not a crash. */
+	atomic_store(&reg->magic, REG_PUT);
+	atomic_fetch_sub(&live_handles, 1);
+}
+
+/* ---- the driver side --------------------------------------------------- */
+struct sunxi_pinctrl_desc { unsigned int pin_base; };
+struct pinctrl_dev { void *drvdata; };
+
+@STRUCT_REGULATOR@
+
+struct sunxi_pinctrl {
+	const struct sunxi_pinctrl_desc	*desc;
+	struct device			*dev;
+	struct sunxi_pinctrl_regulator	regulators[11];
+};
+
+static void *pinctrl_dev_get_drvdata(struct pinctrl_dev *pctldev)
+{
+	return pctldev->drvdata;
+}
+
+static int sunxi_pinctrl_set_io_bias_cfg(struct sunxi_pinctrl *pctl,
+					 unsigned pin, struct regulator *supply)
+{
+	(void)pctl;
+	(void)pin;
+	reg_usable(supply);
+	return 0;
+}
+
+@REQUEST@
+
+@FREE@
+
+/* ---- the callers ------------------------------------------------------- */
+#define BANK 5 /* PF */
+static struct sunxi_pinctrl_desc desc;
+static struct device dev;
+static struct sunxi_pinctrl pctl = { .desc = &desc, .dev = &dev };
+static struct pinctrl_dev pctldev = { .drvdata = &pctl };
+static pthread_mutex_t pinctrl_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pctldev_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_barrier_t start;
+static int rounds;
+
+struct user {
+	pthread_t thread;
+	int gpio;	/* GPIO path: both calls under pctldev->mutex */
+	int first_pin;
+	int npins;
+};
+
+static void *user_thread(void *arg)
+{
+	struct user *u = arg;
+	int r, i;
+
+	pthread_barrier_wait(&start);
+	for (r = 0; r < rounds; r++) {
+		for (i = 0; i < u->npins; i++) {
+			if (u->gpio)
+				pthread_mutex_lock(&pctldev_mutex);
+			if (sunxi_pmx_request(&pctldev, BANK * PINS_PER_BANK + u->first_pin + i))
+				abort();
+			if (u->gpio)
+				pthread_mutex_unlock(&pctldev_mutex);
+		}
+		/* This user holds pins of the bank: its supply must be on. */
+		if (atomic_load(&rdev_use_count) <= 0)
+			atomic_fetch_add(&ev_supply_off_in_use, 1);
+		jitter();
+		if (atomic_load(&rdev_use_count) <= 0)
+			atomic_fetch_add(&ev_supply_off_in_use, 1);
+		pthread_mutex_lock(u->gpio ? &pctldev_mutex : &pinctrl_list_mutex);
+		for (i = 0; i < u->npins; i++)
+			sunxi_pmx_free(&pctldev, BANK * PINS_PER_BANK + u->first_pin + i);
+		pthread_mutex_unlock(u->gpio ? &pctldev_mutex : &pinctrl_list_mutex);
+	}
+	return NULL;
+}
+
+int main(int argc, char **argv)
+{
+	/* The Cubie A7A PF bank: mmc0 (5 pins), the PF4 regulator GPIO, a third user. */
+	struct user users[] = {
+		{ .gpio = 0, .first_pin = 0, .npins = 4 },
+		{ .gpio = 1, .first_pin = 4, .npins = 1 },
+		{ .gpio = 0, .first_pin = 5, .npins = 2 },
+		{ .gpio = 0, .first_pin = 7, .npins = 1 },
+	};
+	struct sunxi_pinctrl_regulator *s_reg = &pctl.regulators[BANK];
+	long bad, leaked;
+	unsigned int i;
+
+	rounds = argc > 1 ? atoi(argv[1]) : 20000;
+	jitter_us = argc > 2 ? (unsigned int)atoi(argv[2]) : 3;
+@INIT_LOCKS@
+	pthread_barrier_init(&start, NULL, ARRAY_SIZE(users));
+	for (i = 0; i < ARRAY_SIZE(users); i++)
+		pthread_create(&users[i].thread, NULL, user_thread, &users[i]);
+	for (i = 0; i < ARRAY_SIZE(users); i++)
+		pthread_join(users[i].thread, NULL);
+
+	/* Every pin is free again: nothing may be left behind. */
+	leaked = atomic_load(&live_handles);
+	printf("rounds=%d users=%zu\n", rounds, ARRAY_SIZE(users));
+	printf("refcount underflow            %ld\n", atomic_load(&ev_underflow));
+	printf("refcount addition on 0        %ld\n", atomic_load(&ev_add_on_zero));
+	printf("supply off while pins in use  %ld\n", atomic_load(&ev_supply_off_in_use));
+	printf("NULL handle used              %ld\n", atomic_load(&ev_null_handle));
+	printf("put handle used again         %ld\n", atomic_load(&ev_stale_handle));
+	printf("put while still enabled       %ld\n", atomic_load(&ev_put_enabled));
+	printf("unbalanced disable            %ld\n", atomic_load(&ev_unbalanced_disable));
+	printf("handles leaked at the end     %ld\n", leaked);
+	printf("supply enables left           %ld\n", atomic_load(&rdev_use_count));
+	printf("bank handle pointer at end    %s\n", s_reg->regulator ? "set" : "NULL");
+	bad = atomic_load(&ev_underflow) + atomic_load(&ev_add_on_zero) +
+	      atomic_load(&ev_supply_off_in_use) + atomic_load(&ev_null_handle) +
+	      atomic_load(&ev_stale_handle) + atomic_load(&ev_put_enabled) +
+	      atomic_load(&ev_unbalanced_disable) + leaked +
+	      atomic_load(&rdev_use_count) + (s_reg->regulator ? 1 : 0);
+	printf("%s\n", bad ? "RACE" : "CLEAN");
+	return bad ? 1 : 0;
+}

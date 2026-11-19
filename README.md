@@ -51,6 +51,14 @@ is the only login, the password is `Fedora123` (`ROOT_PASSWORD`), sshd and
 DHCP are on, and the image holds no SSH keys of anyone (host keys are
 generated on first boot).
 
+## Tests
+
+    python3 fedora/tests/pinctrl-bank-supply.py
+
+A host model (needs `gcc`) of the pin controller module's per-bank supply
+bookkeeping under concurrent pin requests. It is a model of the
+interleavings, not a board test.
+
 ## Not in this repository
 
 - **AIC8800 Wi-Fi/Bluetooth driver source.** Most of the upstream driver
