@@ -26,6 +26,7 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -124,12 +125,30 @@ def sha256(path):
     return h.hexdigest()
 
 
+def _walk_paths(base):
+    def on_error(exc):
+        raise SystemExit(f"cannot traverse {exc.filename or base}: {exc}")
+
+    out = []
+    for dirpath, dirnames, filenames in os.walk(base, onerror=on_error):
+        dirnames.sort()
+        cur = Path(dirpath)
+        for dname in dirnames:
+            dpath = cur / dname
+            if dpath.is_symlink():
+                out.append(dpath)
+        for fname in sorted(filenames):
+            fpath = cur / fname
+            if fpath.is_symlink() or fpath.is_file():
+                out.append(fpath)
+    return sorted(out)
+
+
 def find_firmware(src):
     hits = []
-    for path in sorted(Path(src).rglob("*")):
-        if path.is_file() or path.is_symlink():
-            if firmware_name(path.relative_to(src).as_posix()):
-                hits.append(str(path))
+    for path in _walk_paths(src):
+        if firmware_name(path.relative_to(src).as_posix()):
+            hits.append(str(path))
     return hits
 
 
@@ -170,7 +189,7 @@ def stage(src, out, version, list_path):
         records.append((actual_digest, rel.as_posix()))
     # Nothing outside the reviewed list may be in the staged tree.
     staged = sorted(
-        p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()
+        p.relative_to(dest).as_posix() for p in _walk_paths(dest) if p.is_file()
     )
     expected = sorted(rel.as_posix() for _, rel in entries)
     if staged != expected:
@@ -233,14 +252,95 @@ def _allowed_payload_paths(dkms_ver, entries):
     return allowed_files, allowed_files | allowed_dirs | SPEC_OUTPUTS
 
 
+END_MARKER_RE = re.compile(r"^---END-RPM-PAYLOAD ([0-9]+)$")
+CPIO_NEWC_MAGICS = (b"070701", b"070702")
+
+
+def _parse_rpm_cpio_paths(data):
+    """Parse an uncompressed cpio newc/crc stream from rpm2cpio, requiring TRAILER!!!."""
+    pos = 0
+    length = len(data)
+    paths = []
+    trailer_seen = False
+    while pos < length:
+        if pos + 110 > length:
+            raise ValueError("truncated rpm2cpio cpio header before TRAILER!!!")
+        magic = data[pos : pos + 6]
+        if magic not in CPIO_NEWC_MAGICS:
+            raise ValueError(f"unexpected rpm2cpio magic {magic!r} at offset {pos}")
+        try:
+            fields = [
+                int(data[pos + 6 + i * 8 : pos + 14 + i * 8], 16) for i in range(13)
+            ]
+        except ValueError as exc:
+            raise ValueError(f"corrupt rpm2cpio header at offset {pos}") from exc
+        mode, filesize, namesize = fields[1], fields[6], fields[11]
+        pos += 110
+        if namesize < 1 or pos + namesize > length:
+            raise ValueError("truncated rpm2cpio entry name before TRAILER!!!")
+        raw_name = data[pos : pos + namesize]
+        if not raw_name.endswith(b"\x00"):
+            raise ValueError("unterminated rpm2cpio entry name")
+        name = os.fsdecode(raw_name[:-1])
+        pos += namesize
+        if pos % 4:
+            pos += 4 - (pos % 4)
+        if pos + filesize > length:
+            raise ValueError(f"truncated rpm2cpio payload for {name!r}")
+        pos += filesize
+        if pos % 4:
+            pos += 4 - (pos % 4)
+        if name == "TRAILER!!!":
+            trailer_seen = True
+            if any(b != 0 for b in data[pos:]):
+                raise ValueError("trailing non-zero bytes after rpm2cpio TRAILER!!!")
+            break
+        rel = name.lstrip("/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if rel:
+            paths.append(("/" + rel, stat.S_ISDIR(mode)))
+    if not trailer_seen:
+        raise ValueError("rpm2cpio stream missing TRAILER!!!")
+    return paths
+
+
 def payload(rpm, list_path):
     entries = read_list(list_path)
     dkms_ver = dkms_ver_of(rpm)
     required_driver_files, allowed_all = _allowed_payload_paths(dkms_ver, entries)
     result = subprocess.run(
-        ["rpm", "-qlp", str(rpm)], capture_output=True, text=True, check=True
+        [
+            "rpm",
+            "-qp",
+            "--qf",
+            "[%{FILENAMES}\n]---END-RPM-PAYLOAD %{FILENAMES:arraysize}\n",
+            str(rpm),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        print(f"{rpm}: empty rpm payload listing", file=sys.stderr)
+        return 1
+    match = END_MARKER_RE.fullmatch(lines[-1])
+    if not match:
+        print(
+            f"{rpm}: incomplete rpm payload listing (missing end count marker)",
+            file=sys.stderr,
+        )
+        return 1
+    expected_count = int(match.group(1))
+    paths = lines[:-1]
+    if len(paths) != expected_count:
+        print(
+            f"{rpm}: truncated rpm payload listing "
+            f"(got {len(paths)} paths, header declares {expected_count})",
+            file=sys.stderr,
+        )
+        return 1
     problems = []
     for path in paths:
         if firmware_name(path):
@@ -253,6 +353,31 @@ def payload(rpm, list_path):
     path_set = set(paths)
     for path in sorted(required_driver_files - path_set):
         problems.append(f"{path}: reviewed driver input missing from the RPM")
+    for path in sorted(SPEC_OUTPUTS - path_set):
+        problems.append(f"{path}: required package output missing from the RPM")
+    rpm_path = Path(rpm)
+    if rpm_path.is_file():
+        cpio_res = subprocess.run(["rpm2cpio", str(rpm_path)], capture_output=True)
+        if cpio_res.returncode != 0 or cpio_res.stderr.strip():
+            problems.append(
+                f"{rpm}: rpm2cpio failed: "
+                f"{cpio_res.stderr.decode(errors='replace').strip() or cpio_res.returncode}"
+            )
+        else:
+            try:
+                cpio_entries = _parse_rpm_cpio_paths(cpio_res.stdout)
+            except ValueError as exc:
+                problems.append(f"{rpm}: {exc}")
+            else:
+                cpio_paths = {p for p, _ in cpio_entries}
+                for path in sorted(cpio_paths - path_set):
+                    problems.append(
+                        f"{path}: present in rpm2cpio archive but absent from rpm listing"
+                    )
+                for path in sorted(required_driver_files - cpio_paths):
+                    problems.append(
+                        f"{path}: reviewed driver input missing from rpm2cpio archive"
+                    )
     for problem in problems:
         print(problem)
     if problems:

@@ -50,6 +50,7 @@ import errno
 import gzip
 import hashlib
 import importlib
+import json
 import lzma
 import os
 import re
@@ -1319,6 +1320,179 @@ def initramfs_check(
     return (not problems, problems)
 
 
+REQUIRED_BOARD_PACKAGES = ("cubie-a7a-dtb", "cubie-a7a-board-support")
+OPTIONAL_NOARCH_PACKAGES = (
+    "cubie-a7a-npu",
+    "cubie-a7a-rk1828",
+    "cubie-a7a-display",
+    "cubie-a7a-vdec",
+    "cubie-a7a-hat",
+    "cubie-a7a-aic8800-usb",
+)
+OPTIONAL_AARCH64_PACKAGES = ("cubie-a7a-fwlog",)
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def write_rpm_manifest(rpms_dir, out_manifest, rpm_paths, kind="noarch"):
+    """Write an atomic checked-RPM manifest with exact relpaths and sha256s."""
+    if kind not in ("noarch", "aarch64"):
+        raise PolicyError(f"invalid rpm manifest kind: {kind!r}")
+    allowed = (
+        set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES)
+        if kind == "noarch"
+        else set(OPTIONAL_AARCH64_PACKAGES)
+    )
+    base = Path(rpms_dir).resolve()
+    records = []
+    seen = set()
+    for raw in sorted(rpm_paths):
+        path = Path(raw).resolve()
+        if not path.is_file():
+            raise PolicyError(f"missing built RPM: {path}")
+        try:
+            rel = path.relative_to(base).as_posix()
+        except ValueError as exc:
+            raise PolicyError(f"RPM {path} is outside {base}") from exc
+        res = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{NAME}", str(path)],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            raise PolicyError(f"cannot read RPM name from {path}: {res.stderr.strip()}")
+        pkg = res.stdout.strip()
+        if pkg not in allowed:
+            raise PolicyError(f"unexpected {kind} board RPM package: {pkg}")
+        if pkg in seen:
+            raise PolicyError(f"duplicate {kind} board RPM package in run: {pkg}")
+        seen.add(pkg)
+        records.append(
+            {"package": pkg, "relpath": rel, "sha256": _file_digest(path, "sha256")}
+        )
+    if not records:
+        raise PolicyError(f"no {kind} RPMs provided for manifest")
+    payload = {
+        "version": 1,
+        "kind": kind,
+        "count": len(records),
+        "rpms": records,
+    }
+    out_path = Path(out_manifest)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".checked-rpms.", suffix=".tmp", dir=out_path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_name, out_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return payload
+
+
+def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages):
+    base = Path(rpms_dir).resolve()
+    mpath = Path(manifest_path)
+    try:
+        raw = mpath.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PolicyError(f"cannot read checked RPM manifest {mpath}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PolicyError(f"corrupt or truncated RPM manifest {mpath}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PolicyError(f"invalid RPM manifest {mpath}: expected object")
+    if data.get("version") != 1 or data.get("kind") != expected_kind:
+        raise PolicyError(
+            f"invalid RPM manifest {mpath}: version={data.get('version')!r}, "
+            f"kind={data.get('kind')!r}"
+        )
+    rpms = data.get("rpms")
+    count = data.get("count")
+    if (
+        not isinstance(rpms, list)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(rpms)
+        or count == 0
+    ):
+        raise PolicyError(
+            f"incomplete RPM manifest {mpath}: count={count!r}, entries={len(rpms) if isinstance(rpms, list) else 'invalid'}"
+        )
+    selected = {}
+    for idx, entry in enumerate(rpms):
+        if not isinstance(entry, dict):
+            raise PolicyError(f"{mpath}: entry {idx} is not an object")
+        pkg = entry.get("package")
+        rel = entry.get("relpath")
+        expected_sha = entry.get("sha256")
+        if (
+            not isinstance(pkg, str)
+            or pkg not in allowed_packages
+            or not isinstance(rel, str)
+            or not rel
+            or not isinstance(expected_sha, str)
+            or not SHA256_HEX_RE.fullmatch(expected_sha)
+        ):
+            raise PolicyError(f"{mpath}: invalid entry {idx}: {entry!r}")
+        if pkg in selected:
+            raise PolicyError(f"{mpath}: duplicate package {pkg}")
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise PolicyError(f"{mpath}: unsafe relpath {rel!r}")
+        target = (base / rel_path).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise PolicyError(f"{mpath}: path escapes {base}: {rel!r}") from exc
+        if not target.is_file() or target.is_symlink():
+            raise PolicyError(f"{mpath}: missing or non-regular RPM {rel}")
+        actual_sha = _file_digest(target, "sha256")
+        if actual_sha != expected_sha:
+            raise PolicyError(
+                f"{mpath}: sha256 mismatch for {rel} "
+                f"(actual {actual_sha}, manifest {expected_sha})"
+            )
+        selected[pkg] = target
+    return selected
+
+
+def select_checked_rpms(rpms_dir):
+    """Select board RPMs strictly from the checked manifest(s) under RPMS_DIR.
+
+    Never globs the directory; verifies JSON framing, entry count, safe paths,
+    and every RPM's SHA-256 digest.
+    """
+    base = Path(rpms_dir)
+    noarch_manifest = base / "checked-rpms.json"
+    selected = _load_rpm_manifest(
+        base,
+        noarch_manifest,
+        "noarch",
+        set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES),
+    )
+    for req in REQUIRED_BOARD_PACKAGES:
+        if req not in selected:
+            raise PolicyError(f"{noarch_manifest}: missing required package {req}")
+    aarch64_manifest = base / "checked-aarch64-rpms.json"
+    if aarch64_manifest.exists() or aarch64_manifest.is_symlink():
+        arch_selected = _load_rpm_manifest(
+            base, aarch64_manifest, "aarch64", set(OPTIONAL_AARCH64_PACKAGES)
+        )
+        selected.update(arch_selected)
+    order = (
+        REQUIRED_BOARD_PACKAGES + OPTIONAL_AARCH64_PACKAGES + OPTIONAL_NOARCH_PACKAGES
+    )
+    return [(pkg, selected[pkg]) for pkg in order if pkg in selected]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1357,6 +1531,13 @@ def main(argv=None):
     p = sub.add_parser("shadow")
     p = sub.add_parser("passwd-sole-root")
     p.add_argument("path", type=Path)
+    p = sub.add_parser("write-rpm-manifest")
+    p.add_argument("rpms_dir", type=Path)
+    p.add_argument("manifest", type=Path)
+    p.add_argument("--kind", choices=("noarch", "aarch64"), default="noarch")
+    p.add_argument("rpms", nargs="+", type=Path)
+    p = sub.add_parser("select-rpms")
+    p.add_argument("rpms_dir", type=Path)
     a = ap.parse_args(argv)
     if a.cmd == "aic-overlay":
         try:
@@ -1463,6 +1644,21 @@ def main(argv=None):
                 f"{a.path}: not exactly one root login and no other human user",
                 file=sys.stderr,
             )
+            return 1
+        return 0
+    if a.cmd == "write-rpm-manifest":
+        try:
+            write_rpm_manifest(a.rpms_dir, a.manifest, a.rpms, kind=a.kind)
+        except PolicyError as exc:
+            print(f"write-rpm-manifest: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "select-rpms":
+        try:
+            for pkg, rpm_path in select_checked_rpms(a.rpms_dir):
+                print(f"{pkg}\t{rpm_path}")
+        except PolicyError as exc:
+            print(f"select-rpms: {exc}", file=sys.stderr)
             return 1
         return 0
     return 2

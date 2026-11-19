@@ -192,9 +192,18 @@ class FakeRpm:
 
     def __call__(self, argv, **kwargs):
         if "--qf" in argv:
-            return type("R", (), {"stdout": self.dkms_ver + "\n", "returncode": 0})()
+            fmt = argv[argv.index("--qf") + 1]
+            if "FILENAMES" in fmt:
+                body = "\n".join(self.paths)
+                out = f"{body}\n---END-RPM-PAYLOAD {len(self.paths)}\n"
+                return type("R", (), {"stdout": out, "stderr": "", "returncode": 0})()
+            return type(
+                "R", (), {"stdout": self.dkms_ver + "\n", "stderr": "", "returncode": 0}
+            )()
         return type(
-            "R", (), {"stdout": "\n".join(self.paths) + "\n", "returncode": 0}
+            "R",
+            (),
+            {"stdout": "\n".join(self.paths) + "\n", "stderr": "", "returncode": 0},
         )()
 
 
@@ -424,6 +433,193 @@ def test_build_rpms_stale_spec_not_rebuilt_when_skipped():
         assert rebuilt == [], f"stale AIC spec was rebuilt after skip: {rebuilt}"
 
 
+def test_payload_rejects_silent_truncation():
+    """S0-5: silently truncated rpm payload listing (exit 0, no stderr) fails closed."""
+    if not shutil.which("rpmbuild"):
+        return
+    real_rpm = shutil.which("rpm")
+    assert real_rpm, "need rpm"
+    with tempfile.TemporaryDirectory(prefix="a7a-payload-trunc-") as td:
+        root = Path(td)
+        src = fixture_src(root)
+        list_path = fixture_list(root, src)
+        out = root / "rpmbuild"
+        for sub in ("SOURCES", "SPECS", "BUILD", "RPMS", "SRPMS", "tmp"):
+            (out / sub).mkdir(parents=True)
+        assert run("stage", src, out, "0.4", "--list", list_path) == 0
+        pkg_dir = repo_fedora / "rpm/cubie-a7a-aic8800-usb"
+        for name in (
+            "cubie-a7a-wifi-firmware",
+            "aic8800-d80-usb.manifest",
+            "60-cubie-a7a-aic8800.rules",
+            "cubie-a7a-aic8800-modprobe.conf",
+            "cubie-a7a-aic-udev",
+        ):
+            shutil.copy2(pkg_dir / name, out / "SOURCES" / name)
+        shutil.copy2(repo_fedora / "WIFI-FIRMWARE.md", out / "SOURCES/WIFI-FIRMWARE.md")
+        shutil.copy2(repo_fedora / "rpm/cubie-a7a-dkms", out / "SOURCES/cubie-a7a-dkms")
+        shutil.copy2(list_path, out / "SOURCES/driver-inputs.list")
+        spec_dst = out / "SPECS/cubie-a7a-aic8800-usb.spec"
+        shutil.copy2(pkg_dir / "cubie-a7a-aic8800-usb.spec", spec_dst)
+        res = subprocess.run(
+            [
+                "rpmbuild",
+                "--define",
+                f"_topdir {out}",
+                "--define",
+                f"_tmppath {out / 'tmp'}",
+                "--define",
+                "dist .fc45",
+                "-bb",
+                str(spec_dst),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        rpms = list((out / "RPMS").rglob("cubie-a7a-aic8800-usb-*.rpm"))
+        assert len(rpms) == 1, rpms
+        rpm_file = rpms[0]
+
+        inject_log = root / "inject-rpm.log"
+        wrapper = root / "bin/rpm"
+        wrapper.parent.mkdir()
+        # Match BOTH `rpm -qlp` (074f9b6/999648a) and `rpm -qp --qf ...FILENAMES...` (head):
+        # output only the /usr/src/ driver rows, exit 0, no stderr.
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"real = {real_rpm!r}\n"
+            f"log_path = Path({str(inject_log)!r})\n"
+            "args = sys.argv[1:]\n"
+            "res = subprocess.run([real] + args, capture_output=True, text=True)\n"
+            "is_listing = ('-qlp' in args) or any('FILENAMES' in a for a in args)\n"
+            "if is_listing and res.returncode == 0:\n"
+            "    kept = [l for l in res.stdout.splitlines() if l.startswith('/usr/src/')]\n"
+            "    with log_path.open('a') as fh:\n"
+            "        fh.write(f'injected:rpm-trunc:rows={len(kept)}:args={args!r}\\n')\n"
+            "    sys.stdout.write('\\n'.join(kept) + '\\n')\n"
+            "    sys.exit(0)\n"
+            "sys.stdout.write(res.stdout)\n"
+            "sys.stderr.write(res.stderr)\n"
+            "sys.exit(res.returncode)\n"
+        )
+        wrapper.chmod(0o755)
+        check = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(repo_fedora / "stage-aic8800.py"),
+                "payload",
+                str(rpm_file),
+                "--list",
+                str(list_path),
+            ],
+            env={**os.environ, "PATH": f"{wrapper.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert inject_log.is_file() and "injected:rpm-trunc:" in inject_log.read_text()
+        assert check.returncode != 0, (
+            f"stage-aic8800 payload silently accepted truncated listing:\n"
+            f"{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
+    """Should-fix + S0-6: mkdevcard selects ONLY this run's checked manifest RPMs."""
+    if not shutil.which("rpmbuild"):
+        return
+    with tempfile.TemporaryDirectory(prefix="a7a-manifest-sel-") as td:
+        root = Path(td)
+        src = fixture_src(root)
+        repo_fed = _fixture_repo_copy(root, src)
+        repo_top = repo_fed.parent
+        out = root / "out"
+
+        # Step 1: build WITH AIC8800_SRC into shared OUT.
+        env_with = os.environ.copy()
+        env_with["AIC8800_SRC"] = str(src)
+        r1 = subprocess.run(
+            ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+            env=env_with,
+            capture_output=True,
+            text=True,
+        )
+        assert r1.returncode == 0, f"run 1 failed:\n{r1.stdout}\n{r1.stderr}"
+        stale_aic = list((out / "RPMS/noarch").glob("cubie-a7a-aic8800-usb-*.rpm"))
+        assert len(stale_aic) == 1, stale_aic
+
+        # Step 2: build WITHOUT AIC8800_SRC into the SAME OUT (AIC skipped, old RPM retained).
+        env_without = os.environ.copy()
+        env_without.pop("AIC8800_SRC", None)
+        r2 = subprocess.run(
+            ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+            env=env_without,
+            capture_output=True,
+            text=True,
+        )
+        assert r2.returncode == 0, f"run 2 failed:\n{r2.stdout}\n{r2.stderr}"
+        # Stale AIC RPM is still sitting in RPMS/noarch/, plus plant a stale higher-version DTB.
+        assert stale_aic[0].is_file()
+        real_dtb = list((out / "RPMS/noarch").glob("cubie-a7a-dtb-*.rpm"))[0]
+        stale_dtb = out / "RPMS/noarch/cubie-a7a-dtb-99.0-1.fc45.noarch.rpm"
+        shutil.copy2(real_dtb, stale_dtb)
+
+        # Stub run-build-ns.sh in the fixture copy so mkdevcard.sh stops cleanly at STAGE1
+        # after recording its exact PACKAGES (including BOARD_RPMS) argument vector.
+        recorded = root / "recorded-stage1-args.txt"
+        stub = repo_fed / "run-build-ns.sh"
+        stub.write_text(
+            "#!/usr/bin/env bash\n" f'printf "%s\\n" "$@" > "{recorded}"\n' "exit 42\n"
+        )
+        stub.chmod(0o755)
+
+        def run_mkdevcard(tag):
+            recorded.unlink(missing_ok=True)
+            env = env_without.copy()
+            env["WORK"] = str(repo_top / "build" / f"work-{tag}")
+            env["OUT"] = str(repo_top / "build" / f"img-{tag}.img")
+            return subprocess.run(
+                ["bash", str(repo_fed / "mkdevcard.sh"), "none", str(out / "RPMS")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        res = run_mkdevcard("clean")
+        assert res.returncode == 42, f"mkdevcard did not reach STAGE1:\n{res.stderr}"
+        selected = recorded.read_text().splitlines()
+        assert str(real_dtb.resolve()) in selected, selected
+        assert not any(
+            "cubie-a7a-aic8800-usb" in arg for arg in selected
+        ), f"mkdevcard selected stale AIC RPM after skip: {selected}"
+        assert str(
+            stale_dtb.resolve()
+        ) not in selected and stale_dtb.name not in "\n".join(
+            selected
+        ), f"mkdevcard selected stale higher-version DTB RPM: {selected}"
+
+        # Step 3: silently truncated checked-rpms.json (cut after 1 valid entry) fails closed.
+        manifest = out / "RPMS/checked-rpms.json"
+        orig_manifest = manifest.read_text()
+        manifest.write_text("\n".join(orig_manifest.splitlines()[:8]) + "\n")
+        res_trunc = run_mkdevcard("trunc")
+        assert (
+            res_trunc.returncode != 42 and res_trunc.returncode != 0
+        ), "mkdevcard accepted truncated checked-rpms.json"
+
+        # Step 4: tampered RPM bytes fail SHA-256 verification before STAGE1.
+        manifest.write_text(orig_manifest)
+        with real_dtb.open("ab") as fh:
+            fh.write(b"\x00")
+        res_tamper = run_mkdevcard("tamper")
+        assert (
+            res_tamper.returncode != 42 and res_tamper.returncode != 0
+        ), "mkdevcard accepted tampered RPM bytes"
+
+
 def main():
     case("stage: copies only the listed inputs", test_stage_copies_only_listed_inputs)
     case("stage: refuses firmware in the source", test_stage_refuses_firmware_in_source)
@@ -444,12 +640,20 @@ def main():
     case("payload: rejects an unlisted output", test_payload_rejects_unlisted_output)
     case("rpmbuild: fixture RPM passes payload check", test_real_rpmbuild_from_fixture)
     case(
+        "payload: silently truncated rpm listing fails closed (S0-5)",
+        test_payload_rejects_silent_truncation,
+    )
+    case(
         "build-rpms: reused OUT with older clean RPM does not hide bad build",
         test_build_rpms_reused_dir_older_rpm_does_not_satisfy_check,
     )
     case(
         "build-rpms: stale spec not rebuilt after AIC staging skipped",
         test_build_rpms_stale_spec_not_rebuilt_when_skipped,
+    )
+    case(
+        "mkdevcard: consumes only checked manifest RPMs, never stale globs (Should-fix/S0-6)",
+        test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest,
     )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")

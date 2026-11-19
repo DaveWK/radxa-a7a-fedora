@@ -146,8 +146,25 @@ for s in "$OUT"/SPECS/*.spec; do
         ;;
     esac
 done
-# Preserve the consumer layout, publishing only after checking this run.
+# Preserve the consumer layout, publishing only after checking this run, and
+# record an atomic checked manifest so mkdevcard.sh consumes only this run's RPMs.
+shopt -s nullglob
+built_rpms=("$OUT"/RPMS/*/*.rpm)
+if ((${#built_rpms[@]} == 0)); then
+    echo "build-rpms: no binary RPMs built" >&2
+    exit 1
+fi
 cp -a "$OUT"/{SPECS,SOURCES,RPMS,SRPMS} "$publish/"
-while IFS= read -r -d '' rpm_file; do
+published_rpms=()
+for rpm_file in "${built_rpms[@]}"; do
+    published_rpms+=("$publish/${rpm_file#"$OUT"/}")
+done
+python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
+    "$publish/RPMS" "$publish/RPMS/checked-rpms.json" --kind noarch \
+    "${published_rpms[@]}"
+if [ "$FWREPO" = none ]; then
+    rm -f "$publish/RPMS/checked-aarch64-rpms.json"
+fi
+for rpm_file in "$OUT"/SRPMS/*.rpm "${built_rpms[@]}"; do
     printf '%s/%s\n' "$publish" "${rpm_file#"$OUT"/}"
-done < <(find "$OUT/SRPMS" "$OUT/RPMS" -name '*.rpm' -print0)
+done

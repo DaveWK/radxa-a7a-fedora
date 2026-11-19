@@ -128,35 +128,26 @@ else
     FW_END=$((SEEK * 512 + $(stat -c %s "$FIRMWARE")))
     ((FW_END <= 16 * 1024 * 1024)) || die "firmware ends at $FW_END, inside the first partition"
 fi
-# shellcheck disable=SC2012 # RPM file names are plain
-DTB_RPM=$(ls "$RPMDIR"/noarch/cubie-a7a-dtb-*.noarch.rpm | sort -V | tail -1)
-# shellcheck disable=SC2012 # RPM file names are plain
-BSP_RPM=$(ls "$RPMDIR"/noarch/cubie-a7a-board-support-*.noarch.rpm | sort -V | tail -1)
-# shellcheck disable=SC2012 # RPM file names are plain
-# cubie-a7a-fwlog is optional (not built where the boot-chain repository is
-# absent, e.g. the sbc-image-maker build guest).
-FWLOG_RPM=$(ls "$RPMDIR"/aarch64/cubie-a7a-fwlog-[0-9]*.aarch64.rpm 2>/dev/null | sort -V | tail -1 || :)
-BOARD_RPMS=("$DTB_RPM" "$BSP_RPM")
-BOARD_UNITS=(cubie-a7a-dtb.service)
-if [ -n "$FWLOG_RPM" ]; then
-    BOARD_RPMS+=("$FWLOG_RPM")
-    BOARD_UNITS+=(a7a-fwlog.service)
-fi
-# cubie-a7a-npu (A733 NPU, vipcore), cubie-a7a-rk1828 (RK1828 coprocessor
-# host driver), cubie-a7a-display (HDMI, sunxidrm) and cubie-a7a-vdec (video
-# decoder, a733-cedrus) go in when they were built; cubie-a7a-hat loads them.
-# cubie-a7a-aic8800-usb (AIC8800D80 Wi-Fi/Bluetooth driver) goes in the same
-# way. Its firmware comes from Fedora's linux-firmware (aic/aic8800d80;
+# Select only the checked RPMs recorded by build-rpms.sh (and optionally
+# build-aarch64-rpms.sh); never glob the shared RPMS directory, so a stale
+# package left behind after an AIC skip or older build can never be picked up.
+# Its firmware comes from Fedora's linux-firmware (aic/aic8800d80;
 # fedora/WIFI-FIRMWARE.md), which the image installs and requires by the
-# driver package; verify-devcard.sh rejects only the user-override path
-# (aic8800_fw), never the standard linux-firmware files.
-for extra in cubie-a7a-npu cubie-a7a-rk1828 cubie-a7a-display cubie-a7a-vdec cubie-a7a-hat \
-    cubie-a7a-aic8800-usb; do
-    # shellcheck disable=SC2012 # RPM file names are plain
-    r=$(ls "$RPMDIR"/noarch/"$extra"-[0-9]*.noarch.rpm 2>/dev/null | sort -V | tail -1 || :)
-    [ -z "$r" ] || BOARD_RPMS+=("$r")
-    [ -z "$r" ] || [ "$extra" != cubie-a7a-hat ] || BOARD_UNITS+=(cubie-a7a-hat.service)
-done
+# driver package; verify-devcard.sh rejects only unowned, modified or
+# non-Fedora AIC firmware, never the standard linux-firmware files.
+BOARD_RPMS=()
+BOARD_UNITS=(cubie-a7a-dtb.service)
+rpm_rows=$(python3 -I "$TOP/fedora/devcard-policy.py" select-rpms "$RPMDIR") ||
+    die "cannot select checked board RPMs from $RPMDIR (run fedora/build-rpms.sh)"
+while IFS=$'\t' read -r pkg rpm_path; do
+    [ -n "$pkg" ] || continue
+    BOARD_RPMS+=("$rpm_path")
+    case $pkg in
+    cubie-a7a-fwlog) BOARD_UNITS+=(a7a-fwlog.service) ;;
+    cubie-a7a-hat) BOARD_UNITS+=(cubie-a7a-hat.service) ;;
+    esac
+done <<<"$rpm_rows"
+((${#BOARD_RPMS[@]} >= 2)) || die "checked RPM manifest in $RPMDIR is incomplete"
 # Wi-Fi and Bluetooth userspace, in every image (Wi-Fi out of the box),
 # whether or not the driver package was built: NetworkManager
 # manages wlan0 only with its Wi-Fi plugin (without it the device shows as

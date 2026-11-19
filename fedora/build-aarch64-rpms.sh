@@ -48,4 +48,16 @@ done
 mkdir -p "$OUT/RPMS/aarch64"
 cp "$BR"/out/RPMS/aarch64/*.rpm "$OUT/RPMS/aarch64/"
 NS
-find "$OUT/RPMS/aarch64" -name '*.rpm' -printf '%p\n'
+shopt -s nullglob
+built_aarch64=()
+for rpm_file in "$BR"/out/RPMS/aarch64/*.rpm; do
+    built_aarch64+=("$OUT/RPMS/aarch64/$(basename "$rpm_file")")
+done
+if ((${#built_aarch64[@]} == 0)); then
+    echo "build-aarch64-rpms: no aarch64 binary RPMs built" >&2
+    exit 1
+fi
+python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
+    "$OUT/RPMS" "$OUT/RPMS/checked-aarch64-rpms.json" --kind aarch64 \
+    "${built_aarch64[@]}"
+printf '%s\n' "${built_aarch64[@]}"
