@@ -44,15 +44,18 @@ Details: $DOC
 EOF
 }
 
-# name size sha256 role, one manifest entry per line.
+# name size sha256 role, one manifest entry per line, followed by "#END <count>".
 entries() {
     [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing"
     python3 -I - "$MANIFEST" <<'PY'
 import sys
+count = 0
 for line in open(sys.argv[1]):
     if line.strip() and not line.lstrip().startswith("#"):
         parts = line.split()
         print(" ".join((parts + ["", "", "", ""])[:4]))
+        count += 1
+print(f"#END {count}")
 PY
 }
 
@@ -62,7 +65,7 @@ PY
 # "installed 0/0" status.
 check_manifest() {
     [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing or unreadable"
-    [ -n "$(entries)" ] || die "manifest $MANIFEST has no entries"
+    entries | grep -qv '^#END ' || die "manifest $MANIFEST has no entries"
     python3 -I - "$MANIFEST" <<'PY' || exit 1
 import re
 import sys
@@ -196,11 +199,16 @@ sdio_build() {
 }
 
 cmd_status() {
-    local name size sha role f got req=0 req_ok=0 bad=0 lf_ok=0 lf_files=0 sdio=0
+    local name size sha role f got req=0 req_ok=0 bad=0 lf_ok=0 lf_files=0 sdio=0 seen=0 end_count=""
     check_manifest
     chip_status
     echo "override: $FWDIR"
     while read -r name size sha role; do
+        if [ "$name" = "#END" ]; then
+            end_count=$size
+            break
+        fi
+        seen=$((seen + 1))
         if f=$(locate "$FWDIR" "$name"); then
             got=$(sha_of "$f")
             if [ "$got" = "$sha" ]; then
@@ -215,10 +223,19 @@ cmd_status() {
         fi
         [ "$role" != required ] || req=$((req + 1))
     done < <(entries)
+    [ -n "$end_count" ] && [ "$seen" = "$end_count" ] ||
+        die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
     # linux-firmware: the driver's source for each required file the override
     # lacks. Its patch table names no extension patch, so ext0 is not needed.
     echo "linux-firmware: $LFDIR"
+    seen=0
+    end_count=""
     while read -r name size sha role; do
+        if [ "$name" = "#END" ]; then
+            end_count=$size
+            break
+        fi
+        seen=$((seen + 1))
         [ "$role" = required ] || continue
         if locate "$FWDIR" "$name" >/dev/null; then
             continue
@@ -241,6 +258,8 @@ cmd_status() {
             printf '  absent    %s\n' "$name"
         fi
     done < <(entries)
+    [ -n "$end_count" ] && [ "$seen" = "$end_count" ] ||
+        die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
     links_status
     [ "$req" -gt 0 ] || die "manifest $MANIFEST has no required entries"
     if [ "$bad" = 1 ]; then
@@ -311,7 +330,7 @@ reprobe() {
 }
 
 cmd_install() {
-    local src name size sha role f got stage n=0 bad=0
+    local src name size sha role f got stage n=0 bad=0 seen=0 end_count=""
     [ $# = 1 ] || {
         usage >&2
         exit 2
@@ -326,6 +345,11 @@ cmd_install() {
     work_stage=$stage
     trap 'cleanup; rm -rf -- "$work_stage"' EXIT
     while read -r name size sha role; do
+        if [ "$name" = "#END" ]; then
+            end_count=$size
+            break
+        fi
+        seen=$((seen + 1))
         if ! f=$(locate "$src" "$name"); then
             if [ "$role" = required ]; then
                 echo "  missing   required $name" >&2
@@ -346,6 +370,8 @@ cmd_install() {
         fi
         echo "  ok        $role $name"
     done < <(entries)
+    [ -n "$end_count" ] && [ "$seen" = "$end_count" ] ||
+        die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
     [ "$bad" = 0 ] || die "refused: nothing installed (every file must match $MANIFEST)"
     mkdir -p -- "$FWDIR"
     for f in "$stage"/*; do
@@ -365,13 +391,18 @@ cmd_install() {
 }
 
 cmd_remove() {
-    local name size sha role f n=0 d
+    local name size sha role f n=0 d seen=0 end_count=""
     [ $# = 0 ] || {
         usage >&2
         exit 2
     }
     [ -n "${CUBIE_A7A_WIFI_FWDIR:-}" ] || [ "$(id -u)" = 0 ] || die "remove needs root"
     while read -r name size sha role; do
+        if [ "$name" = "#END" ]; then
+            end_count=$size
+            break
+        fi
+        seen=$((seen + 1))
         for f in "$FWDIR/$name" "$FWDIR/$name.xz" "$FWDIR/$name.zst"; do
             if [ -e "$f" ] || [ -L "$f" ]; then
                 rm -f -- "$f"
@@ -379,6 +410,8 @@ cmd_remove() {
             fi
         done
     done < <(entries)
+    [ -n "$end_count" ] && [ "$seen" = "$end_count" ] ||
+        die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
     # Empty directories only; files this tool did not install stay.
     d=$FWDIR
     for _ in 1 2 3; do

@@ -1147,6 +1147,120 @@ def initramfs_check_truncation_cases():
         assert not ok, f"truncated lsinitrd -f passed forbid_text: {problems}"
 
 
+def verify_rpmdb_list_cases():
+    """S0-8: verify-rpmdb-list rejects silently truncated `rpm -qa` output."""
+    import rpm
+
+    with fixture() as work:
+        unsigned = _build_test_aic_rpm(work)
+        ts = rpm.TransactionSet(str(work))
+        with unsigned.open("rb") as f:
+            hdr = ts.hdrFromFdno(f.fileno())
+        root = _rpmdb_fixture(work, [(hdr.unload(),)])
+        # Import a real Fedora pubkey into the fixture rpmdb so there are >=2 entries.
+        keys = sorted(
+            Path("/usr/share/pki/rpm-gpg").glob("RPM-GPG-KEY-fedora-*-primary")
+        ) or sorted(Path("/etc/pki/rpm-gpg").glob("RPM-GPG-KEY-fedora-*-primary"))
+        assert keys, "need Fedora GPG key for fixture rpmdb"
+        subprocess.run(
+            ["rpmkeys", "--root", str(root), "--import", str(keys[0])],
+            check=True,
+            capture_output=True,
+        )
+        res = subprocess.run(
+            [
+                "rpm",
+                "--root",
+                str(root),
+                "-qa",
+                "--qf",
+                "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{RSAHEADER:pgpsig}\n",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = sorted(res.stdout.splitlines())
+        assert len(lines) >= 2, lines
+        full_file = work / "packages-full.txt"
+        full_file.write_text("\n".join(lines) + "\n")
+        assert policy.verify_rpmdb_list(root, full_file) == len(lines)
+
+        # Silent truncation after 1 valid row (exit 0, no stderr) must fail closed.
+        trunc_file = work / "packages-trunc.txt"
+        trunc_file.write_text(lines[0] + "\n")
+        try:
+            policy.verify_rpmdb_list(root, trunc_file)
+            raise AssertionError("verify_rpmdb_list accepted truncated rpm -qa list")
+        except policy.PolicyError as exc:
+            assert "mismatch" in str(exc), exc
+
+
+def absence_check_cases():
+    """S0-10: absence-check detects matches and fails closed on unreadable dirs/files."""
+    with fixture() as root:
+        # Clean root passes all modes.
+        ok, problems = policy.check_absence(
+            root, "no-entries", ["home", "work", "data"]
+        )
+        assert ok, problems
+        ok, problems = policy.check_absence(root, "no-regular-files", ["dev"])
+        assert ok, problems
+        ok, problems = policy.check_absence(
+            root, "no-glob", ["etc/repart.d"], pattern="*.conf", recursive=True
+        )
+        assert ok, problems
+
+        # Real hits fail.
+        write(root / "home/stray", "x")
+        ok, _ = policy.check_absence(root, "no-entries", ["home", "work", "data"])
+        assert not ok
+        write(root / "dev/kmsg", "oops")
+        ok, _ = policy.check_absence(root, "no-regular-files", ["dev"])
+        assert not ok
+        write(root / "etc/repart.d/50-root.conf", "[Partition]\n")
+        ok, _ = policy.check_absence(
+            root, "no-glob", ["etc/repart.d"], pattern="*.conf", recursive=True
+        )
+        assert not ok
+        write(
+            root / "usr/lib/udev/rules.d/85-nm-unmanaged.rules",
+            'ENV{NM_UNMANAGED}="1"\n',
+        )
+        ok, problems = policy.check_absence(
+            root,
+            "no-text",
+            ["etc/udev/rules.d", "usr/lib/udev/rules.d"],
+            pattern=r"NM_UNMANAGED",
+            allow_basenames=["85-nm-unmanaged.rules"],
+        )
+        assert ok, problems
+        write(root / "etc/udev/rules.d/99-bad.rules", 'ENV{NM_UNMANAGED}="1"\n')
+        ok, _ = policy.check_absence(
+            root,
+            "no-text",
+            ["etc/udev/rules.d", "usr/lib/udev/rules.d"],
+            pattern=r"NM_UNMANAGED",
+            allow_basenames=["85-nm-unmanaged.rules"],
+        )
+        assert not ok
+
+        if os.geteuid() != 0:
+            locked = root / "etc/ssh"
+            write(locked / "ssh_host_ed25519_key", "secret")
+            locked.chmod(0o000)
+            try:
+                try:
+                    policy.check_absence(
+                        root, "no-glob", ["etc/ssh"], pattern="ssh_host_*"
+                    )
+                    raise AssertionError("unreadable etc/ssh must raise PolicyError")
+                except policy.PolicyError:
+                    pass
+            finally:
+                locked.chmod(0o755)
+
+
 def repart_incomplete_listing():
     with fixture() as work:
         fake = work / "listing"
@@ -1289,6 +1403,14 @@ def main():
     case(
         "initramfs-check: silent truncation of lsinitrd and -f fails closed (S0-9)",
         initramfs_check_truncation_cases,
+    )
+    case(
+        "verify-rpmdb-list: silent rpm -qa truncation fails closed (S0-8)",
+        verify_rpmdb_list_cases,
+    )
+    case(
+        "absence-check: matches and unreadable dirs fail closed (S0-10)",
+        absence_check_cases,
     )
     case("repart: incomplete listing fails closed", repart_incomplete_listing)
     case("repart: good root", repart_good_root)

@@ -362,6 +362,398 @@ def test_truncated_sfdisk_json():
         assert res.returncode != 0, "truncated sfdisk JSON must fail closed"
 
 
+def test_image_firmware_truncation_and_list_refusal():
+    """S0-7: image-firmware.py rejects silent debugfs/lsinitrd truncation and check --list."""
+    fw_tool = here.parent / "image-firmware.py"
+    real_debugfs = shutil.which("debugfs")
+    real_lsinitrd = shutil.which("lsinitrd")
+    assert real_debugfs and real_lsinitrd, "need debugfs and lsinitrd"
+    with tempfile.TemporaryDirectory(prefix="a7a-fw-trunc-") as td:
+        work = Path(td)
+        # Build a GPT image whose root has an allowed file AND a forbidden rtl_nic file.
+        stage = work / "stage"
+        (stage / "usr/lib/firmware/open").mkdir(parents=True)
+        (stage / "usr/lib/firmware/open/a_allowed.fw").write_text("ok\n")
+        (stage / "usr/lib/firmware/rtl_nic").mkdir(parents=True)
+        (stage / "usr/lib/firmware/rtl_nic/rtl8125b-2.fw").write_text("blob\n")
+        allow_file = work / "allow.txt"
+        allow_file.write_text("open/a_allowed.fw\n")
+
+        root_img = work / "root.img"
+        subprocess.run(["truncate", "-s", "8M", str(root_img)], check=True)
+        subprocess.run(["mkfs.ext4", "-q", "-d", str(stage), str(root_img)], check=True)
+        disk = work / "disk.img"
+        sectors = root_img.stat().st_size // 512
+        total = (34816 + sectors + 2048) * 512
+        subprocess.run(["truncate", "-s", str(total), str(disk)], check=True)
+        subprocess.run(
+            ["sfdisk", "--quiet", "--no-reread", "--no-tell-kernel", str(disk)],
+            input=f"label: gpt\nfirst-lba: 34\nstart=34816, size={sectors}, type={ROOT_TYPE}\n",
+            text=True,
+            check=True,
+        )
+        with disk.open("r+b") as dst:
+            dst.seek(34816 * 512)
+            dst.write(root_img.read_bytes())
+
+        # Control: real image-firmware check catches rtl_nic (exit 1).
+        ctrl = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(fw_tool),
+                "check",
+                "--image",
+                str(disk),
+                "--allow",
+                str(allow_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert ctrl.returncode == 1, (ctrl.returncode, ctrl.stdout, ctrl.stderr)
+
+        # Case 1 (S0-7a): debugfs wrapper truncates ls of /usr/lib/firmware after
+        # `.`, `..`, and `open` (hiding `rtl_nic`), exit 0, banner-only stderr.
+        inject_dbg = work / "inject-dbg.log"
+        dbg_wrap = work / "bin-dbg/debugfs"
+        dbg_wrap.parent.mkdir()
+        dbg_wrap.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"real = {real_debugfs!r}\n"
+            f"log_path = Path({str(inject_dbg)!r})\n"
+            "args = sys.argv[1:]\n"
+            "stdin_bytes = sys.stdin.buffer.read() if not sys.stdin.isatty() else b''\n"
+            "res = subprocess.run([real] + args, input=stdin_bytes, capture_output=True)\n"
+            "is_fw_ls = any('ls ' in a and '/usr/lib/firmware\"' in a for a in args) or b'ls -l -p \"/usr/lib/firmware\"' in stdin_bytes\n"
+            "if is_fw_ls and res.returncode == 0:\n"
+            "    kept = []\n"
+            "    for line in res.stdout.splitlines(keepends=True):\n"
+            "        if line.startswith(b'debugfs: ls '):\n"
+            "            kept.append(line)\n"
+            "            continue\n"
+            "        if line.startswith(b'/'):\n"
+            "            if b'/rtl_nic/' in line:\n"
+            "                break\n"
+            "            kept.append(line)\n"
+            "    with log_path.open('a') as fh:\n"
+            "        fh.write(f'injected:fw-debugfs-trunc:args={args!r}\\n')\n"
+            "    sys.stdout.buffer.write(b''.join(kept))\n"
+            "    sys.stderr.buffer.write(res.stderr)\n"
+            "    sys.exit(0)\n"
+            "sys.stdout.buffer.write(res.stdout)\n"
+            "sys.stderr.buffer.write(res.stderr)\n"
+            "sys.exit(res.returncode)\n"
+        )
+        dbg_wrap.chmod(0o755)
+        r_dbg = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(fw_tool),
+                "check",
+                "--image",
+                str(disk),
+                "--allow",
+                str(allow_file),
+            ],
+            env={**os.environ, "PATH": f"{dbg_wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            inject_dbg.is_file()
+            and "injected:fw-debugfs-trunc:" in inject_dbg.read_text()
+        )
+        assert r_dbg.returncode == 2, (
+            f"image-firmware check --image accepted truncated debugfs listing "
+            f"(rc={r_dbg.returncode}):\n{r_dbg.stdout}\n{r_dbg.stderr}"
+        )
+
+        # Case 2 (S0-7b): lsinitrd wrapper truncates after 1 allowed row (hiding rtl_nic),
+        # exit 0, no stderr.
+        rd_root = work / "rd-root"
+        (rd_root / "boot").mkdir(parents=True)
+        rd_tree = work / "rd-tree"
+        (rd_tree / "usr/lib/firmware/open").mkdir(parents=True)
+        (rd_tree / "usr/lib/firmware/open/a_allowed.fw").write_text("ok\n")
+        (rd_tree / "usr/lib/firmware/rtl_nic").mkdir(parents=True)
+        (rd_tree / "usr/lib/firmware/rtl_nic/rtl8125b-2.fw").write_text("blob\n")
+        rd_img = rd_root / "boot/initramfs-7.4.0.img"
+        entries = sorted(p.relative_to(rd_tree).as_posix() for p in rd_tree.rglob("*"))
+        cpio_out = subprocess.run(
+            ["cpio", "-o", "-H", "newc", "--quiet"],
+            input=("\n".join(entries) + "\n").encode(),
+            cwd=rd_tree,
+            capture_output=True,
+            check=True,
+        ).stdout
+        rd_img.write_bytes(cpio_out)
+
+        inject_ls = work / "inject-lsinitrd.log"
+        ls_wrap = work / "bin-ls/lsinitrd"
+        ls_wrap.parent.mkdir()
+        rule = "=" * 72
+        row = "-rw-r--r--   1 root     root            3 Nov 19 06:00 usr/lib/firmware/open/a_allowed.fw"
+        ls_wrap.write_text(
+            "#!/bin/sh\n"
+            f'echo "injected:fw-lsinitrd-trunc:$*" >> "{inject_ls}"\n'
+            f'printf "%s\\n%s\\n" "{rule}" "{row}"\n'
+            "exit 0\n"
+        )
+        ls_wrap.chmod(0o755)
+        r_ls = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(fw_tool),
+                "check",
+                "--root",
+                str(rd_root),
+                "--initramfs",
+                "--allow",
+                str(allow_file),
+            ],
+            env={**os.environ, "PATH": f"{ls_wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            inject_ls.is_file()
+            and "injected:fw-lsinitrd-trunc:" in inject_ls.read_text()
+        )
+        assert r_ls.returncode == 2, (
+            f"image-firmware check --initramfs accepted truncated lsinitrd "
+            f"(rc={r_ls.returncode}):\n{r_ls.stdout}\n{r_ls.stderr}"
+        )
+
+        # Case 3 (S0-7c): `check --list` has no positive completeness signal -> refused.
+        raw_list = work / "paths.list"
+        raw_list.write_text("/usr/lib/firmware/open/a_allowed.fw\n")
+        r_list = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(fw_tool),
+                "check",
+                "--list",
+                str(raw_list),
+                "--allow",
+                str(allow_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            r_list.returncode == 2 and "positive completeness signal" in r_list.stderr
+        ), (
+            r_list.returncode,
+            r_list.stdout,
+            r_list.stderr,
+        )
+
+
+def test_selinux_label_verify_rejects_truncation():
+    """S0-13: selinux-label.py --verify fails closed on silent debugfs -f truncation."""
+    label_tool = here.parent / "selinux-label.py"
+    real_debugfs = shutil.which("debugfs")
+    assert real_debugfs, "need debugfs"
+    with tempfile.TemporaryDirectory(prefix="a7a-selinux-trunc-") as td:
+        work = Path(td)
+        root = work / "root"
+        fc = root / "etc/selinux/targeted/contexts/files/file_contexts"
+        fc.parent.mkdir(parents=True)
+        fc.write_text("/.* system_u:object_r:default_t:s0\n")
+        (root / "etc/motd").write_text("hello\n")
+        img = work / "root.img"
+        subprocess.run(["truncate", "-s", "8M", str(img)], check=True)
+        subprocess.run(["mkfs.ext4", "-q", "-d", str(root), str(img)], check=True)
+
+        # Label and verify cleanly first.
+        r_w = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(label_tool),
+                str(root),
+                str(img),
+                str(work / "w1"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r_w.returncode == 0, r_w.stderr
+        r_v = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(label_tool),
+                "--verify",
+                str(root),
+                str(img),
+                str(work / "v1"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r_v.returncode == 0, r_v.stderr
+
+        # Wrap debugfs -f so only the FIRST ea_get executes; exit 0, banner-only stderr.
+        inject_log = work / "inject-selinux.log"
+        wrap = work / "bin/debugfs"
+        wrap.parent.mkdir()
+        wrap.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"real = {real_debugfs!r}\n"
+            f"log_path = Path({str(inject_log)!r})\n"
+            "args = sys.argv[1:]\n"
+            "if '-f' in args:\n"
+            "    idx = args.index('-f')\n"
+            "    script_path = Path(args[idx + 1])\n"
+            "    first = script_path.read_text().splitlines()[:1]\n"
+            "    trunc = script_path.with_name('trunc.debugfs')\n"
+            "    trunc.write_text('\\n'.join(first) + '\\n')\n"
+            "    args[idx + 1] = str(trunc)\n"
+            "    with log_path.open('a') as fh:\n"
+            "        fh.write(f'injected:selinux-debugfs-trunc:lines=1\\n')\n"
+            "res = subprocess.run([real] + args, capture_output=True)\n"
+            "sys.stdout.buffer.write(res.stdout)\n"
+            "sys.stderr.buffer.write(res.stderr)\n"
+            "sys.exit(res.returncode)\n"
+        )
+        wrap.chmod(0o755)
+        r_trunc = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(label_tool),
+                "--verify",
+                str(root),
+                str(img),
+                str(work / "v2"),
+            ],
+            env={**os.environ, "PATH": f"{wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            inject_log.is_file()
+            and "injected:selinux-debugfs-trunc:" in inject_log.read_text()
+        )
+        assert (
+            r_trunc.returncode != 0
+            and "wrong or missing image labels" in r_trunc.stderr
+        ), (
+            r_trunc.returncode,
+            r_trunc.stdout,
+            r_trunc.stderr,
+        )
+
+
+def test_verifier_rejects_truncated_rpm_qa():
+    """S0-8: verify-devcard.sh rejects silently truncated `rpm -qa` before layout checks."""
+    real_rpm = shutil.which("rpm")
+    assert real_rpm, "need rpm"
+    keys = sorted(
+        Path("/usr/share/pki/rpm-gpg").glob("RPM-GPG-KEY-fedora-*-primary")
+    ) or sorted(Path("/etc/pki/rpm-gpg").glob("RPM-GPG-KEY-fedora-*-primary"))
+    assert len(keys) >= 2, f"need >=2 Fedora GPG keys for 2-entry fixture rpmdb: {keys}"
+    with tempfile.TemporaryDirectory(prefix="a7a-rpmqa-trunc-") as td:
+        work = Path(td)
+        stage = work / "stage"
+        (stage / "etc").mkdir(parents=True)
+        (stage / "etc/motd").write_text("ok\n")
+        for key in keys[:2]:
+            subprocess.run(
+                ["rpmkeys", "--root", str(stage), "--import", str(key)],
+                check=True,
+                capture_output=True,
+            )
+        root_img = work / "root.img"
+        subprocess.run(["truncate", "-s", "8M", str(root_img)], check=True)
+        subprocess.run(
+            [
+                str(here.parent / "run-build-ns.sh"),
+                "user",
+                "mkfs.ext4",
+                "-q",
+                "-E",
+                "root_owner=0:0",
+                "-d",
+                str(stage),
+                str(root_img),
+            ],
+            check=True,
+        )
+        esp_img = work / "esp.img"
+        subprocess.run(
+            ["mkfs.fat", "-F", "32", "-C", str(esp_img), "1024"],
+            check=True,
+            capture_output=True,
+        )
+        disk = work / "disk.img"
+        esp_sectors = esp_img.stat().st_size // 512
+        root_sectors = root_img.stat().st_size // 512
+        root_start = 32768 + esp_sectors
+        total = (root_start + root_sectors + 2048) * 512
+        subprocess.run(["truncate", "-s", str(total), str(disk)], check=True)
+        subprocess.run(
+            ["sfdisk", "--quiet", "--no-reread", "--no-tell-kernel", str(disk)],
+            input=(
+                "label: gpt\nfirst-lba: 34\n"
+                f"start=32768, size={esp_sectors}, type={ESP_TYPE}\n"
+                f"start={root_start}, size={root_sectors}, type={ROOT_TYPE}\n"
+            ),
+            text=True,
+            check=True,
+        )
+        with disk.open("r+b") as dst:
+            dst.seek(32768 * 512)
+            dst.write(esp_img.read_bytes())
+            dst.seek(root_start * 512)
+            dst.write(root_img.read_bytes())
+
+        inject_log = work / "inject-rpmqa.log"
+        wrap = work / "bin/rpm"
+        wrap.parent.mkdir()
+        wrap.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"real = {real_rpm!r}\n"
+            f"log_path = Path({str(inject_log)!r})\n"
+            "res = subprocess.run([real] + sys.argv[1:], capture_output=True, text=True)\n"
+            "if '-qa' in sys.argv[1:] and res.returncode == 0:\n"
+            "    first = res.stdout.splitlines()[:1]\n"
+            "    with log_path.open('a') as fh:\n"
+            "        fh.write(f'injected:rpmqa-trunc:total={len(res.stdout.splitlines())}\\n')\n"
+            "    sys.stdout.write('\\n'.join(first) + '\\n')\n"
+            "    sys.exit(0)\n"
+            "sys.stdout.write(res.stdout)\n"
+            "sys.stderr.write(res.stderr)\n"
+            "sys.exit(res.returncode)\n"
+        )
+        wrap.chmod(0o755)
+        res = subprocess.run(
+            [here.parent / "verify-devcard.sh", disk, work / "verify"],
+            env={**os.environ, "PATH": f"{wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            inject_log.is_file() and "injected:rpmqa-trunc:" in inject_log.read_text()
+        )
+        assert (
+            res.returncode != 0
+            and "rpm package listing" in res.stderr
+            and "== layout" not in res.stdout
+        ), f"verify-devcard accepted truncated rpm -qa:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+
+
 def test_verifier_rejects_damaged_inode():
     with tempfile.TemporaryDirectory(prefix="a7a-verifier-") as td:
         work = Path(td)
@@ -415,6 +807,18 @@ def main():
     case(
         "partitions: reject silently truncated sfdisk JSON (S0-14)",
         test_truncated_sfdisk_json,
+    )
+    case(
+        "image-firmware: reject truncated debugfs/lsinitrd and refuse check --list (S0-7)",
+        test_image_firmware_truncation_and_list_refusal,
+    )
+    case(
+        "selinux-label --verify: reject silently truncated debugfs -f (S0-13)",
+        test_selinux_label_verify_rejects_truncation,
+    )
+    case(
+        "verify-devcard rejects silently truncated rpm -qa before layout checks (S0-8)",
+        test_verifier_rejects_truncated_rpm_qa,
     )
     case(
         "verify-devcard rejects a corrupted inode before querying RPM",

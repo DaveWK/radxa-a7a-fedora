@@ -146,6 +146,57 @@ else
     bad "install: first_required failed with commented entries (rc=$rc): $out"
 fi
 
+# S0-12: silent truncation of the manifest entries() stream after 1 valid row
+# (exit 0, no stderr) must fail closed, never report "installed (1/1)".
+mkdir -p "$tmp/fw-trunc" "$tmp/bin"
+printf 'abc' >"$tmp/fw-trunc/first.bin"
+sha_first=$(sha256sum "$tmp/fw-trunc/first.bin" | cut -d' ' -f1)
+cat >"$tmp/two.manifest" <<EOF
+first.bin 3 $sha_first required
+second.bin 3 $sha_b required
+EOF
+real_py=$(command -v python3)
+cat >"$tmp/bin/python3" <<EOF
+#!$real_py
+import subprocess, sys
+from pathlib import Path
+real = "$real_py"
+log_path = Path("$tmp/inject-entries.log")
+count_path = Path("$tmp/entries-call-count")
+stdin_bytes = sys.stdin.buffer.read()
+res = subprocess.run([real] + sys.argv[1:], input=stdin_bytes, capture_output=True)
+if b'parts = line.split()' in stdin_bytes and b'bad sha256' not in stdin_bytes and res.returncode == 0:
+    calls = int(count_path.read_text()) if count_path.is_file() else 0
+    calls += 1
+    count_path.write_text(str(calls))
+    # First two calls are inside check_manifest() (top-level + cmd_status); truncate the
+    # third call (cmd_status override loop) to 1 valid row, exit 0, no stderr.
+    if calls >= 3:
+        first_line = res.stdout.splitlines(keepends=True)[:1]
+        with log_path.open("a") as fh:
+            fh.write(f"injected:entries-trunc:call={calls}\\n")
+        sys.stdout.buffer.write(b"".join(first_line))
+        sys.exit(0)
+sys.stdout.buffer.write(res.stdout)
+sys.stderr.buffer.write(res.stderr)
+sys.exit(res.returncode)
+EOF
+chmod 0755 "$tmp/bin/python3"
+out=$(env PATH="$tmp/bin:$PATH" \
+    CUBIE_A7A_WIFI_MANIFEST="$tmp/two.manifest" \
+    CUBIE_A7A_WIFI_FWDIR="$tmp/fw-trunc" \
+    CUBIE_A7A_LINUX_FWDIR="$tmp/lf" \
+    CUBIE_A7A_SYSFS="$tmp/sysfs" \
+    "$script" status 2>&1)
+rc=$?
+if [ ! -s "$tmp/inject-entries.log" ]; then
+    bad "S0-12: entries() truncation fault was never injected"
+elif [ "$rc" -ne 0 ] && [[ $out == *"truncated"* ]]; then
+    ok "S0-12: silent truncation of manifest entries() fails closed"
+else
+    bad "S0-12: silent truncation of manifest entries() accepted (rc=$rc): $out"
+fi
+
 if [ "$fail" -gt 0 ]; then
     echo "$fail test(s) FAILED ($pass passed)"
     exit 1

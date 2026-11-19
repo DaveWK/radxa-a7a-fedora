@@ -79,6 +79,10 @@ rpm --root "$ROOT" -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %
     echo "verify-devcard: cannot read the rpm database in $IMG" >&2
     exit 1
 }
+python3 -I "$TOP/fedora/devcard-policy.py" verify-rpmdb-list "$ROOT" "$VERIFY_PACKAGES" || {
+    echo "verify-devcard: rpm package listing from $IMG is incomplete" >&2
+    exit 1
+}
 PACKAGES=$VERIFY_PACKAGES
 fail=0
 ok() { printf '  ok    %s\n' "$*"; }
@@ -127,7 +131,12 @@ pkgstamp=$(cat "$ROOT/usr/lib/cubie-a7a/dtb/VERSION")
 if [ "$fwstamp" -lt "$pkgstamp" ]; then
     check "ESP DTB override present (firmware stamp $fwstamp < package $pkgstamp)" mtype -i "$ESP" ::/dtb/allwinner/sun60i-a733-cubie-a7a.dtb
 else
-    if mdir -i "$ESP" ::/dtb >/dev/null 2>&1; then bad "no DTB override on the ESP (firmware DTB is current)"; else ok "no DTB override on the ESP (firmware DTB is current)"; fi
+    esp_root_entries=$(mdir -b -i "$ESP" ::/ 2>/dev/null) || esp_root_entries=
+    if grep -qx '::/EFI/' <<<"$esp_root_entries" && ! grep -qixE '::/dtb/?' <<<"$esp_root_entries"; then
+        ok "no DTB override on the ESP (firmware DTB is current)"
+    else
+        bad "no DTB override on the ESP (firmware DTB is current)"
+    fi
 fi
 
 echo "== kernel, BLS, initramfs"
@@ -207,8 +216,11 @@ if [ "$pinctrl_builtin" = yes ]; then
     dkms_mods="sun60i-a733-ccu axp318w axp318-regulator dwmac-sun55i sun8i_thermal nvmem_sunxi_sid"
     override_mods="dwmac-sun55i sun55i-pck600 sun8i_thermal nvmem_sunxi_sid"
     check "kernel config: A733 pinctrl built in (CONFIG_PINCTRL_SUN60I_A733=y)" grep -qx 'CONFIG_PINCTRL_SUN60I_A733=y' "$ROOT/usr/lib/modules/$kver/config"
-    check "no A733 pinctrl kmod for $kver (it would never bind)" bash -c "! ls '$ROOT/usr/lib/modules/$kver/extra/pinctrl-sun60i-a733.ko'* >/dev/null 2>&1"
-    check "sun6i-dma is the stock module (A733 support is upstream)" bash -c "! ls '$ROOT/usr/lib/modules/$kver/extra/sun6i-dma.ko'* >/dev/null 2>&1 && grep -q '^kernel/drivers/dma/sun6i-dma.ko' '$ROOT/usr/lib/modules/$kver/modules.dep'"
+    check "no A733 pinctrl kmod for $kver (it would never bind)" \
+        python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+        --mode no-glob --pattern 'pinctrl-sun60i-a733.ko*' "usr/lib/modules/$kver/extra"
+    check "sun6i-dma is the stock module (A733 support is upstream)" bash -c \
+        "python3 -I '$TOP/fedora/devcard-policy.py' absence-check '$ROOT' --mode no-glob --pattern 'sun6i-dma.ko*' 'usr/lib/modules/$kver/extra' && grep -q '^kernel/drivers/dma/sun6i-dma.ko' '$ROOT/usr/lib/modules/$kver/modules.dep'"
     check "stock sun6i-dma knows the A733 (allwinner,sun60i-a733-dma alias)" bash -c "grep -q 'sun60i-a733-dma.* sun6i_dma' '$ROOT/usr/lib/modules/$kver/modules.alias'"
 else
     dkms_mods="sun60i-a733-ccu pinctrl-sun60i-a733 axp318w axp318-regulator sun6i-dma dwmac-sun55i sun8i_thermal nvmem_sunxi_sid"
@@ -256,8 +268,12 @@ others=${rest#*$'\t'}
 if [ "$root_hash" = "$(openssl passwd -6 -salt "$salt" Fedora123)" ]; then ok "root password is Fedora123"; else bad "root password is Fedora123"; fi
 if [ -n "$others" ]; then bad "only root has a password"; else ok "only root has a password"; fi
 check "sshd: PermitRootLogin yes" grep -q '^PermitRootLogin yes' "$ROOT/etc/ssh/sshd_config.d/00-public-image.conf"
-check "no SSH host keys" bash -c "! ls '$ROOT'/etc/ssh/ssh_host_* >/dev/null 2>&1"
-check "no authorized_keys" bash -c "! ls '$ROOT'/root/.ssh/authorized_keys* >/dev/null 2>&1"
+check "no SSH host keys" \
+    python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+    --mode no-glob --pattern 'ssh_host_*' etc/ssh
+check "no authorized_keys" \
+    python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+    --mode no-glob --pattern 'authorized_keys*' root/.ssh
 # cubie-a7a-fwlog is optional (built only where the boot-chain checkout is).
 units="sshd NetworkManager firewalld chronyd cubie-a7a-dtb dkms bluetooth"
 if grep -q '^cubie-a7a-fwlog-' "$PACKAGES"; then
@@ -284,7 +300,9 @@ if grep -q '^cubie-a7a-aic8800-usb-' "$PACKAGES"; then
         check "DKMS $m built for $kver" bash -c "ls '$ROOT/usr/lib/modules/$kver/extra/$m.ko'* >/dev/null"
     done
     # Bluetooth on the mainline btusb; the vendor aic_btusb is not built.
-    check "no aic_btusb module for $kver" bash -c "! ls '$ROOT/usr/lib/modules/$kver/extra/aic_btusb.ko'* >/dev/null 2>&1"
+    check "no aic_btusb module for $kver" \
+        python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+        --mode no-glob --pattern 'aic_btusb.ko*' "usr/lib/modules/$kver/extra"
     check "cubie-a7a-wifi-firmware (optional override) and its manifest installed" bash -c "test -x '$ROOT/usr/bin/cubie-a7a-wifi-firmware' && test -s '$ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest' && test -s '$ROOT/usr/share/cubie-a7a/WIFI-FIRMWARE.md'"
     check "aic_btusb blacklisted (Bluetooth on the mainline btusb)" bash -c "grep -qx 'blacklist aic_btusb' '$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf' && grep -qx 'install aic_btusb /bin/false' '$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf' && ! grep -q '^softdep' '$ROOT/usr/lib/modprobe.d/cubie-a7a-aic8800.conf'"
 fi
@@ -296,9 +314,16 @@ for pkg in NetworkManager-wifi wpa_supplicant iw bluez wireless-regdb; do
 done
 check "no iwd (NetworkManager's Wi-Fi backend is wpa_supplicant)" bash -c "! grep -q '^iwd-[0-9]' '$PACKAGES'"
 check "NetworkManager Wi-Fi device plugin present" bash -c "ls '$ROOT'/usr/lib64/NetworkManager/*/libnm-device-plugin-wifi.so >/dev/null 2>&1"
-check "NetworkManager config leaves devices managed (no unmanaged-devices, no managed=false)" bash -c "! grep -rqsiE '^[[:space:]]*(unmanaged-devices|managed[[:space:]]*=[[:space:]]*(0|false|no))' '$ROOT/etc/NetworkManager' '$ROOT/usr/lib/NetworkManager/conf.d'"
-check "no udev rule marks Wi-Fi unmanaged (only NetworkManager's own 85-nm-unmanaged.rules, which names no Wi-Fi)" bash -c "! grep -rlsE 'NM_UNMANAGED' '$ROOT/etc/udev/rules.d' '$ROOT/usr/lib/udev/rules.d' | grep -qv '/85-nm-unmanaged.rules\$' && ! grep -qiE 'wlan|wifi|wlp|aic' '$ROOT/usr/lib/udev/rules.d/85-nm-unmanaged.rules'"
-check "no Wi-Fi connection profile in the image (nothing auto-connects)" bash -c "! grep -rlsq 'type=wifi\|type=802-11-wireless' '$ROOT/etc/NetworkManager/system-connections' '$ROOT/usr/lib/NetworkManager/system-connections'"
+check "NetworkManager config leaves devices managed (no unmanaged-devices, no managed=false)" \
+    python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+    --mode no-text --ignore-case --pattern '^[ \t]*(unmanaged-devices|managed[ \t]*=[ \t]*(0|false|no))' \
+    etc/NetworkManager usr/lib/NetworkManager/conf.d
+check "no udev rule marks Wi-Fi unmanaged (only NetworkManager's own 85-nm-unmanaged.rules, which names no Wi-Fi)" bash -c \
+    "python3 -I '$TOP/fedora/devcard-policy.py' absence-check '$ROOT' --mode no-text --pattern 'NM_UNMANAGED' --allow-basename 85-nm-unmanaged.rules etc/udev/rules.d usr/lib/udev/rules.d && python3 -I '$TOP/fedora/devcard-policy.py' absence-check '$ROOT' --mode no-text --ignore-case --pattern 'wlan|wifi|wlp|aic' usr/lib/udev/rules.d/85-nm-unmanaged.rules"
+check "no Wi-Fi connection profile in the image (nothing auto-connects)" \
+    python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+    --mode no-text --pattern 'type=wifi|type=802-11-wireless' \
+    etc/NetworkManager/system-connections usr/lib/NetworkManager/system-connections
 for pkg in $EXTRA_PACKAGES; do
     check "$pkg installed (EXTRA_PACKAGES)" grep -q "^$pkg-[0-9]" "$PACKAGES"
 done
@@ -314,8 +339,12 @@ fi
 check "SELinux enforcing" grep -q '^SELINUX=enforcing' "$ROOT/etc/selinux/config"
 # Build-host paths must not appear in the image (dnf persistdir, cachedir and
 # the like are relative to the installroot) and /dev holds no regular files.
-check "no build-host paths in the root (/work, /data, /home/*)" bash -c "! find '$ROOT/home' '$ROOT/work' '$ROOT/data' -mindepth 1 2>/dev/null | grep -q ."
-check "/dev has no regular files" bash -c "! find '$ROOT/dev' -type f 2>/dev/null | grep -q ."
+check "no build-host paths in the root (/work, /data, /home/*)" \
+    python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+    --mode no-entries home work data
+check "/dev has no regular files" \
+    python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+    --mode no-regular-files dev
 # Rootless builds see file capabilities as v3 xattrs with the build user's
 # rootid outside the namespace; inside it (where mkfs.ext4 -d runs) the kernel
 # hands out the v2 form, which the board applies for root. Lock that in.
@@ -358,7 +387,9 @@ if [ "$GROW_ROOT" = yes ]; then
     check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
 else
     echo "== root growth: never (GROW_ROOT=no)"
-    check "no repart.d config (etc, usr/lib, usr/local/lib)" bash -c "! find '$ROOT/etc/repart.d' '$ROOT/usr/lib/repart.d' '$ROOT/usr/local/lib/repart.d' -name '*.conf' 2>/dev/null | grep -q ."
+    check "no repart.d config (etc, usr/lib, usr/local/lib)" \
+        python3 -I "$TOP/fedora/devcard-policy.py" absence-check "$ROOT" \
+        --mode no-glob --recursive --pattern '*.conf' etc/repart.d run/repart.d usr/lib/repart.d usr/local/lib/repart.d
     check "fstab: no x-systemd.growfs (and no x-systemd.makefs)" bash -c "! grep -qE 'x-systemd\.(growfs|makefs)' '$ROOT/etc/fstab'"
     repart_initramfs_absent() {
         local img found=0

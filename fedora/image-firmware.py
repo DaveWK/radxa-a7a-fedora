@@ -39,6 +39,7 @@ import argparse
 import datetime
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -128,11 +129,14 @@ def scan_root(root, scan_dirs, notes):
             None,
         )
         if link:
-            notes.append(f"{root}: /{d} not scanned, /{link} is a symlink ({os.readlink(os.path.join(root, link))})")
+            notes.append(
+                f"{root}: /{d} not scanned, /{link} is a symlink ({os.readlink(os.path.join(root, link))})"
+            )
             continue
         top = os.path.join(root, d)
         if not os.path.isdir(top):
             continue
+
         def fail(e):
             raise InputError(f"{e.filename}: {e.strerror}")
 
@@ -168,25 +172,48 @@ def parse_listing(lines, scan_dirs):
     return entries
 
 
+def _load_policy():
+    policy_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "devcard-policy.py"
+    )
+    if not os.path.isfile(policy_path):
+        raise InputError(f"cannot locate {policy_path} for initramfs verification")
+    spec = importlib.util.spec_from_file_location("devcard_policy_fw", policy_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def list_initramfs(path):
     if not shutil.which("lsinitrd"):
         raise InputError("lsinitrd (dracut) is needed to list an initramfs")
-    r = subprocess.run(["lsinitrd", path], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise InputError(f"lsinitrd {path}: {r.stderr.strip()}")
-    return r.stdout.splitlines()
+    policy_mod = _load_policy()
+    try:
+        all_rows, _ = policy_mod.inspect_initramfs(path)
+    except policy_mod.PolicyError as exc:
+        raise InputError(f"lsinitrd {path}: {exc}") from exc
+    return [rel for kind, rel, _ in all_rows if kind in ("file", "symlink")]
 
 
 class Debugfs:
     """Read-only view of an ext4 filesystem inside a disk image."""
 
+    _BANNER_RE = re.compile(r"^debugfs [0-9.]+ \([^()]+\)$")
+
     def __init__(self, image, partition):
         if not shutil.which("debugfs") or not shutil.which("sfdisk"):
-            raise InputError("debugfs (e2fsprogs) and sfdisk (util-linux) are needed for --image")
+            raise InputError(
+                "debugfs (e2fsprogs) and sfdisk (util-linux) are needed for --image"
+            )
         r = subprocess.run(["sfdisk", "-J", image], capture_output=True, text=True)
         if r.returncode != 0:
             raise InputError(f"sfdisk -J {image}: {r.stderr.strip()}")
-        parts = json.loads(r.stdout)["partitiontable"]["partitions"]
+        try:
+            parts = json.loads(r.stdout)["partitiontable"]["partitions"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise InputError(
+                f"sfdisk -J {image}: corrupt partition table: {exc}"
+            ) from exc
         if partition:
             if not 1 <= partition <= len(parts):
                 raise InputError(f"{image}: no partition {partition}")
@@ -201,29 +228,129 @@ class Debugfs:
         self.label = f"{image} partition {parts.index(part) + 1}"
         self.cache = {}
 
+    def _stderr_diagnostics(self, stderr):
+        lines = [line for line in stderr.splitlines() if line.strip()]
+        if lines and self._BANNER_RE.fullmatch(lines[0]):
+            lines.pop(0)
+        return lines
+
+    def _check_result(self, r, what):
+        diags = self._stderr_diagnostics(r.stderr)
+        if r.returncode != 0 or diags:
+            msg = "; ".join(diags) or f"exit {r.returncode}"
+            raise InputError(f"{self.label}: debugfs {what} failed: {msg}")
+
     def run(self, request):
         # No -w: debugfs opens the filesystem read-only.
-        r = subprocess.run(["debugfs", "-R", request, self.dev], capture_output=True, text=True)
+        r = subprocess.run(
+            ["debugfs", "-R", request, self.dev],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        self._check_result(r, request)
+        return r.stdout
+
+    def _stat_optional(self, path):
+        r = subprocess.run(
+            ["debugfs", "-R", f'stat "{path}"', self.dev],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        diags = self._stderr_diagnostics(r.stderr)
+        if any("File not found by ext2_lookup" in d for d in diags):
+            return None
+        self._check_result(r, f'stat "{path}"')
         return r.stdout
 
     def ls(self, path):
-        """{name: mode} of a directory, None when it does not exist."""
+        """{name: (mode, size)} of a directory, None when it does not exist."""
         if path not in self.cache:
-            out = self.run(f'ls -p "{path}"')
+            if path != "/" and self._stat_optional(path) is None:
+                self.cache[path] = None
+                return None
+            script = f'ls -l -p "{path}"\nstat "{path}"\n'
+            r = subprocess.run(
+                ["debugfs", "-f", "-", self.dev],
+                input=script,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            self._check_result(r, f'ls -l -p "{path}"')
+            ls_rows = []
+            stat_lines = []
+            ls_seen = False
+            in_stat = False
+            for line in r.stdout.splitlines():
+                if not in_stat:
+                    if line.startswith("debugfs: ls -l -p "):
+                        ls_seen = True
+                        continue
+                    if line.startswith("debugfs: stat "):
+                        in_stat = True
+                        continue
+                    if line:
+                        ls_rows.append(line)
+                else:
+                    stat_lines.append(line)
+            if not ls_seen or not in_stat:
+                raise InputError(
+                    f"{self.label}: incomplete debugfs listing for {path} (missing stat sentinel)"
+                )
+            stat_text = "\n".join(stat_lines)
+            m_type = re.search(r"Inode:\s+(\d+)\s+Type:\s+(\S+)", stat_text)
+            m_links = re.search(r"Links:\s+(\d+)", stat_text)
+            if not m_type or m_type.group(2) != "directory" or not m_links:
+                raise InputError(
+                    f"{self.label}: invalid debugfs stat sentinel for {path}"
+                )
+            stat_ino = int(m_type.group(1))
+            stat_links = int(m_links.group(1))
+
             entries = {}
-            for line in out.splitlines():
+            self_seen = False
+            parent_seen = False
+            child_dirs = 0
+            for line in ls_rows:
                 f = line.split("/")
                 # /inode/mode/uid/gid/name/size/
-                if len(f) >= 7 and f[0] == "" and f[2].isdigit():
-                    if f[5] not in (".", ".."):
-                        entries[f[5]] = int(f[2], 8)
-            self.cache[path] = entries if out.strip() else None
+                if len(f) != 8 or f[0] != "" or f[-1] != "" or not f[1].isdigit():
+                    raise InputError(
+                        f"{self.label}: malformed debugfs listing row at {path}: {line!r}"
+                    )
+                if f[1] == "0" and f[5] == "":
+                    continue
+                if f[5] == ".":
+                    self_seen = int(f[1]) == stat_ino
+                    continue
+                if f[5] == "..":
+                    parent_seen = True
+                    continue
+                mode = int(f[2], 8)
+                size = int(f[6]) if f[6].isdigit() else 0
+                entries[f[5]] = (mode, size)
+                if (mode & 0o170000) == 0o040000:
+                    child_dirs += 1
+            if not self_seen or not parent_seen:
+                raise InputError(
+                    f"{self.label}: incomplete debugfs listing for {path} (missing . or ..)"
+                )
+            if stat_links >= 2 and child_dirs + 2 != stat_links:
+                raise InputError(
+                    f"{self.label}: incomplete debugfs listing for {path} "
+                    f"(saw {child_dirs} subdirs, inode Links={stat_links})"
+                )
+            self.cache[path] = entries
         return self.cache[path]
 
     def mode(self, path):
         parent, name = path.rsplit("/", 1)
         listing = self.ls(parent or "/")
-        return None if listing is None else listing.get(name)
+        if listing is None or name not in listing:
+            return None
+        return listing[name][0]
 
     def walk(self, scan_dirs, notes):
         entries = []
@@ -246,7 +373,7 @@ class Debugfs:
             while todo:
                 rel = todo.pop()
                 listing = self.ls(f"/{d}/{rel}".rstrip("/")) or {}
-                for name, m in sorted(listing.items()):
+                for name, (m, _sz) in sorted(listing.items()):
                     child = f"{rel}/{name}".lstrip("/")
                     if (m & 0o170000) == 0o040000:
                         todo.append(child)
@@ -255,9 +382,17 @@ class Debugfs:
         return entries
 
     def dump(self, path, dest):
+        parent, name = path.rsplit("/", 1)
+        listing = self.ls(parent or "/")
+        if listing is None or name not in listing:
+            raise InputError(f"{self.label}: cannot locate {path}")
+        expected_size = listing[name][1]
         self.run(f'dump "{path}" "{dest}"')
-        if not os.path.isfile(dest):
-            raise InputError(f"{self.label}: cannot read {path}")
+        if not os.path.isfile(dest) or os.path.getsize(dest) != expected_size:
+            raise InputError(
+                f"{self.label}: incomplete dump of {path} "
+                f"(expected {expected_size} bytes)"
+            )
 
 
 # --- classify, report, strip -------------------------------------------------
@@ -308,8 +443,12 @@ def strip(root, items, manifest_rel, scan_dirs):
         full = os.path.join(root, i["path"].lstrip("/"))
         if not os.path.lexists(full):
             continue
-        rec = dict(i, package=owner(root, i["path"]), sha256=digest(full),
-                   size=0 if os.path.islink(full) else os.path.getsize(full))
+        rec = dict(
+            i,
+            package=owner(root, i["path"]),
+            sha256=digest(full),
+            size=0 if os.path.islink(full) else os.path.getsize(full),
+        )
         os.unlink(full)
         removed.append(rec)
     # Directories the removal emptied (deepest first), inside the scan dirs.
@@ -322,15 +461,20 @@ def strip(root, items, manifest_rel, scan_dirs):
                 os.rmdir(cur)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [f"# {stamp} image-firmware strip: {len(removed)} file(s) removed"]
-    lines += [f"{r['sha256']}\t{r['size']}\t{r['package']}\t{r['reason']}\t{r['path']}" for r in removed]
+    lines += [
+        f"{r['sha256']}\t{r['size']}\t{r['package']}\t{r['reason']}\t{r['path']}"
+        for r in removed
+    ]
     man = os.path.join(root, manifest_rel.lstrip("/"))
     os.makedirs(os.path.dirname(man), exist_ok=True)
     new = not os.path.exists(man)
     with open(man, "a", encoding="utf-8") as f:
         if new:
-            f.write("# Firmware removed from this tree by hand: Realtek firmware and every\n"
-                    "# file not on the allow-list (image-firmware.py strip). One section per run.\n"
-                    "# sha256\tbytes\tpackage\treason\tpath\n")
+            f.write(
+                "# Firmware removed from this tree by hand: Realtek firmware and every\n"
+                "# file not on the allow-list (image-firmware.py strip). One section per run.\n"
+                "# sha256\tbytes\tpackage\treason\tpath\n"
+            )
         f.write("\n".join(lines) + "\n")
     return removed, lines
 
@@ -344,14 +488,33 @@ def main():
     ap.add_argument("mode", choices=("audit", "check", "strip"))
     ap.add_argument("--root", action="append", default=[], help="root filesystem tree")
     ap.add_argument("--list", action="append", default=[], help="path listing file")
-    ap.add_argument("--image", action="append", default=[], help="raw disk image (read-only)")
-    ap.add_argument("--partition", type=int, default=0, help="with --image: partition number")
-    ap.add_argument("--initramfs", action="store_true", help="also list boot/initramfs-*.img")
-    ap.add_argument("--allow", action="append", default=None, help=f"allow-list (default {default_allow})")
-    ap.add_argument("--scan-dir", action="append", default=None,
-                    help="directory to check, relative to the root (default: %s)" % ", ".join(FIRMWARE_DIRS))
-    ap.add_argument("--manifest", default="usr/share/doc/cubie-a7a/removed-firmware.txt",
-                    help="strip: manifest path inside the root")
+    ap.add_argument(
+        "--image", action="append", default=[], help="raw disk image (read-only)"
+    )
+    ap.add_argument(
+        "--partition", type=int, default=0, help="with --image: partition number"
+    )
+    ap.add_argument(
+        "--initramfs", action="store_true", help="also list boot/initramfs-*.img"
+    )
+    ap.add_argument(
+        "--allow",
+        action="append",
+        default=None,
+        help=f"allow-list (default {default_allow})",
+    )
+    ap.add_argument(
+        "--scan-dir",
+        action="append",
+        default=None,
+        help="directory to check, relative to the root (default: %s)"
+        % ", ".join(FIRMWARE_DIRS),
+    )
+    ap.add_argument(
+        "--manifest",
+        default="usr/share/doc/cubie-a7a/removed-firmware.txt",
+        help="strip: manifest path inside the root",
+    )
     ap.add_argument("--json", help="also write the result as JSON")
     ap.add_argument("--quiet", action="store_true", help="do not print allowed files")
     a = ap.parse_args()
@@ -359,6 +522,13 @@ def main():
         ap.error("give at least one --root, --list or --image")
     if a.mode == "strip" and (a.image or a.initramfs or len(a.root) != 1):
         ap.error("strip works on exactly one --root (no --image or --initramfs)")
+    if a.mode == "check" and a.list:
+        print(
+            "image-firmware: check --list cannot certify absence: an unframed "
+            "path listing has no positive completeness signal; use --root or --image",
+            file=sys.stderr,
+        )
+        return 2
     scan_dirs = tuple(d.strip("/") for d in (a.scan_dir or FIRMWARE_DIRS))
 
     notes = []
@@ -374,15 +544,21 @@ def main():
                 for name in sorted(os.listdir(boot)) if os.path.isdir(boot) else []:
                     if name.startswith("initramfs-") and name.endswith(".img"):
                         p = os.path.join(boot, name)
-                        found += [(f"{p} (initramfs)", d, rel)
-                                  for d, rel in parse_listing(list_initramfs(p), scan_dirs)]
+                        found += [
+                            (f"{p} (initramfs)", d, rel)
+                            for d, rel in parse_listing(list_initramfs(p), scan_dirs)
+                        ]
         listed = []
         for path in a.list:
             try:
                 if path == "-":
                     lines = sys.stdin.read().splitlines()
                 else:
-                    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+                    lines = (
+                        open(path, encoding="utf-8", errors="replace")
+                        .read()
+                        .splitlines()
+                    )
             except OSError as e:
                 raise InputError(f"--list {path}: {e.strerror}") from e
             listed += [(path, d, rel) for d, rel in parse_listing(lines, scan_dirs)]
@@ -403,17 +579,30 @@ def main():
                         if name.startswith("initramfs-") and name.endswith(".img"):
                             dest = os.path.join(tmp, name)
                             fs.dump(f"/boot/{name}", dest)
-                            found += [(f"{fs.label}:/boot/{name} (initramfs)", d, rel)
-                                      for d, rel in parse_listing(list_initramfs(dest), scan_dirs)]
+                            found += [
+                                (f"{fs.label}:/boot/{name} (initramfs)", d, rel)
+                                for d, rel in parse_listing(
+                                    list_initramfs(dest), scan_dirs
+                                )
+                            ]
                             os.unlink(dest)
     except InputError as e:
         print(f"image-firmware: {e}", file=sys.stderr)
         return 2
 
     realtek, unlisted, allowed = classify(found, rules)
-    result = {"mode": a.mode, "scan_dirs": scan_dirs, "allow_lists": a.allow or [default_allow],
-              "sources": sorted({s for s, _, _ in found} | set(a.root) | set(a.list) | set(a.image)),
-              "notes": notes, "realtek": realtek, "unlisted": unlisted, "allowed": allowed}
+    result = {
+        "mode": a.mode,
+        "scan_dirs": scan_dirs,
+        "allow_lists": a.allow or [default_allow],
+        "sources": sorted(
+            {s for s, _, _ in found} | set(a.root) | set(a.list) | set(a.image)
+        ),
+        "notes": notes,
+        "realtek": realtek,
+        "unlisted": unlisted,
+        "allowed": allowed,
+    }
     for n in notes:
         print(f"note      {n}")
     if not a.quiet:
@@ -423,12 +612,16 @@ def main():
     if a.mode == "strip":
         removed, lines = strip(a.root[0], realtek + unlisted, a.manifest, scan_dirs)
         for r in removed:
-            print(f"removed   {r['path']}  package={r['package']} sha256={r['sha256']} "
-                  f"({r['reason']}, {r['size']} bytes)")
+            print(
+                f"removed   {r['path']}  package={r['package']} sha256={r['sha256']} "
+                f"({r['reason']}, {r['size']} bytes)"
+            )
         result["removed"] = removed
-        print(f"image-firmware: removed {len(removed)} file(s) "
-              f"({len(realtek)} Realtek, {len(unlisted)} not on the allow-list), "
-              f"{len(allowed)} allowed kept; manifest /{a.manifest.lstrip('/')}")
+        print(
+            f"image-firmware: removed {len(removed)} file(s) "
+            f"({len(realtek)} Realtek, {len(unlisted)} not on the allow-list), "
+            f"{len(allowed)} allowed kept; manifest /{a.manifest.lstrip('/')}"
+        )
     else:
         tag = "REALTEK " if a.mode == "check" else "realtek "
         for i in realtek:
@@ -436,9 +629,11 @@ def main():
         tag = "UNLISTED" if a.mode == "check" else "unlisted"
         for i in unlisted:
             print(f"{tag}  {i['path']}  [{i['source']}]")
-        print(f"image-firmware: {len(found)} firmware entries in {len(result['sources'])} "
-              f"source(s): {len(realtek)} Realtek, {len(unlisted)} not on the allow-list, "
-              f"{len(allowed)} allowed")
+        print(
+            f"image-firmware: {len(found)} firmware entries in {len(result['sources'])} "
+            f"source(s): {len(realtek)} Realtek, {len(unlisted)} not on the allow-list, "
+            f"{len(allowed)} allowed"
+        )
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=1)
