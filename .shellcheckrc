@@ -1,0 +1,11 @@
+# shellcheck config for this repository (read automatically from the
+# script's directory and its parents).
+#
+# The scripts source fedora/release.sh through "$TOP/fedora/release.sh".
+# SC1091 ("Not following: ... was not specified as input") is an info note,
+# not a defect; following the source is what the repository wants, so this
+# is the repository-level equivalent of running shellcheck with -x.  The
+# source= directives use SCRIPTDIR so they resolve from any working
+# directory.
+external-sources=true
+source-path=SCRIPTDIR

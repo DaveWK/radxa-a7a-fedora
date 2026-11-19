@@ -12,7 +12,7 @@
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
-# shellcheck source=fedora/release.sh
+# shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
 OUT=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
 BR=${BUILDROOT:-$TOP/build/fedora/buildroot-aarch64$RELEASE_SUFFIX}

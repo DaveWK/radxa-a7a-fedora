@@ -22,7 +22,7 @@
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
-# shellcheck source=fedora/release.sh
+# shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
 # The firmware log reader and its format document come from a boot-chain
 # tree that has tools/a7a-fwlog (FWREPO). FWREPO=none (default) builds the

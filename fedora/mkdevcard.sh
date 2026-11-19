@@ -70,7 +70,7 @@ set -euo pipefail
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 FIRMWARE=${1:?firmware.bin}
 RPMDIR=${2:?rpmbuild RPMS directory with noarch/ and aarch64/ cubie-a7a packages}
-# shellcheck source=fedora/release.sh
+# shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
 W=${WORK:-$TOP/build/fedora/devcard$RELEASE_SUFFIX}
 OUT=${OUT:-$TOP/build/image/a7a-fedora$RELEASE_SUFFIX-dev.img}
@@ -337,7 +337,7 @@ kernels=$(ls "$ROOT/usr/lib/modules")
 [ "$(wc -w <<<"$kernels")" = 1 ] || { echo "mkdevcard: expected one kernel, got: $kernels" >&2; exit 1; }
 [ -z "$KERNEL_VERSION" ] || [ "$kernels" = "$KERNEL_VERSION.aarch64" ] ||
     { echo "mkdevcard: kernel $kernels installed, KERNEL_VERSION asked for $KERNEL_VERSION" >&2; exit 1; }
-# shellcheck source=fedora/release.sh
+# shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
 for k in $kernels; do
     # The board package's own guard: every boot kmod built (and selected

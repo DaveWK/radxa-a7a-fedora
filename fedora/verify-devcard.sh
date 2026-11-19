@@ -20,7 +20,7 @@
 set -uo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
-# shellcheck source=fedora/release.sh
+# shellcheck source=release.sh
 . "$TOP/fedora/release.sh"
 IMG=${1:-$TOP/build/image/a7a-fedora$RELEASE_SUFFIX-dev.img}
 W=${2:-$TOP/build/fedora/devcard$RELEASE_SUFFIX}
