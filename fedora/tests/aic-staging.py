@@ -12,6 +12,7 @@ Run: python3 -I fedora/tests/aic-staging.py
 
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -701,8 +702,6 @@ def test_rpm_manifests_bound_to_one_run():
         run = Path(r_bld.stdout.strip())
         outputs, checks = run / "out", run / "rpm-checks"
         assert not (checks / "checked-aarch64-rpms.json").exists()
-        import json
-
         noarch = checks / "checked-rpms.json"
         data = json.loads(noarch.read_text())
         srpm = run / data["srpm"]["relpath"]
@@ -842,6 +841,7 @@ def _aarch64_rebuild_fixture(root):
         "br = Path(sys.argv[1])\n"
         "name = Path(sys.argv[-1]).name\n"
         f"open({str(log)!r}, 'a').write(name + '\\n')\n"
+        f"Path({str(log.with_suffix('.args.json'))!r}).write_text(json.dumps(sys.argv[2:]))\n"
         "if os.environ.get('STUB_MUTATE'):\n"
         "    m = br.parent / 'rpm-checks/checked-rpms.json'\n"
         "    d = json.loads(m.read_text())\n"
@@ -853,7 +853,11 @@ def _aarch64_rebuild_fixture(root):
         "spec.loader.exec_module(t)\n"
         "work = br / 'stubwork'\n"
         "work.mkdir(exist_ok=True)\n"
-        "t._fake_fwlog_binary(work, br / 'sources' / name, br / 'work/RPMS/aarch64')\n"
+        "binary = t._fake_fwlog_binary(work, br / 'sources' / name, br / 'work/RPMS/aarch64')\n"
+        "if os.environ.get('STUB_EXTRA'):\n"
+        "    extra = br / 'work/RPMS/noarch/unexpected.rpm'\n"
+        "    extra.parent.mkdir()\n"
+        "    shutil.copyfile(binary, extra)\n"
     )
     for s in stubs.iterdir():
         s.chmod(0o755)
@@ -880,6 +884,10 @@ def test_aarch64_rebuild_uses_only_the_bound_srpm():
         rebuilt = log.read_text().split() if log.exists() else []
         assert rebuilt == [bound.name], f"rebuilt {rebuilt}, bound {bound.name}"
         assert r.returncode == 0, r.stderr
+        rpmbuild_args = json.loads(log.with_suffix(".args.json").read_text())
+        assert ("--define", "debug_package %{nil}") in zip(
+            rpmbuild_args, rpmbuild_args[1:]
+        ), rpmbuild_args
         r = _policy("load-rpm-run", str(out))
         assert r.returncode == 0 and "cubie-a7a-fwlog\t" in r.stdout, r.stderr
 
@@ -900,6 +908,23 @@ def test_aarch64_rebuild_refuses_run_change():
         assert log.exists(), "the rebuild did not run"
         assert r.returncode != 0, f"a mid-rebuild run change was bound:\n{r.stderr}"
         assert not (out / "rpm-checks/checked-aarch64-rpms.json").exists()
+        assert not (out / "rpm-snapshot.json").exists()
+
+
+def test_aarch64_rebuild_refuses_any_extra_rpm():
+    """An extra output outside aarch64/ must not disappear from the gate."""
+    with tempfile.TemporaryDirectory(prefix="a7a-aarch64-") as td:
+        repo_fed, out, env, log = _aarch64_rebuild_fixture(Path(td))
+        r = subprocess.run(
+            ["bash", str(repo_fed / "build-aarch64-rpms.sh"), str(out)],
+            env={**env, "STUB_EXTRA": "1"},
+            capture_output=True,
+            text=True,
+        )
+        assert log.exists(), "the rebuild did not run"
+        assert r.returncode == 1, f"unexpected RPM was ignored (exit {r.returncode})"
+        assert "expected exactly one aarch64 image RPM" in r.stderr, r.stderr
+        assert "work/RPMS/noarch/unexpected.rpm" in r.stderr, r.stderr
         assert not (out / "rpm-snapshot.json").exists()
 
 
@@ -949,6 +974,10 @@ def main():
     case(
         "build-aarch64-rpms: a mid-rebuild run change is refused (F6 B5)",
         test_aarch64_rebuild_refuses_run_change,
+    )
+    case(
+        "build-aarch64-rpms: refuses every unexpected binary output",
+        test_aarch64_rebuild_refuses_any_extra_rpm,
     )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")

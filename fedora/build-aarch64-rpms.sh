@@ -52,16 +52,22 @@ mount -t proc proc "$BUILD_SYS/proc"
 for n in null zero random urandom full; do touch "$BUILD_SYS/dev/$n"; mount --bind "/dev/$n" "$BUILD_SYS/dev/$n"; done
 mount -t tmpfs tmpfs "$BUILD_SYS/run"
 chroot "$BUILD_SYS" rpmbuild --define "_topdir /work" --define "_tmppath /work/tmp" \
-    --define "dist $DIST" --rebuild "/sources/${SRPM##*/}"
+    --define "dist $DIST" --define 'debug_package %{nil}' --rebuild "/sources/${SRPM##*/}"
 NS
-shopt -s nullglob
-built_aarch64=("$BUILD_SYS"/work/RPMS/aarch64/*.rpm)
-if ((${#built_aarch64[@]} == 0)); then
-    echo "build-aarch64-rpms: no aarch64 binary RPMs built" >&2
+shopt -s nullglob globstar dotglob
+built_aarch64=("$BUILD_SYS"/work/RPMS/**/*.rpm)
+if ((${#built_aarch64[@]} != 1)); then
+    printf 'build-aarch64-rpms: expected exactly one aarch64 image RPM; found %s\n' "${#built_aarch64[@]}" >&2
+    printf '  %s\n' "${built_aarch64[@]}" >&2
+    exit 1
+fi
+rpm_file=${built_aarch64[0]}
+if [ "${rpm_file%/*}" != "$BUILD_SYS/work/RPMS/aarch64" ] || [ ! -f "$rpm_file" ] || [ -L "$rpm_file" ]; then
+    echo "build-aarch64-rpms: unexpected image RPM output: $rpm_file" >&2
     exit 1
 fi
 mkdir "$RUN/out/aarch64"
-cp "${built_aarch64[@]}" "$RUN/out/aarch64/"
+cp "$rpm_file" "$RUN/out/aarch64/"
 python3 -I "$POLICY" write-rpm-manifest \
     "$RUN/out" "$RUN/rpm-checks/checked-aarch64-rpms.json" --kind aarch64 \
     --bind-noarch "$NOARCH_MANIFEST" --bind-noarch-sha256 "$NOARCH_SHA256" \
