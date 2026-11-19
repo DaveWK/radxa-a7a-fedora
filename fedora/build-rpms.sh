@@ -9,8 +9,8 @@
 #   cubie-a7a-display        DKMS sunxidrm (A733 HDMI display driver)
 #   cubie-a7a-vdec           DKMS a733-cedrus (A733 video decoder)
 #   cubie-a7a-aic8800-usb    DKMS AIC8800D80 Wi-Fi/Bluetooth driver (firmware
-#                            from linux-firmware) and the optional override
-#                            helper (no firmware)
+#                            from linux-firmware); only the reviewed driver
+#                            inputs are staged, never the whole external tree
 #   cubie-a7a-fwlog          firmware log reader + journal unit (aarch64; its
 #                            binary RPM is built by build-aarch64-rpms.sh)
 #
@@ -73,10 +73,22 @@ for pair in cubie-a7a-npu:a733-vipcore cubie-a7a-rk1828:rk1828-pcie-rkep \
     v=$(ver "$spec")
     src=$TOP/fedora/kmods/$kmod
     # The AIC8800 driver is not in this repository (most of its files carry
-    # no licence grant); AIC8800_SRC names a local tree of it.
-    [ "$kmod" != aic8800-usb ] || src=${AIC8800_SRC:-$src}
-    if [ ! -d "$src" ]; then
-        echo "build-rpms: $pkg skipped: no $kmod source (AIC8800_SRC=<tree>)" >&2
+    # no licence grant); AIC8800_SRC names a local tree of it.  Stage only
+    # the reviewed driver inputs (driver-inputs.list, with SHA256 values
+    # verified) and refuse the tree when it holds firmware.
+    if [ "$kmod" = aic8800-usb ]; then
+        src=${AIC8800_SRC:-$src}
+        if [ ! -d "$src" ]; then
+            echo "build-rpms: $pkg skipped: no $kmod source (AIC8800_SRC=<tree>)" >&2
+            continue
+        fi
+        python3 -I "$TOP/fedora/stage-aic8800.py" stage "$src" "$OUT" "$v" \
+            --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list" ||
+            {
+                echo "build-rpms: refusing the $pkg driver source (reviewed inputs only)" >&2
+                exit 1
+            }
+        cp "$spec" "$OUT/SPECS/"
         continue
     fi
     cp -a "$src" "$stage/$kmod-$v"
@@ -87,7 +99,7 @@ done
 cp "$TOP"/fedora/rpm/cubie-a7a-npu/{60-cubie-a7a-npu.rules,cubie-a7a-npu.sysusers} "$OUT/SOURCES/"
 cp "$TOP/fedora/rpm/cubie-a7a-display/cubie-a7a-display-modprobe.conf" "$OUT/SOURCES/"
 cp "$TOP"/fedora/rpm/cubie-a7a-vdec/{cubie-a7a-vdec-modprobe.conf,cubie-a7a-vdec-selftest} "$OUT/SOURCES/"
-cp "$TOP"/fedora/rpm/cubie-a7a-aic8800-usb/{cubie-a7a-wifi-firmware,aic8800-d80-usb.manifest,60-cubie-a7a-aic8800.rules,cubie-a7a-aic8800-modprobe.conf,cubie-a7a-aic-udev} \
+cp "$TOP"/fedora/rpm/cubie-a7a-aic8800-usb/{cubie-a7a-wifi-firmware,aic8800-d80-usb.manifest,60-cubie-a7a-aic8800.rules,cubie-a7a-aic8800-modprobe.conf,cubie-a7a-aic-udev,driver-inputs.list} \
     "$TOP/fedora/WIFI-FIRMWARE.md" "$OUT/SOURCES/"
 
 # --- cubie-a7a-hat -----------------------------------------------------------
@@ -111,7 +123,26 @@ for s in "$OUT"/SPECS/*.spec; do
     rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bs "$s"
     case $s in
     *cubie-a7a-fwlog.spec) ;; # ExclusiveArch aarch64
-    *) rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bb "$s" ;;
+    *)
+        rpmbuild --define "_topdir $OUT" --define "_tmppath $OUT/tmp" --define "dist $DIST" -bb "$s"
+        case $s in
+        *cubie-a7a-aic8800-usb.spec)
+            # The built RPM must carry only the reviewed driver inputs and
+            # listed package outputs: no firmware, nothing unlisted.
+            rpm_file=$(find "$OUT/RPMS" -name 'cubie-a7a-aic8800-usb-*.rpm' -print -quit)
+            [ -n "$rpm_file" ] || {
+                echo "build-rpms: $s built no cubie-a7a-aic8800-usb RPM" >&2
+                exit 1
+            }
+            python3 -I "$TOP/fedora/stage-aic8800.py" payload "$rpm_file" \
+                --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list" ||
+                {
+                    echo "build-rpms: cubie-a7a-aic8800-usb RPM payload check failed" >&2
+                    exit 1
+                }
+            ;;
+        esac
+        ;;
     esac
 done
 find "$OUT/SRPMS" "$OUT/RPMS" -name '*.rpm' -printf '%p\n'

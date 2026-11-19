@@ -1,6 +1,6 @@
 Name:           cubie-a7a-aic8800-usb
 Version:        0.4
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        AIC8800D80 USB Wi-Fi driver and firmware loader for the Cubie A7A (firmware from linux-firmware)
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -15,6 +15,7 @@ Source3:        WIFI-FIRMWARE.md
 Source4:        60-cubie-a7a-aic8800.rules
 Source5:        cubie-a7a-aic8800-modprobe.conf
 Source6:        cubie-a7a-aic-udev
+Source7:        driver-inputs.list
 Source9:        cubie-a7a-dkms
 BuildRequires:  systemd-rpm-macros
 Requires:       dkms gcc make kmod
@@ -58,12 +59,20 @@ stable locally administered one (udev).
 
 %prep
 %setup -q -n aic8800-usb-%{version}
+# Verify every unpacked source file against the reviewed driver input list
+# (SHA256 and exact path set; no unlisted or firmware files).
+grep -Ev '^[[:space:]]*(#|$)' %{SOURCE7} | sha256sum -c -
+test "$(find . -type f -printf '%%P\n' | LC_ALL=C sort)" = \
+    "$(grep -Ev '^[[:space:]]*(#|$)' %{SOURCE7} | sed 's/^[^[:space:]]*[[:space:]]*//' | LC_ALL=C sort)"
 
 %build
 
 %install
 mkdir -p %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}
-cp -a . %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/
+grep -Ev '^[[:space:]]*(#|$)' %{SOURCE7} | while read -r _ rel; do
+    mkdir -p "%{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/$(dirname "$rel")"
+    cp -p "$rel" "%{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/$rel"
+done
 sed -i 's/@VERSION@/%{dkms_ver}/' %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/dkms.conf
 grep -qx 'PACKAGE_VERSION="%{dkms_ver}"' %{buildroot}%{_usrsrc}/%{dkms_name}-%{dkms_ver}/dkms.conf
 install -Dpm0755 %{SOURCE9} %{buildroot}%{_libexecdir}/cubie-a7a/dkms-%{dkms_name}
@@ -76,6 +85,17 @@ install -Dpm0644 %{SOURCE3} %{buildroot}%{_datadir}/cubie-a7a/WIFI-FIRMWARE.md
 install -Dpm0644 %{SOURCE4} %{buildroot}%{_udevrulesdir}/60-cubie-a7a-aic8800.rules
 install -Dpm0644 %{SOURCE5} %{buildroot}%{_prefix}/lib/modprobe.d/cubie-a7a-aic8800.conf
 install -Dpm0755 %{SOURCE6} %{buildroot}%{_libexecdir}/cubie-a7a/aic-udev
+
+%check
+# No firmware files anywhere in the package payload.
+! find %{buildroot} \( -type f -o -type l \) \( \
+    -path '*/lib/firmware/*' -o \
+    -path '*/fw/*' -o -path '*/firmware/*' -o \
+    -iname '*.bin' -o -iname '*.bin.xz' -o -iname '*.bin.zst' -o \
+    -iname '*.fw' -o -iname '*.fw.xz' -o -iname '*.fw.zst' -o \
+    -iname '*.dat' -o -iname '*.hex' -o -iname '*.img' -o \
+    -iname 'fw_*' -o -iname 'fmacfw*' -o -iname 'lmacfw*' \
+    \) | grep -q .
 
 %post
 %{_libexecdir}/cubie-a7a/dkms-%{dkms_name} add || :
@@ -110,6 +130,12 @@ install -Dpm0755 %{SOURCE6} %{buildroot}%{_libexecdir}/cubie-a7a/aic-udev
 %{_libexecdir}/cubie-a7a/aic-udev
 
 %changelog
+* Thu Nov 19 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.4-2
+- Stage and install only the reviewed driver inputs (driver-inputs.list, with
+  recorded SHA256 values verified in stage-aic8800.py and %%prep), never the
+  whole external AIC8800 tree; refuse firmware in AIC8800_SRC and verify the
+  built RPM payload with %%check and rpm -qlp
+
 * Thu Nov 12 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.4-1
 - Bluetooth on the mainline btusb: aic_btusb is no longer built or shipped
   (aic_load_fw uploads the Bluetooth patch set itself); modprobe.d
