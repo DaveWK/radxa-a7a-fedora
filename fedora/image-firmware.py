@@ -10,8 +10,8 @@ allow-list says) or unlisted (closed or not reviewed yet).
 
   audit   list allowed, Realtek and unlisted files; always exits 0. This is
           what the image build runs (mkdevcard.sh, a report next to the
-          build log) and what "make audit-firmware IMG=..." runs; also for
-          wider audits of closed files with --scan-dir/--allow
+          build log) and what "make audit-firmware" runs; also for wider
+          audits of closed files with --scan-dir/--allow
   check   the same, exit 1 when a Realtek or unlisted file is present
           (manual use only; nothing in the build calls it)
   strip   manual tool, not used by the image build or any package: remove
@@ -22,14 +22,15 @@ allow-list says) or unlisted (closed or not reviewed yet).
           the listed paths. The image keeps its firmware packages: a closed
           file goes only once an open replacement reaches parity
 
-Inputs (audit/check), any number of each:
+Inputs (audit/check/strip), any number of each:
   --root DIR        a root filesystem tree (mkdevcard's $W/root, / on the board)
   --list FILE       a listing of paths (- for stdin): one path per line, or lsinitrd /
                     ls -l output (directories skipped, "a -> b" counts as a)
-  --image IMG       a raw disk image: its root partition is read with debugfs
-                    (read-only, no mount)
-  --initramfs       also list every boot/initramfs-*.img of each --root or
-                    --image with lsinitrd (an image's is copied to TMPDIR)
+
+This tool walks plain directory trees and path listings only. It reads no
+archive or filesystem format: initramfs listings come from the build's own
+lsinitrd capture, and the whole-disk ext4 walk it used to do was removed when
+verify moved to an exact build manifest (fedora/devcard-manifest.py).
 
 Exit 0: clean (or audit/strip done). Exit 1: check found files. Exit 2: usage
 or input error.
@@ -39,16 +40,12 @@ import argparse
 import datetime
 import fnmatch
 import hashlib
-import importlib.util
 import json
 import os
 import re
 import shutil
-import stat
-import struct
 import subprocess
 import sys
-import tempfile
 
 FIRMWARE_DIRS = ("usr/lib/firmware", "lib/firmware", "usr/local/lib/firmware")
 COMPRESSION = (".xz", ".zst")
@@ -56,12 +53,6 @@ COMPRESSION = (".xz", ".zst")
 # directories rtl_nic, rtl_bt, rtlwifi, rtw88, rtw89 and realtek, and file or
 # directory names starting rtl, rtw or rtk (rtl8125b-2.fw, rtw8822c_fw.bin).
 REALTEK = re.compile(r"(^|/)(rt[lwk][^/]*|realtek)(/|$)", re.IGNORECASE)
-# GPT partition types searched for the root filesystem, in this order.
-ROOT_TYPES = (
-    "B921B045-1DF0-41C3-AF44-4C6F280D3FAE",  # root, arm64
-    "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709",  # root, x86-64
-    "0FC63DAF-8483-4772-8E79-3D69D8477DE4",  # Linux filesystem data
-)
 LS_LINE = re.compile(r"^([dlcbps-])[rwxsStT-]{9}[.+@]?\s")
 
 
@@ -174,468 +165,6 @@ def parse_listing(lines, scan_dirs):
     return entries
 
 
-def _load_policy():
-    policy_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "devcard-policy.py"
-    )
-    if not os.path.isfile(policy_path):
-        raise InputError(f"cannot locate {policy_path} for initramfs verification")
-    prev = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        spec = importlib.util.spec_from_file_location("devcard_policy_fw", policy_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        sys.dont_write_bytecode = prev
-
-
-def list_initramfs(path):
-    if not shutil.which("lsinitrd"):
-        raise InputError("lsinitrd (dracut) is needed to list an initramfs")
-    policy_mod = _load_policy()
-    try:
-        records = policy_mod.inspect_initramfs(path)
-    except policy_mod.PolicyError as exc:
-        raise InputError(f"lsinitrd {path}: {exc}") from exc
-    return [rec[1] for rec in records if rec[0] in ("file", "symlink")]
-
-
-class Debugfs:
-    """Read-only view of an ext4 filesystem inside a disk image.
-
-    What is checked, and no more: the superblock is pinned to what
-    mkfs.ext4 makes for us (filetype and extents, no inline_data or
-    encryption, 1/2/4 KiB blocks); every directory is listed by inode, and
-    its listing (names, inode numbers, file types, subdirectory count) must
-    equal the entries parsed from that directory's own raw blocks, located
-    through the extent map debugfs stat reports (contiguous logical blocks,
-    inside the partition, no logical block twice).  Not checked: regular
-    files' sizes or extents, block ownership across inodes (two inodes
-    sharing a block), or extent-tree interior nodes; a dump's size is
-    compared only with the size debugfs itself lists.  Firmware paths are
-    classified by name, so these limits affect file contents, not which
-    files are found.
-    """
-
-    _BANNER_RE = re.compile(r"^debugfs [0-9.]+ \([^()]+\)$")
-    _EXT4_INCOMPAT_FILETYPE = 0x0002
-    _EXT4_INCOMPAT_EXTENTS = 0x0040
-    _EXT4_INCOMPAT_INLINE_DATA = 0x8000
-    _EXT4_INCOMPAT_ENCRYPT = 0x10000
-    _EXT4_FL_EXTENTS = 0x80000
-    _EXT4_FL_ENCRYPT = 0x00800
-    _EXT4_FL_INLINE_DATA = 0x10000000
-    _EXT4_FT_CSUM = 0xDE
-    _ROOT_INO = 2
-    _MODE_TO_FT = {
-        stat.S_IFREG: 1,
-        stat.S_IFDIR: 2,
-        stat.S_IFCHR: 3,
-        stat.S_IFBLK: 4,
-        stat.S_IFIFO: 5,
-        stat.S_IFSOCK: 6,
-        stat.S_IFLNK: 7,
-    }
-
-    def __init__(self, image, partition):
-        if not shutil.which("debugfs") or not shutil.which("sfdisk"):
-            raise InputError(
-                "debugfs (e2fsprogs) and sfdisk (util-linux) are needed for --image"
-            )
-        r = subprocess.run(["sfdisk", "-J", image], capture_output=True, text=True)
-        if r.returncode != 0:
-            raise InputError(f"sfdisk -J {image}: {r.stderr.strip()}")
-        try:
-            parts = json.loads(r.stdout)["partitiontable"]["partitions"]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise InputError(
-                f"sfdisk -J {image}: corrupt partition table: {exc}"
-            ) from exc
-        if partition:
-            if not 1 <= partition <= len(parts):
-                raise InputError(f"{image}: no partition {partition}")
-            part = parts[partition - 1]
-        else:
-            part = next(
-                (p for t in ROOT_TYPES for p in parts if p["type"].upper() == t), None
-            )
-            if part is None:
-                raise InputError(f"{image}: no root partition (use --partition)")
-        self.image = image
-        self.part_offset = part["start"] * 512
-        self.part_size = part["size"] * 512
-        self.dev = f"{image}?offset={self.part_offset}"
-        self.label = f"{image} partition {parts.index(part) + 1}"
-        self.block_size = self._read_ext4_superblock()
-        self.cache = {}
-
-    def _read_ext4_superblock(self):
-        """Pin to mkfs.ext4 extent+filetype ext4 without inline_data or encrypt."""
-        try:
-            with open(self.image, "rb") as fh:
-                fh.seek(self.part_offset + 1024)
-                sb = fh.read(1024)
-        except OSError as exc:
-            raise InputError(
-                f"{self.label}: cannot read ext4 superblock: {exc}"
-            ) from exc
-        if len(sb) != 1024 or struct.unpack_from("<H", sb, 0x38)[0] != 0xEF53:
-            raise InputError(f"{self.label}: not an ext4 filesystem superblock")
-        log_bs = struct.unpack_from("<I", sb, 0x18)[0]
-        if log_bs > 2:
-            raise InputError(
-                f"{self.label}: unsupported ext4 block size (log={log_bs}); "
-                "expected 1024, 2048 or 4096"
-            )
-        block_size = 1024 << log_bs
-        incompat = struct.unpack_from("<I", sb, 0x60)[0]
-        if not (incompat & self._EXT4_INCOMPAT_FILETYPE) or not (
-            incompat & self._EXT4_INCOMPAT_EXTENTS
-        ):
-            raise InputError(
-                f"{self.label}: refused ext4 without filetype+extents (incompat={hex(incompat)})"
-            )
-        if incompat & (self._EXT4_INCOMPAT_INLINE_DATA | self._EXT4_INCOMPAT_ENCRYPT):
-            raise InputError(
-                f"{self.label}: refused ext4 with inline_data or encrypt (incompat={hex(incompat)})"
-            )
-        return block_size
-
-    def _raw_dir_entries(self, stat_ino, stat_text, path):
-        """Parse a directory's raw ext4 blocks from the image file.
-
-        Blocks are located through the extent map from debugfs stat (the
-        directory's size, logical-to-physical runs); only the directory's
-        own records are parsed, not file extents or block ownership.
-        """
-        m_flags = re.search(r"Flags:\s+0x([0-9a-fA-F]+)", stat_text)
-        m_size = re.search(r"Size:\s+(\d+)", stat_text)
-        if not m_flags or not m_size:
-            raise InputError(
-                f"{self.label}: incomplete debugfs stat for {path} (missing Flags or Size)"
-            )
-        flags = int(m_flags.group(1), 16)
-        size = int(m_size.group(1))
-        if not (flags & self._EXT4_FL_EXTENTS):
-            raise InputError(
-                f"{self.label}: refused non-extent directory {path} (flags={hex(flags)})"
-            )
-        if flags & (self._EXT4_FL_INLINE_DATA | self._EXT4_FL_ENCRYPT):
-            raise InputError(
-                f"{self.label}: refused inline_data or encrypted directory {path} (flags={hex(flags)})"
-            )
-        if size == 0 or size % self.block_size != 0:
-            raise InputError(f"{self.label}: invalid directory size {size} for {path}")
-        m_ext = re.search(r"EXTENTS:\n(.*)", stat_text, re.S)
-        if not m_ext:
-            raise InputError(
-                f"{self.label}: missing EXTENTS in debugfs stat for {path}"
-            )
-        blks = {}
-        for token in m_ext.group(1).replace("\n", " ").split(","):
-            token = token.strip()
-            if not token or token.startswith("(ETB"):
-                continue
-            m = re.fullmatch(r"\((\d+)(?:-(\d+))?\):(\d+)(?:-(\d+))?", token)
-            if not m:
-                raise InputError(
-                    f"{self.label}: unrecognized extent {token!r} in {path}"
-                )
-            l0 = int(m.group(1))
-            l1 = int(m.group(2)) if m.group(2) else l0
-            p0 = int(m.group(3))
-            p1 = int(m.group(4)) if m.group(4) else p0
-            if (l1 - l0) != (p1 - p0):
-                raise InputError(f"{self.label}: mismatched extent {token!r} in {path}")
-            for off in range(l1 - l0 + 1):
-                lidx = l0 + off
-                pidx = p0 + off
-                if lidx in blks or (pidx + 1) * self.block_size > self.part_size:
-                    raise InputError(
-                        f"{self.label}: out-of-range or duplicate extent in {path}"
-                    )
-                blks[lidx] = pidx
-        num_blks = size // self.block_size
-        if len(blks) != num_blks or any(i not in blks for i in range(num_blks)):
-            raise InputError(
-                f"{self.label}: incomplete extent map for {path} "
-                f"(got {len(blks)}, expected {num_blks})"
-            )
-        raw_entries = {}
-        self_seen = False
-        parent_seen = False
-        try:
-            with open(self.image, "rb") as fh:
-                for lidx in range(num_blks):
-                    fh.seek(self.part_offset + blks[lidx] * self.block_size)
-                    buf = fh.read(self.block_size)
-                    if len(buf) != self.block_size:
-                        raise InputError(
-                            f"{self.label}: short read on directory block of {path}"
-                        )
-                    pos = 0
-                    while pos < self.block_size:
-                        if pos + 8 > self.block_size:
-                            raise InputError(
-                                f"{self.label}: corrupt ext4 dir record in {path}"
-                            )
-                        ino, rec_len, name_len, ftype = struct.unpack_from(
-                            "<IHBB", buf, pos
-                        )
-                        if (
-                            rec_len < 8
-                            or rec_len % 4 != 0
-                            or pos + rec_len > self.block_size
-                        ):
-                            raise InputError(
-                                f"{self.label}: corrupt ext4 dir rec_len={rec_len} in {path}"
-                            )
-                        if ino != 0 and name_len > 0 and ftype != self._EXT4_FT_CSUM:
-                            if 8 + name_len > rec_len:
-                                raise InputError(
-                                    f"{self.label}: corrupt ext4 dir name_len in {path}"
-                                )
-                            name = buf[pos + 8 : pos + 8 + name_len].decode(
-                                "utf-8", errors="surrogateescape"
-                            )
-                            if name == ".":
-                                self_seen = ino == stat_ino
-                            elif name == "..":
-                                parent_seen = True
-                            else:
-                                if name in raw_entries:
-                                    raise InputError(
-                                        f"{self.label}: duplicate raw dir entry {name!r} in {path}"
-                                    )
-                                raw_entries[name] = (ino, ftype)
-                        pos += rec_len
-        except OSError as exc:
-            raise InputError(
-                f"{self.label}: cannot read raw directory blocks for {path}: {exc}"
-            ) from exc
-        if not self_seen or not parent_seen:
-            raise InputError(f"{self.label}: raw ext4 directory {path} missing . or ..")
-        return raw_entries
-
-    def _stderr_diagnostics(self, stderr):
-        lines = [line for line in stderr.splitlines() if line.strip()]
-        if lines and self._BANNER_RE.fullmatch(lines[0]):
-            lines.pop(0)
-        return lines
-
-    def _check_result(self, r, what):
-        diags = self._stderr_diagnostics(r.stderr)
-        if r.returncode != 0 or diags:
-            msg = "; ".join(diags) or f"exit {r.returncode}"
-            raise InputError(f"{self.label}: debugfs {what} failed: {msg}")
-
-    def run(self, request):
-        # No -w: debugfs opens the filesystem read-only.
-        r = subprocess.run(
-            ["debugfs", "-R", request, self.dev],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-        self._check_result(r, request)
-        return r.stdout
-
-    def _ls_ino(self, ino, path):
-        """{name: (mode, size, ino)} of directory inode INO (PATH for messages).
-
-        Listed by inode (`ls -l -p <INO>`, `stat <INO>`), so no name lookup
-        happens here; the listing must carry its stat sentinel, `.` naming INO
-        itself, `..`, the inode's link count of subdirectories, and match the
-        raw ext4 directory blocks.  Any debugfs error fails.
-        """
-        if ino in self.cache:
-            return self.cache[ino]
-        script = f"ls -l -p <{ino}>\nstat <{ino}>\n"
-        r = subprocess.run(
-            ["debugfs", "-f", "-", self.dev],
-            input=script,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-        self._check_result(r, f"ls -l -p <{ino}> ({path})")
-        ls_rows = []
-        stat_lines = []
-        ls_seen = False
-        in_stat = False
-        for line in r.stdout.splitlines():
-            if not in_stat:
-                if line.startswith("debugfs: ls -l -p "):
-                    ls_seen = True
-                    continue
-                if line.startswith("debugfs: stat "):
-                    in_stat = True
-                    continue
-                if line:
-                    ls_rows.append(line)
-            else:
-                stat_lines.append(line)
-        if not ls_seen or not in_stat:
-            raise InputError(
-                f"{self.label}: incomplete debugfs listing for {path} (missing stat sentinel)"
-            )
-        stat_text = "\n".join(stat_lines)
-        m_type = re.search(r"Inode:\s+(\d+)\s+Type:\s+(\S+)", stat_text)
-        m_links = re.search(r"Links:\s+(\d+)", stat_text)
-        if (
-            not m_type
-            or int(m_type.group(1)) != ino
-            or m_type.group(2) != "directory"
-            or not m_links
-        ):
-            raise InputError(f"{self.label}: invalid debugfs stat sentinel for {path}")
-        stat_links = int(m_links.group(1))
-
-        entries = {}
-        ls_check = {}
-        self_seen = False
-        parent_seen = False
-        child_dirs = 0
-        for line in ls_rows:
-            f = line.split("/")
-            # /inode/mode/uid/gid/name/size/
-            if len(f) != 8 or f[0] != "" or f[-1] != "" or not f[1].isdigit():
-                raise InputError(
-                    f"{self.label}: malformed debugfs listing row at {path}: {line!r}"
-                )
-            if f[1] == "0" and f[5] == "":
-                continue
-            if f[5] == ".":
-                self_seen = int(f[1]) == ino
-                continue
-            if f[5] == "..":
-                parent_seen = True
-                continue
-            child_ino = int(f[1])
-            mode = int(f[2], 8)
-            size = int(f[6]) if f[6].isdigit() else 0
-            ft = self._MODE_TO_FT.get(stat.S_IFMT(mode))
-            if ft is None:
-                raise InputError(
-                    f"{self.label}: unsupported mode {oct(mode)} for {path}/{f[5]}"
-                )
-            if f[5] in entries:
-                raise InputError(
-                    f"{self.label}: duplicate debugfs listing row {f[5]!r} in {path}"
-                )
-            entries[f[5]] = (mode, size, child_ino)
-            ls_check[f[5]] = (child_ino, ft)
-            if stat.S_ISDIR(mode):
-                child_dirs += 1
-        if not self_seen or not parent_seen:
-            raise InputError(
-                f"{self.label}: incomplete debugfs listing for {path} (missing . or ..)"
-            )
-        if stat_links >= 2 and child_dirs + 2 != stat_links:
-            raise InputError(
-                f"{self.label}: incomplete debugfs listing for {path} "
-                f"(saw {child_dirs} subdirs, inode Links={stat_links})"
-            )
-        raw_entries = self._raw_dir_entries(ino, stat_text, path)
-        if ls_check != raw_entries:
-            raise InputError(
-                f"{self.label}: debugfs listing mismatch for {path} "
-                f"(ls={len(ls_check)} entries, raw ext4 dir={len(raw_entries)})"
-            )
-        self.cache[ino] = entries
-        return entries
-
-    def lookup(self, path):
-        """(mode, size, ino) of PATH, walking inode by inode from the root.
-
-        None only when a reconciled parent listing lacks the name; a name the
-        parent lists is always read by its inode, so a lookup error fails
-        instead of reading as absence.  Symlinks are not followed: a symlink
-        ancestor is returned as itself (its mode tells the caller).
-        """
-        if path.strip("/") == "":
-            return (stat.S_IFDIR | 0o755, 0, self._ROOT_INO)
-        listing = self._ls_ino(self._ROOT_INO, "/")
-        cur = ""
-        parts = [p for p in path.strip("/").split("/") if p]
-        for i, name in enumerate(parts):
-            cur += "/" + name
-            if name not in listing:
-                return None
-            mode, size, child = listing[name]
-            if i == len(parts) - 1 or not stat.S_ISDIR(mode):
-                if i != len(parts) - 1:
-                    if stat.S_ISLNK(mode):
-                        return (mode, size, child)
-                    raise InputError(f"{self.label}: {cur} is not a directory")
-                return (mode, size, child)
-            listing = self._ls_ino(child, cur)
-        raise InputError(f"{self.label}: cannot look up {path}")
-
-    def ls(self, path):
-        """{name: (mode, size)} of a directory, None when its parent lacks it."""
-        found = self.lookup(path)
-        if found is None:
-            return None
-        mode, _size, ino = found
-        if not stat.S_ISDIR(mode):
-            raise InputError(f"{self.label}: {path} is not a directory")
-        listing = self._ls_ino(ino, path)
-        return {name: (m, sz) for name, (m, sz, _i) in listing.items()}
-
-    def mode(self, path):
-        found = self.lookup(path)
-        return None if found is None else found[0]
-
-    def walk(self, scan_dirs, notes):
-        entries = []
-        for d in scan_dirs:
-            found = self.lookup("/" + d)
-            if found is None:
-                continue
-            cur = ""
-            symlink = False
-            for name in d.split("/"):
-                cur += "/" + name
-                m = self.mode(cur)
-                if m is None:
-                    break
-                if stat.S_ISLNK(m):
-                    notes.append(f"{self.label}: /{d} not scanned, {cur} is a symlink")
-                    symlink = True
-                    break
-            if symlink:
-                continue
-            mode, _size, ino = found
-            if not stat.S_ISDIR(mode):
-                raise InputError(f"{self.label}: /{d} is not a directory")
-            todo = [("", ino)]
-            while todo:
-                rel, dino = todo.pop()
-                listing = self._ls_ino(dino, f"/{d}/{rel}".rstrip("/"))
-                for name, (m, _sz, cino) in sorted(listing.items()):
-                    child = f"{rel}/{name}".lstrip("/")
-                    if stat.S_ISDIR(m):
-                        todo.append((child, cino))
-                    else:
-                        entries.append((d, child))
-        return entries
-
-    def dump(self, path, dest):
-        found = self.lookup(path)
-        if found is None or not stat.S_ISREG(found[0]):
-            raise InputError(f"{self.label}: cannot locate regular file {path}")
-        expected_size = found[1]
-        self.run(f'dump <{found[2]}> "{dest}"')
-        if not os.path.isfile(dest) or os.path.getsize(dest) != expected_size:
-            raise InputError(
-                f"{self.label}: incomplete dump of {path} "
-                f"(expected {expected_size} bytes)"
-            )
-
-
 # --- classify, report, strip -------------------------------------------------
 
 
@@ -730,15 +259,6 @@ def main():
     ap.add_argument("--root", action="append", default=[], help="root filesystem tree")
     ap.add_argument("--list", action="append", default=[], help="path listing file")
     ap.add_argument(
-        "--image", action="append", default=[], help="raw disk image (read-only)"
-    )
-    ap.add_argument(
-        "--partition", type=int, default=0, help="with --image: partition number"
-    )
-    ap.add_argument(
-        "--initramfs", action="store_true", help="also list boot/initramfs-*.img"
-    )
-    ap.add_argument(
         "--allow",
         action="append",
         default=None,
@@ -759,14 +279,14 @@ def main():
     ap.add_argument("--json", help="also write the result as JSON")
     ap.add_argument("--quiet", action="store_true", help="do not print allowed files")
     a = ap.parse_args()
-    if not (a.root or a.list or a.image):
-        ap.error("give at least one --root, --list or --image")
-    if a.mode == "strip" and (a.image or a.initramfs or len(a.root) != 1):
-        ap.error("strip works on exactly one --root (no --image or --initramfs)")
+    if not (a.root or a.list):
+        ap.error("give at least one --root or --list")
+    if a.mode == "strip" and (len(a.root) != 1):
+        ap.error("strip works on exactly one --root")
     if a.mode == "check" and a.list:
         print(
             "image-firmware: check --list cannot certify absence: an unframed "
-            "path listing has no positive completeness signal; use --root or --image",
+            "path listing has no positive completeness signal; use --root",
             file=sys.stderr,
         )
         return 2
@@ -780,15 +300,6 @@ def main():
             if not os.path.isdir(root):
                 raise InputError(f"--root {root}: not a directory")
             found += [(root, d, rel) for d, rel in scan_root(root, scan_dirs, notes)]
-            if a.initramfs:
-                boot = os.path.join(root, "boot")
-                for name in sorted(os.listdir(boot)) if os.path.isdir(boot) else []:
-                    if name.startswith("initramfs-") and name.endswith(".img"):
-                        p = os.path.join(boot, name)
-                        found += [
-                            (f"{p} (initramfs)", d, rel)
-                            for d, rel in parse_listing(list_initramfs(p), scan_dirs)
-                        ]
         listed = []
         for path in a.list:
             try:
@@ -811,22 +322,6 @@ def main():
             found = [f for f in found if (f[1], f[2]) in keep]
         else:
             found += listed
-        for image in a.image:
-            fs = Debugfs(image, a.partition)
-            found += [(fs.label, d, rel) for d, rel in fs.walk(scan_dirs, notes)]
-            if a.initramfs:
-                with tempfile.TemporaryDirectory(prefix="image-firmware-") as tmp:
-                    for name in sorted(fs.ls("/boot") or {}):
-                        if name.startswith("initramfs-") and name.endswith(".img"):
-                            dest = os.path.join(tmp, name)
-                            fs.dump(f"/boot/{name}", dest)
-                            found += [
-                                (f"{fs.label}:/boot/{name} (initramfs)", d, rel)
-                                for d, rel in parse_listing(
-                                    list_initramfs(dest), scan_dirs
-                                )
-                            ]
-                            os.unlink(dest)
     except InputError as e:
         print(f"image-firmware: {e}", file=sys.stderr)
         return 2
@@ -836,9 +331,7 @@ def main():
         "mode": a.mode,
         "scan_dirs": scan_dirs,
         "allow_lists": a.allow or [default_allow],
-        "sources": sorted(
-            {s for s, _, _ in found} | set(a.root) | set(a.list) | set(a.image)
-        ),
+        "sources": sorted({s for s, _, _ in found} | set(a.root) | set(a.list)),
         "notes": notes,
         "realtek": realtek,
         "unlisted": unlisted,
