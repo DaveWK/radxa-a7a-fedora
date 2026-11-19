@@ -22,11 +22,16 @@ Commands:
                       package's recorded digest.  Ownership comes from ROOT's
                       rpm database, or from a recorded TSV / rpm -qlv --dump
                       FILE.  Prints one problem per line; exit 1 on failure.
-  repart-root ROOT    every effective systemd-repart unit carries the
-                      --discard=no drop-in; exit 1 with a diagnostic otherwise.
-  repart-initramfs-listing
-                      stdin is an lsinitrd listing: no systemd-repart, or one
-                      with the --discard=no drop-in; exit 1 otherwise.
+  repart-root ROOT    every effective systemd-repart invocation carries
+                      --discard=no; exit 1 with a diagnostic otherwise.  The
+                      effective command comes from the unit plus every drop-in
+                      in systemd precedence order, including indented
+                      ExecStart= lines and ExecStart= resets.
+  repart-initramfs IMG [--chroot ROOT | --run-build-ns SCRIPT] [--forbid-repart]
+                      extract systemd-repart units, drop-ins and repart.d
+                      configs from IMG via lsinitrd and verify the effective
+                      command carries --discard=no (or is absent/masked);
+                      never accepts a drop-in by filename alone.
   enabled-repos DIR [DIR...]
                       enabled dnf repository ids, sorted, each followed by a
                       space (the awk's sort -u | tr '\n' ' ').
@@ -42,8 +47,10 @@ import argparse
 import hashlib
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 AIC_PATTERN = re.compile(r"aic8800", re.IGNORECASE)
@@ -55,8 +62,21 @@ FIRMWARE = "usr/lib/firmware"
 # non-Fedora file under an AIC firmware path is ours and forbidden
 # (DECISIONS 2026-11-11).
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
-REPART_DROPIN = "10-cubie-a7a-no-discard.conf"
 REPART_REPARTD = ("etc/repart.d", "usr/lib/repart.d", "usr/local/lib/repart.d")
+# systemd unit search path, highest precedence first.
+SYSTEMD_UNIT_DIRS = (
+    "etc/systemd/system",
+    "run/systemd/system",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+    "lib/systemd/system",
+)
+DISCARD_FLAG = "--discard=no"
+INITRAMFS_REPART_RE = re.compile(
+    r"^(?:etc|run|usr/local/lib|usr/lib|lib)/systemd/system/"
+    r"(?:systemd-repart(?:@)?\.service|(?:systemd-repart(?:@)?\.service|service)\.d/[^/]+\.conf)$"
+    r"|^(?:etc|usr/lib|usr/local/lib)/repart\.d/[^/]+\.conf$"
+)
 # rpm's PGPHASHALGO values (rpm/rpmpgp.h).
 RPM_ALGO = {1: "md5", 2: "sha1", 3: "sha224", 8: "sha256", 9: "sha384", 10: "sha512"}
 DIGEST_ALGO_DEFAULT = 8
@@ -497,96 +517,269 @@ def passwd_sole_root(text):
     return roots == 1
 
 
-def _exec_start_lines(path):
-    if not path.is_file():
-        return []
-    return [
-        line[len("ExecStart=") :]
-        for line in path.read_text().splitlines()
-        if line.startswith("ExecStart=")
-    ]
+def _logical_lines(text):
+    """Unit-file logical lines: backslash continuations joined per systemd."""
+    lines = []
+    buf = ""
+    for line in text.splitlines():
+        if buf:
+            stripped = line.lstrip()
+            if stripped.startswith(("#", ";")):
+                continue
+            line = stripped
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        buf += line
+        lines.append(buf)
+        buf = ""
+    if buf:
+        lines.append(buf)
+    return lines
 
 
-def repart_unit_ok(root, unit):
-    """True when UNIT carries the no-discard protection.
+def _service_assignments(text):
+    """Ordered (key, value) pairs inside [Service], whitespace tolerated."""
+    out = []
+    section = None
+    for line in _logical_lines(text):
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip()
+            continue
+        if section != "Service" or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        out.append((key.strip(), value.strip()))
+    return out
 
-    The drop-in repeats the unit's own ExecStart with --discard=no, no other
-    drop-in sets ExecStart, and /etc does not replace the unit with a regular
-    file.  A masked unit (a /dev/null symlink) is left alone: it cannot run.
+
+def _masked(path):
+    try:
+        if not path.is_symlink():
+            return False
+        return os.readlink(path) == "/dev/null" or os.path.realpath(path) == "/dev/null"
+    except OSError:
+        return False
+
+
+def _active_unit_dirs(root):
+    """Unit directories in precedence order, skipping lib/ when usr-merged."""
+    dirs = []
+    lib = root / "lib"
+    for rel in SYSTEMD_UNIT_DIRS:
+        if rel == "lib/systemd/system" and lib.is_symlink():
+            continue
+        dirs.append(rel)
+    return dirs
+
+
+def _unit_files(root, unit):
+    """Base unit file and drop-ins in systemd precedence order.
+
+    Returns None when UNIT is masked (/dev/null), [] when absent, or
+    [base, drop-in, ...] where:
+      - base is the highest-precedence unit file (etc > run > usr/local > usr/lib)
+      - drop-ins from service.d/*.conf then <unit>.d/*.conf are deduplicated
+        by filename (higher-precedence directory wins, /dev/null masks that
+        drop-in filename) and sorted lexicographically by filename.
     """
     root = Path(root)
-    lib = root / "usr/lib/systemd/system" / unit
-    etc = root / "etc/systemd/system" / unit
-    if etc.is_symlink():
-        try:
-            if etc.resolve() == Path("/dev/null"):
-                return True
-        except OSError:
-            pass
-    if etc.exists() and not etc.is_symlink():
-        return False
-    if not lib.is_file():
-        return False
-    stock = _exec_start_lines(lib)
-    if len(stock) != 1 or not stock[0]:
-        return False
-    dropin = root / "etc/systemd/system" / (unit + ".d") / REPART_DROPIN
-    if not dropin.is_file():
-        return False
-    lines = [
-        line
-        for line in dropin.read_text().splitlines()
-        if line and not line.startswith("#")
-    ]
-    if lines != ["[Service]", "ExecStart=", f"ExecStart={stock[0]} --discard=no"]:
-        return False
-    for directory in (dropin.parent, lib.parent / (unit + ".d")):
-        if not directory.is_dir():
-            continue
-        for conf in sorted(directory.glob("*.conf")):
-            if conf == dropin:
+    unit_dirs = _active_unit_dirs(root)
+    base = None
+    for directory in unit_dirs:
+        candidate = root / directory / unit
+        if candidate.is_symlink():
+            if _masked(candidate):
+                return None
+            resolved = _resolve_within(root, candidate)
+            if resolved is None:
+                return [candidate]  # unreadable/escaping -> fail closed
+            base = resolved
+            break
+        if candidate.is_file():
+            base = candidate
+            break
+    if base is None:
+        return []
+    ordered_dropins = []
+    for dropin_name in ("service.d", f"{unit}.d"):
+        by_name = {}
+        for directory in unit_dirs:
+            dpath = root / directory / dropin_name
+            if not dpath.is_dir():
                 continue
-            if any(
-                line.startswith("ExecStart") for line in conf.read_text().splitlines()
-            ):
-                return False
-    return True
+            for conf in sorted(dpath.glob("*.conf")):
+                if conf.name in by_name:
+                    continue  # higher-precedence directory already won
+                if conf.is_symlink():
+                    if _masked(conf):
+                        by_name[conf.name] = None  # masked drop-in
+                    else:
+                        by_name[conf.name] = _resolve_within(root, conf) or conf
+                elif conf.is_file():
+                    by_name[conf.name] = conf
+        for name in sorted(by_name):
+            if by_name[name] is not None:
+                ordered_dropins.append(by_name[name])
+    return [base] + ordered_dropins
+
+
+def _effective_exec_start(files):
+    """Effective [Service] ExecStart commands after applying FILES in order.
+
+    An empty ``ExecStart=`` resets the list, as systemd does; a later
+    assignment appends.  Indented lines and whitespace around ``=`` are
+    handled by ``_service_assignments``.  Returns None if any file cannot
+    be read (fail closed).
+    """
+    commands = []
+    for path in files:
+        if not path.is_file():
+            return None
+        try:
+            text = path.read_text()
+        except OSError:
+            return None
+        for key, value in _service_assignments(text):
+            if key != "ExecStart":
+                continue
+            if value == "":
+                commands = []
+            else:
+                commands.append(value)
+    return commands
+
+
+def _command_carries_no_discard(command):
+    """True when COMMAND's effective --discard option is --discard=no."""
+    cmd = command.lstrip("@-:+!")
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    discard = None
+    for tok in tokens[1:]:
+        if tok == "--":
+            break
+        if tok == DISCARD_FLAG:
+            discard = "no"
+        elif tok == "--discard" or tok.startswith("--discard="):
+            discard = "other"
+    return discard == "no"
+
+
+def _carries_no_discard(commands):
+    return bool(commands) and all(_command_carries_no_discard(c) for c in commands)
 
 
 def repart_root_ok(root):
-    """Every effective systemd-repart unit carries the protection."""
+    """Every effective systemd-repart invocation carries --discard=no."""
     root = Path(root)
     problems = []
+    unit_dirs = _active_unit_dirs(root)
+    repart_service_seen = False
     for unit in REPART_UNITS:
-        lib = root / "usr/lib/systemd/system" / unit
-        etc = root / "etc/systemd/system" / unit
-        if not lib.exists() and not etc.exists() and not etc.is_symlink():
+        present = any(
+            (root / directory / unit).exists() or (root / directory / unit).is_symlink()
+            for directory in unit_dirs
+        )
+        if not present:
             continue
-        if not repart_unit_ok(root, unit):
-            problems.append(f"{unit} lacks the --discard=no drop-in")
+        if unit == "systemd-repart.service":
+            repart_service_seen = True
+        files = _unit_files(root, unit)
+        if files is None:
+            continue  # masked: cannot run
+        commands = _effective_exec_start(files)
+        if commands is None:
+            problems.append(f"{unit}: unreadable unit or drop-in")
+        elif not _carries_no_discard(commands):
+            problems.append(f"{unit} runs {commands!r} without {DISCARD_FLAG}")
     configs = []
     for rel in REPART_REPARTD:
         directory = root / rel
         if directory.is_dir():
             configs += [c for c in directory.glob("*.conf") if c.is_file()]
-    if (
-        configs
-        and not (root / "usr/lib/systemd/system/systemd-repart.service").is_file()
-    ):
+    if configs and not repart_service_seen:
         problems.append("repart.d configuration without systemd-repart.service")
     return (not problems, problems)
 
 
-def repart_initramfs_ok(listing):
-    """An initramfs listing: no systemd-repart, or one with the drop-in."""
-    if "systemd-repart" not in listing:
-        return True, ""
-    if f"systemd-repart.service.d/{REPART_DROPIN}" not in listing:
-        return (
-            False,
-            "initramfs carries systemd-repart without the --discard=no drop-in",
-        )
-    return True, ""
+def _parse_lsinitrd_listing(listing):
+    """Return list of (kind, relpath, size_or_target) for repart-related entries."""
+    entries = []
+    for line in listing.splitlines():
+        if not line or line[0] not in ("-", "l"):
+            continue
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        mode, size_str, rest = parts[0], parts[4], parts[8]
+        if mode.startswith("l"):
+            if " -> " not in rest:
+                continue
+            rel, target = rest.split(" -> ", 1)
+            rel = rel.lstrip("/")
+            if rel.startswith("./"):
+                rel = rel[2:]
+            if INITRAMFS_REPART_RE.match(rel):
+                entries.append(("symlink", rel, target))
+        else:
+            rel = rest.lstrip("/")
+            if rel.startswith("./"):
+                rel = rel[2:]
+            if INITRAMFS_REPART_RE.match(rel):
+                size = int(size_str) if size_str.isdigit() else 0
+                entries.append(("file", rel, size))
+    return entries
+
+
+def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
+    """Extract systemd-repart units/drop-ins from IMG and verify effective command.
+
+    Never accepts a drop-in by filename alone; fails closed when lsinitrd fails.
+    """
+    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
+    listing = subprocess.run(cmd + [str(img)], capture_output=True, text=True)
+    if listing.returncode != 0 or "========" not in listing.stdout:
+        msg = listing.stderr.strip() or listing.stdout.strip() or "lsinitrd failed"
+        return False, [f"cannot inspect initramfs {img}: {msg}"]
+    entries = _parse_lsinitrd_listing(listing.stdout)
+    if not entries:
+        return True, []
+    with tempfile.TemporaryDirectory(prefix="a7a-initramfs-repart-") as td:
+        tree = Path(td)
+        for kind, rel, meta in entries:
+            dest = tree / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if kind == "symlink":
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                dest.symlink_to(meta)
+            else:
+                extracted = subprocess.run(
+                    cmd + ["-f", rel, str(img)], capture_output=True
+                )
+                if extracted.returncode != 0 or (meta > 0 and not extracted.stdout):
+                    return False, [f"cannot extract {rel} from {img}"]
+                dest.write_bytes(extracted.stdout)
+        if forbid_repart:
+            problems = []
+            for unit in REPART_UNITS:
+                files = _unit_files(tree, unit)
+                if files:
+                    problems.append(f"initramfs contains active {unit}")
+            for rel_dir in REPART_REPARTD:
+                dpath = tree / rel_dir
+                if dpath.is_dir() and any(dpath.glob("*.conf")):
+                    problems.append(f"initramfs contains repart.d config in {rel_dir}")
+            return (not problems, problems)
+        return repart_root_ok(tree)
 
 
 def main(argv=None):
@@ -600,7 +793,12 @@ def main(argv=None):
     p.add_argument("--report", type=Path)
     p = sub.add_parser("repart-root")
     p.add_argument("root", type=Path)
-    p = sub.add_parser("repart-initramfs-listing")
+    p = sub.add_parser("repart-initramfs")
+    p.add_argument("img")
+    runner = p.add_mutually_exclusive_group()
+    runner.add_argument("--chroot", type=Path)
+    runner.add_argument("--run-build-ns", type=Path)
+    p.add_argument("--forbid-repart", action="store_true")
     p = sub.add_parser("enabled-repos")
     p.add_argument("dirs", nargs="+", type=Path)
     p = sub.add_parser("dumpe2fs")
@@ -635,9 +833,16 @@ def main(argv=None):
         for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
-    if a.cmd == "repart-initramfs-listing":
-        ok, problem = repart_initramfs_ok(sys.stdin.read())
-        if problem:
+    if a.cmd == "repart-initramfs":
+        lsinitrd_cmd = None
+        if a.chroot:
+            lsinitrd_cmd = ["chroot", str(a.chroot), "lsinitrd"]
+        elif a.run_build_ns:
+            lsinitrd_cmd = [str(a.run_build_ns), "user", "lsinitrd"]
+        ok, problems = repart_initramfs_ok(
+            a.img, lsinitrd_cmd=lsinitrd_cmd, forbid_repart=a.forbid_repart
+        )
+        for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1
     if a.cmd == "enabled-repos":

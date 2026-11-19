@@ -559,8 +559,8 @@ python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
 python3 -I "$TOP/fedora/devcard-policy.py" repart-root "$ROOT" >/dev/null ||
     { echo "mkdevcard: a systemd-repart unit lacks the --discard=no protection" >&2; exit 1; }
 for k in $(cat "$W/kernel.txt"); do
-    chroot "$ROOT" lsinitrd "/boot/initramfs-$k.img" 2>/dev/null |
-        python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs-listing >/dev/null ||
+    python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs \
+        --chroot "$ROOT" "/boot/initramfs-$k.img" >/dev/null ||
         { echo "mkdevcard: initramfs-$k.img runs systemd-repart without --discard=no" >&2; exit 1; }
 done
 

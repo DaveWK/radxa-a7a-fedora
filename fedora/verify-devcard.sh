@@ -268,34 +268,30 @@ check "machine-id empty (first boot)" test ! -s "$ROOT/etc/machine-id"
 # (mkdevcard.sh writes the drop-ins); an image with a repart.d configuration
 # and no such setting loses its firmware on the first rw boot from a native
 # eMMC or SD slot.
-repart_no_discard() { # UNIT: its drop-in is the unit's ExecStart plus --discard=no, and nothing else sets ExecStart
-    local u=$1 stock others dir=$ROOT/etc/systemd/system/$1.d
-    stock=$(sed -n 's/^ExecStart=//p' "$ROOT/usr/lib/systemd/system/$u")
-    [ -n "$stock" ] && [ "$(wc -l <<<"$stock")" = 1 ] || return 1
-    [ "$(grep -v '^#' "$dir/10-cubie-a7a-no-discard.conf" | grep -v '^$')" = "[Service]
-ExecStart=
-ExecStart=$stock --discard=no" ] || return 1
-    # no other drop-in sets ExecStart again, and no copy in /etc replaces the unit
-    others=$(grep -lsE '^ExecStart' "$dir"/*.conf "$ROOT/usr/lib/systemd/system/$u.d"/*.conf | grep -v '/10-cubie-a7a-no-discard\.conf$')
-    [ -z "$others" ] || return 1
-    [ ! -f "$ROOT/etc/systemd/system/$u" ] || [ -L "$ROOT/etc/systemd/system/$u" ]
+repart_root_ok() {
+    local out
+    if out=$(python3 -I "$TOP/fedora/devcard-policy.py" repart-root "$ROOT" 2>&1); then
+        ok "systemd-repart runs with --discard=no (the unpartitioned gap holds the boot firmware)"
+    else
+        bad "systemd-repart runs with --discard=no: $out"
+    fi
 }
-initramfs_repart_no_discard() { # the final initramfs: no systemd-repart, or one with the drop-in
-    local img
+repart_initramfs_ok() {
+    local img out found=0
     for img in "$ROOT"/boot/initramfs-*.img; do
         [ -f "$img" ] || continue
-        "$TOP/fedora/run-build-ns.sh" user lsinitrd "$img" 2>/dev/null |
-            python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs-listing >/dev/null || return 1
+        found=1
+        if out=$(python3 -I "$TOP/fedora/devcard-policy.py" repart-initramfs \
+            --run-build-ns "$TOP/fedora/run-build-ns.sh" "$img" 2>&1); then
+            ok "${img##*/}: effective systemd-repart carries --discard=no (or absent/masked)"
+        else
+            bad "${img##*/}: effective systemd-repart lacks --discard=no: $out"
+        fi
     done
+    [ "$found" = 1 ] || bad "initramfs: none found under $ROOT/boot"
 }
-for u in systemd-repart.service systemd-repart@.service; do
-    if [ -f "$ROOT/usr/lib/systemd/system/$u" ]; then
-        check "$u runs with --discard=no (the unpartitioned gap holds the boot firmware)" repart_no_discard "$u"
-    elif find "$ROOT/etc/repart.d" "$ROOT/usr/lib/repart.d" "$ROOT/usr/local/lib/repart.d" -name '*.conf' 2>/dev/null | grep -q . && [ "$u" = systemd-repart.service ]; then
-        bad "repart.d configuration without a $u to carry --discard=no"
-    fi
-done
-check "initramfs: no systemd-repart, or one with the --discard=no drop-in" initramfs_repart_no_discard
+repart_root_ok
+repart_initramfs_ok
 if [ "$GROW_ROOT" = yes ]; then
     check "repart grows root" test -f "$ROOT/etc/repart.d/50-root.conf"
 else

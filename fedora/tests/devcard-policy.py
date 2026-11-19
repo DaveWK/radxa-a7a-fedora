@@ -12,6 +12,8 @@ Run: python3 -I fedora/tests/devcard-policy.py
 
 import hashlib
 import importlib.util
+import shutil
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -398,8 +400,91 @@ def repart_good_root():
         assert ok, problems
 
 
+def repart_indented_override_drops_flag():
+    with fixture() as root:
+        build_repart_root(
+            root,
+            dropin="[Service]\n  ExecStart=\n  ExecStart=systemd-repart\n",
+        )
+        ok, problems = policy.repart_root_ok(root)
+        assert not ok, "an indented override without --discard=no must fail"
+        assert any("systemd-repart.service" in p for p in problems), problems
+
+
+def repart_reset_then_new_execstart_without_flag():
+    with fixture() as root:
+        build_repart_root(
+            root,
+            dropin="[Service]\nExecStart=\nExecStart=systemd-repart --discard=yes\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "a reset followed by ExecStart without --discard=no must fail"
+
+
+def repart_discard_no_then_yes_fails():
+    with fixture() as root:
+        build_repart_root(
+            root,
+            dropin="[Service]\nExecStart=\nExecStart=systemd-repart --discard=no --discard=yes\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "a later --discard=yes on the same line overrides --discard=no"
+
+
+def repart_execstart_wrong_section_ignored():
+    with fixture() as root:
+        build_repart_root(
+            root,
+            dropin="[Unit]\nExecStart=\nExecStart=systemd-repart --discard=no\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "ExecStart outside [Service] must not satisfy the check"
+
+
+def repart_indented_correct_dropin_passes():
+    with fixture() as root:
+        build_repart_root(
+            root,
+            dropin="  [Service]\n\tExecStart=\n\tExecStart=systemd-repart --discard=no\n",
+        )
+        ok, problems = policy.repart_root_ok(root)
+        assert ok, problems
+
+
+def repart_later_dropin_resets_away_the_flag():
+    with fixture() as root:
+        build_repart_root(root)
+        write(
+            root / "etc/systemd/system/systemd-repart.service.d/20-reset.conf",
+            "[Service]\n  ExecStart=\n  ExecStart=systemd-repart\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "a later drop-in that resets ExecStart must win"
+
+
+def repart_dropin_precedence_etc_overrides_usr_lib():
+    with fixture() as root:
+        write(root / REPART_UNIT, "[Service]\nExecStart=systemd-repart\n")
+        # usr/lib sets --discard=no, but same-named /etc drop-in overrides it.
+        write(
+            root / "usr/lib/systemd/system/systemd-repart.service.d/10-repart.conf",
+            GOOD_DROPIN,
+        )
+        write(
+            root / "etc/systemd/system/systemd-repart.service.d/10-repart.conf",
+            "[Service]\nExecStart=\nExecStart=systemd-repart\n",
+        )
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "/etc drop-in must override same-named /usr/lib drop-in"
+        # Same-named /etc drop-in masking /usr/lib drop-in via /dev/null.
+        etc_dropin = root / "etc/systemd/system/systemd-repart.service.d/10-repart.conf"
+        etc_dropin.unlink()
+        etc_dropin.symlink_to("/dev/null")
+        ok, _ = policy.repart_root_ok(root)
+        assert not ok, "/etc /dev/null symlink must mask /usr/lib drop-in"
+
+
 def repart_overlay_drops_dropin():
-    # The fixture overlay scenario: the unit is there, the drop-in is gone.
     with fixture() as root:
         build_repart_root(root, dropin=None)
         ok, problems = policy.repart_root_ok(root)
@@ -407,32 +492,15 @@ def repart_overlay_drops_dropin():
         assert any("systemd-repart.service" in p for p in problems), problems
 
 
-def repart_overlay_replaces_dropin():
-    with fixture() as root:
-        build_repart_root(
-            root,
-            dropin="[Service]\nExecStart=\nExecStart=systemd-repart --discard=yes\n",
-        )
-        ok, _ = policy.repart_root_ok(root)
-        assert not ok, "a --discard=yes drop-in must fail"
-
-
-def repart_other_dropin_sets_execstart():
-    with fixture() as root:
-        build_repart_root(root)
-        write(
-            root / "etc/systemd/system/systemd-repart.service.d/20-evil.conf",
-            "[Service]\nExecStart=systemd-repart --discard=yes\n",
-        )
-        ok, _ = policy.repart_root_ok(root)
-        assert not ok, "another drop-in setting ExecStart must fail"
-
-
 def repart_etc_unit_override():
     with fixture() as root:
-        build_repart_root(root, etc_unit="[Service]\nExecStart=systemd-repart\n")
+        build_repart_root(
+            root, dropin=None, etc_unit="[Service]\nExecStart=systemd-repart\n"
+        )
         ok, _ = policy.repart_root_ok(root)
-        assert not ok, "a regular-file /etc unit override must fail"
+        assert (
+            not ok
+        ), "a regular-file /etc unit override without --discard=no must fail"
 
 
 def repart_masked_unit_ok():
@@ -449,19 +517,69 @@ def repart_conf_without_unit():
         assert not ok, "repart.d without systemd-repart.service must fail"
 
 
+def repart_absent_passes():
+    with fixture() as root:
+        ok, problems = policy.repart_root_ok(root)
+        assert ok, problems
+
+
+def _build_cpio_initramfs(tree, out_img):
+    entries = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*"))
+    res = subprocess.run(
+        ["cpio", "-o", "-H", "newc", "--quiet"],
+        input=("\n".join(entries) + ("\n" if entries else "")).encode(),
+        cwd=tree,
+        capture_output=True,
+        check=True,
+    )
+    out_img.write_bytes(res.stdout)
+
+
 def repart_initramfs_cases():
-    ok, _ = policy.repart_initramfs_ok("usr/lib/modules/x\n")
-    assert ok, "an initramfs without systemd-repart is fine"
-    ok, _ = policy.repart_initramfs_ok(
-        "usr/lib/systemd/system/systemd-repart.service\n"
-        "usr/lib/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf\n"
-    )
-    assert ok, "an initramfs with the drop-in is fine"
-    ok, problem = policy.repart_initramfs_ok(
-        "usr/lib/systemd/system/systemd-repart.service\n"
-    )
-    assert not ok, "an initramfs with systemd-repart and no drop-in must fail"
-    assert "drop-in" in problem
+    assert shutil.which("lsinitrd") and shutil.which("cpio"), "need lsinitrd and cpio"
+    with fixture() as tmp:
+        # 1. Initramfs without repart passes (both normal and --forbid-repart).
+        tree1 = tmp / "t1"
+        write(tree1 / "usr/lib/modules/placeholder", "ok\n")
+        img1 = tmp / "no-repart.img"
+        _build_cpio_initramfs(tree1, img1)
+        ok, problems = policy.repart_initramfs_ok(img1)
+        assert ok, problems
+        ok, problems = policy.repart_initramfs_ok(img1, forbid_repart=True)
+        assert ok, problems
+
+        # 2. Initramfs with repart + valid drop-in passes (and fails --forbid-repart).
+        tree2 = tmp / "t2"
+        build_repart_root(tree2)
+        img2 = tmp / "good-repart.img"
+        _build_cpio_initramfs(tree2, img2)
+        ok, problems = policy.repart_initramfs_ok(img2)
+        assert ok, problems
+        ok, problems = policy.repart_initramfs_ok(img2, forbid_repart=True)
+        assert not ok, "forbid_repart must fail when active systemd-repart is present"
+
+        # 3. Filename-only drop-in whose content drops --discard=no (indented) FAILS.
+        tree3 = tmp / "t3"
+        build_repart_root(
+            tree3,
+            dropin="[Service]\n  ExecStart=\n  ExecStart=systemd-repart\n",
+        )
+        img3 = tmp / "bad-dropin.img"
+        _build_cpio_initramfs(tree3, img3)
+        ok, _ = policy.repart_initramfs_ok(img3)
+        assert not ok, "must not accept drop-in by filename alone"
+
+        # 4. Masked unit in initramfs passes.
+        tree4 = tmp / "t4"
+        build_repart_root(tree4, dropin=None, etc_unit="/dev/null")
+        img4 = tmp / "masked-repart.img"
+        _build_cpio_initramfs(tree4, img4)
+        ok, problems = policy.repart_initramfs_ok(img4)
+        assert ok, problems
+
+        # 5. Missing initramfs fails closed.
+        ok, _ = policy.repart_initramfs_ok(tmp / "missing.img")
+        assert not ok, "missing initramfs must fail closed"
 
 
 def main():
@@ -503,13 +621,33 @@ def main():
     case("shadow: root, others, empty", shadow_cases)
     case("passwd: sole root policy", passwd_sole_root_cases)
     case("repart: good root", repart_good_root)
+    case("repart: indented override drops flag", repart_indented_override_drops_flag)
+    case(
+        "repart: reset then ExecStart without flag",
+        repart_reset_then_new_execstart_without_flag,
+    )
+    case("repart: --discard=no then --discard=yes", repart_discard_no_then_yes_fails)
+    case(
+        "repart: ExecStart outside [Service] ignored",
+        repart_execstart_wrong_section_ignored,
+    )
+    case(
+        "repart: indented correct drop-in passes", repart_indented_correct_dropin_passes
+    )
+    case(
+        "repart: later drop-in resets away flag",
+        repart_later_dropin_resets_away_the_flag,
+    )
+    case(
+        "repart: /etc drop-in overrides /usr/lib",
+        repart_dropin_precedence_etc_overrides_usr_lib,
+    )
     case("repart: overlay drops the drop-in", repart_overlay_drops_dropin)
-    case("repart: overlay replaces the drop-in", repart_overlay_replaces_dropin)
-    case("repart: another drop-in sets ExecStart", repart_other_dropin_sets_execstart)
     case("repart: /etc unit override", repart_etc_unit_override)
     case("repart: masked unit", repart_masked_unit_ok)
     case("repart: repart.d without the unit", repart_conf_without_unit)
-    case("repart: initramfs listings", repart_initramfs_cases)
+    case("repart: absent unit passes", repart_absent_passes)
+    case("repart: initramfs effective command", repart_initramfs_cases)
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")
         return 1
