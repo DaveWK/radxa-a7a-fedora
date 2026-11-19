@@ -19,6 +19,50 @@ def check(args, rc, want=None):
     return result.stdout
 
 
+def root_selection(work):
+    root = work / "kernel-root"
+    version = "7.4.fixture"
+    config = root / "usr/lib/modules" / version / "config"
+    config.parent.mkdir(parents=True)
+    config.write_text("CONFIG_PINCTRL_SUN60I_A733=y\n")
+    args = [
+        "bash",
+        "-euc",
+        r"""
+. "$1"
+chroot() {
+    [[ $1 == "$fixture_root" ]] || return 99
+    case "$2" in
+    modinfo)
+        [[ $3 == -k && $5 == -n ]] || return 99
+        if [[ $6 == dwmac-sun55i && $mode == wrong-selection ]]; then
+            printf '/lib/modules/%s/kernel/%s.ko.zst\n' "$4" "$6"
+        else
+            printf '/lib/modules/%s/extra/%s.ko.zst\n' "$4" "$6"
+        fi
+        ;;
+    test)
+        [[ $3 == -f && $4 == /lib/modules/*/extra/*.ko.zst && $mode != missing-file ]]
+        ;;
+    *) return 99 ;;
+    esac
+}
+mode=$4
+fixture_root=$2
+cubie_check_root_kmods "$2" "$3"
+""",
+        "root-fixture",
+        str(FEDORA / "release.sh"),
+        str(root),
+        version,
+    ]
+    check([*args, "good"], 0)
+    check([*args, "wrong-selection"], 1)
+    check([*args, "missing-file"], 1)
+    config.write_text("# pinctrl is not set\n")
+    check([*args, "good"], 1)
+
+
 def cases(work):
     root = work / "root"
     bootdir = root / "boot"
@@ -84,12 +128,17 @@ def cases(work):
         'initramfs-policy.py" capture-digest',
         'initramfs-policy.py" overlay',
         'cp -a --no-preserve=ownership "$OVERLAY"',
+        '--report "$W/aic-provenance-final.tsv"',
+        'cubie_check_root_kmods "$ROOT" "$k"',
         'initramfs-policy.py" verify-digest',
         "zstd -t --check --",
         "mkfs.ext4 -q",
     ]
     indexes = [stage.index(command) for command in order]
     assert indexes == sorted(indexes)
+    assert stage.count('devcard-policy.py" aic-provenance') == 2
+    assert "/usr/libexec/cubie-a7a/kernel check" not in stage
+    root_selection(work)
     print("staged initramfs paths, overlay veto and root module checks passed")
 
 

@@ -113,7 +113,6 @@ for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3
     systemctl zstd rpm ssh-keygen; do
     command -v $t >/dev/null || die "$t not found"
 done
-[ -x /usr/lib/systemd/systemd ] || die "systemd manager for staged loader not found"
 python3 -I -c 'import selinux' 2>/dev/null || die "python3-libselinux not found"
 # On an aarch64 host (the image builder's QEMU guest) the target's scriptlets
 # run natively; elsewhere they need qemu-aarch64 binfmt.
@@ -311,10 +310,11 @@ echo 0123456789abcdef0123456789abcdef >"$ROOT/etc/machine-id"
 echo "$FIRMWARE_DTB_VERSION" >"$ROOT/var/lib/cubie-a7a/firmware-dtb-version"
 growfs=,x-systemd.growfs
 [ "$GROW_ROOT" = yes ] || growfs=
-cat >"$ROOT/etc/fstab" <<EOF
+cat >"$W/fstab" <<EOF
 UUID=$ROOT_UUID  /          ext4  defaults$growfs  1 1
 UUID=$ESP_UUID   /boot/efi  vfat  umask=0077,shortname=winnt  0 2
 EOF
+cp -- "$W/fstab" "$ROOT/etc/fstab"
 
 mkdir -p "$ROOT/etc/dkms/framework.conf.d"
 printf 'parallel_jobs="%s"\n' "$BUILD_JOBS" > "$ROOT/etc/dkms/framework.conf.d/00-image-build.conf"
@@ -520,7 +520,7 @@ if [ "$BOOT_MODES" = protective ] && [ "$GROW_ROOT" = no ] && [ -z "$FIRST_BOOT"
     # Retain the build-owned BLS/GRUB inputs before the overlay can edit them.
     (
         cd "$ROOT"
-        cp --parents -- boot/loader/entries/*.conf boot/grub2/grub.cfg \
+        cp --parents -- boot/loader/entries/*.conf boot/grub2/{grub.cfg,grubenv} \
             etc/default/grub etc/kernel/cmdline usr/local/bin/cubie-a7a-bootmode \
             etc/kernel/install.d/96-cubie-a7a-bootmodes.install \
             etc/systemd/system/cubie-a7a-bootmode-{ro,next}.service "$expected/"
@@ -528,6 +528,7 @@ if [ "$BOOT_MODES" = protective ] && [ "$GROW_ROOT" = no ] && [ -z "$FIRST_BOOT"
             sha256sum <"boot/vmlinuz-$k" | cut -d ' ' -f1 >"$expected/vmlinuz-$k.sha256"
         done <"$W/kernel.txt"
     )
+    cp -- "$W/fstab" "$expected/etc/fstab"
 fi
 
 # Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
@@ -582,13 +583,18 @@ if [ -n "$OVERLAY" ]; then
     python3 -I "$TOP/fedora/devcard-policy.py" check-installed-rpms "$ROOT" "$RPM_RECORDS"
 fi
 
+# Recheck signer and bytes on the final root, including inputs outside the firmware veto.
+python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
+    --report "$W/aic-provenance-final.tsv" >/dev/null ||
+    { echo "mkdevcard: final AIC8800 firmware provenance failed" >&2; exit 1; }
+
 
 while IFS= read -r k; do
     # Recheck root module ownership/depmod selection after overlays.
     boot=$(cubie_boot_kmods "$k")
     python3 -I "$TOP/fedora/initramfs-policy.py" root-modules "$ROOT" "$k" \
         --board "${boot%% -- *}"
-    chroot "$ROOT" /usr/libexec/cubie-a7a/kernel check "$k" ||
+    cubie_check_root_kmods "$ROOT" "$k" ||
         { echo "mkdevcard: board kmods incomplete for $k" >&2; exit 1; }
     for m in sun60i-a733-serdes sun60i-a733-pcie sun55i-pck600; do
         ls "$ROOT/usr/lib/modules/$k/extra/$m.ko"* >/dev/null 2>&1 ||

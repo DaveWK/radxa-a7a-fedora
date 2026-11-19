@@ -358,6 +358,31 @@ def aic_provenance_offline_rpmdb_fedora_and_modified():
                 subprocess.run(["rpmkeys", "--root", root, "--import", key], check=True)
         problems, records = policy.aic_problems(root)
         assert not problems and records, problems
+        assert policy.main(["aic-provenance", str(root)]) == 0
+        # An overlay can carry an rpmdb without touching the firmware directory.
+        # The real signer/ownership check must still reject the changed root.
+        db_rel = Path("usr/lib/sysimage/rpm/rpmdb.sqlite")
+        overlay = work / "overlay"
+        overlay.mkdir()
+        subprocess.run(["rpm", "--root", overlay, "--initdb"], check=True)
+        veto = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(here.parent / "initramfs-policy.py"),
+                "overlay",
+                str(overlay),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert veto.returncode == 0, veto.stderr
+        staged_db = root / db_rel
+        original_db = staged_db.read_bytes()
+        staged_db.write_bytes((overlay / db_rel).read_bytes())
+        assert policy.main(["aic-provenance", str(root)]) == 1
+        staged_db.write_bytes(original_db)
+        assert policy.main(["aic-provenance", str(root)]) == 0
         with next(p for p in dst.iterdir() if p.is_file()).open("ab") as target:
             target.write(b"changed")
         problems, _ = policy.aic_problems(root)

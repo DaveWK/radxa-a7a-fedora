@@ -133,7 +133,7 @@ def bls(path):
     return result
 
 
-def grubenv(root, saved_entry):
+def grubenv(root, expected, saved_entry):
     # GRUB's shipped grub.cfg selects saved_entry only if next_entry is absent.
     path = regular(root, "boot/grub2/grubenv")
     data = path.read_bytes()
@@ -151,6 +151,8 @@ def grubenv(root, saved_entry):
         raise PolicyError(f"{path}: saved_entry is not the build's protective default")
     if "next_entry" in variables:
         raise PolicyError(f"{path}: unexpected next_entry")
+    if data != regular(expected, "boot/grub2/grubenv").read_bytes():
+        raise PolicyError("boot/grub2/grubenv: differs from the build-generated block")
 
 
 BOOT_HELPER = "usr/local/bin/cubie-a7a-bootmode"
@@ -280,11 +282,11 @@ def boot_entries(root, expected, kernels, root_uuid, default_args, saved):
                 raise PolicyError(f"{name}: BLS entry differs from the build")
     if sorted(versions) != sorted(kernels):
         raise PolicyError("protective BLS versions differ from kernel.txt")
-    grubenv(root, saved)
+    grubenv(root, expected, saved)
 
 
-def growth(root):
-    # Proves no staged repart configs, fstab growfs option or unmasked unit path.
+def growth(root, expected):
+    # Proves the mount table is unchanged and growth config/masks are as staged.
     # A runtime unit or generator's behaviour is for board acceptance.
     entries = []
     for prefix in ("etc", "usr/lib", "usr/local/lib", "run"):
@@ -296,10 +298,11 @@ def growth(root):
     if any(name.endswith(".conf") for name in entries):
         raise PolicyError(f"unexpected repart.d config: {entries}")
     print(f"protective repart.d entries: {entries}")
-    for line in regular(root, "etc/fstab").read_text().splitlines():
-        fields = line.split("#", 1)[0].split()
-        if len(fields) >= 4 and "x-systemd.growfs" in fields[3].split(","):
-            raise PolicyError("etc/fstab: unexpected x-systemd.growfs")
+    if (
+        regular(root, "etc/fstab").read_bytes()
+        != regular(expected, "etc/fstab").read_bytes()
+    ):
+        raise PolicyError("etc/fstab: differs from the build-generated mount table")
     for unit in (
         "systemd-repart.service",
         "systemd-repart@.service",
@@ -332,13 +335,46 @@ def accounts(root, expected):
         raise PolicyError("etc/passwd: expected root as the sole human account")
 
 
-def overlay_units(overlay):
-    # No overlay-defined first-boot services/timers; does not resolve units.
-    for prefix in ("etc", "run", "usr/local/lib", "usr/lib", "lib"):
-        name = prefix + "/systemd/system"
-        path = optional_dir(overlay, name)
-        if path is not None and any(path.iterdir()):
-            raise PolicyError(f"protective overlay writes units or timers: {name}")
+BOOT_CONTROL_PATHS = (
+    "boot/grub2",
+    "boot/loader",
+    "etc/cubie-a7a/bootmodes.conf",
+    "etc/default/grub",
+    "etc/default/grub.d",
+    "etc/fstab",
+    "etc/grub.d",
+    "etc/kernel",
+    "etc/crypttab",
+    "usr/lib/kernel",
+    "usr/local/bin/cubie-a7a-bootmode",
+)
+SYSTEMD_CONTROL_PATHS = (
+    "system",
+    "system.control",
+    "system.conf",
+    "system.conf.d",
+    "transient",
+    "generator.early",
+    "generator",
+    "generator.late",
+    "system-generators",
+    "system-environment-generators",
+)
+
+
+def overlay_boot_control(overlay):
+    # Reject writes to these named inputs without modelling systemd unit lookup.
+    paths = (
+        *BOOT_CONTROL_PATHS,
+        *(
+            f"{prefix}/systemd/{name}"
+            for prefix in ("etc", "run", "usr/local/lib", "usr/lib", "lib")
+            for name in SYSTEMD_CONTROL_PATHS
+        ),
+    )
+    for name in paths:
+        if physical(overlay, name, missing=True) is not None:
+            raise PolicyError(f"protective overlay writes boot-control input: {name}")
 
 
 def debugfs(image, command):
@@ -386,7 +422,7 @@ def main():
         if args.command == "staged":
             first_boot(args.root)
             wifi(args.root)
-            growth(args.root)
+            growth(args.root, args.expected)
             accounts(args.root, sys.stdin.read().rstrip("\n"))
             boot_entries(
                 args.root,
@@ -398,7 +434,7 @@ def main():
             )
             expected_files(args.root, args.expected)
         elif args.command == "overlay":
-            overlay_units(args.directory)
+            overlay_boot_control(args.directory)
         else:
             packed_root(args.root_image, args.protective)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:

@@ -13,6 +13,7 @@ from pathlib import Path
 FEDORA = Path(__file__).resolve().parent.parent
 CHECK = [sys.executable, "-I", str(FEDORA / "staged-root-policy.py")]
 UUID = "11111111-2222-3333-4444-555555555555"
+ESP = "1234-ABCD"
 PASSWORD = "$6$synthetic$fixture"
 BASE = f"root=UUID={UUID} ro"
 
@@ -66,7 +67,11 @@ def fixtures(root):
         "systemd-growfs-root.service",
     ):
         (root / "etc/systemd/system" / unit).symlink_to("/dev/null")
-    write(root, "etc/fstab", f"UUID={UUID} / ext4 defaults 1 1\n")
+    write(
+        root,
+        "etc/fstab",
+        f"UUID={UUID} / ext4 defaults 1 1\nUUID={ESP} /boot/efi vfat defaults 0 2\n",
+    )
     write(
         root,
         "etc/shadow",
@@ -134,11 +139,19 @@ def cases(work):
         require(staged, code, diagnostic, data=PASSWORD + "\n")
 
     preboot(0)
+    fstab = (root / "etc/fstab").read_text()
     mutations = (
         (
             "etc/fstab",
-            f"UUID={UUID} / ext4 defaults,x-systemd.growfs 1 1\n",
-            "unexpected x-systemd.growfs",
+            fstab.replace("ext4 defaults", "ext4 defaults,x-systemd.growfs"),
+            "etc/fstab: differs",
+        ),
+        ("etc/fstab", fstab.replace(UUID, "changed-root"), "etc/fstab: differs"),
+        ("etc/fstab", fstab.replace("/boot/efi", "/mnt/esp"), "etc/fstab: differs"),
+        (
+            "etc/fstab",
+            fstab.replace("ext4 defaults", "ext4 defaults,x-systemd.makefs"),
+            "etc/fstab: differs",
         ),
         (
             "usr/local/lib/repart.d/50-root.conf",
@@ -207,6 +220,8 @@ def cases(work):
     for setting, diagnostic in (
         ("saved_entry=entry~maintenance", "saved_entry is not"),
         ("next_entry=entry~maintenance", "unexpected next_entry"),
+        ("blsdir=/alternate/entries", "differs from the build-generated block"),
+        ("other_setting=changed", "differs from the build-generated block"),
     ):
         old = env.read_bytes()
         subprocess.run(["grub2-editenv", str(env), "set", setting], check=True)
@@ -231,8 +246,26 @@ def cases(work):
     overlay = work / "overlay"
     overlay.mkdir()
     require([*CHECK, "overlay", str(overlay)], 0)
-    write(overlay, "usr/lib/systemd/system/maintenance.timer", "[Timer]\nOnBootSec=1\n")
-    require([*CHECK, "overlay", str(overlay)], 1, "overlay writes units or timers")
+    write(overlay, "opt/ordinary-file", "unrelated")
+    require([*CHECK, "overlay", str(overlay)], 0)
+    for name in (
+        "etc/systemd/system.control/fixture.conf",
+        "etc/cubie-a7a/bootmodes.conf",
+        "usr/lib/systemd/system/fixture.timer",
+        "run/systemd/transient/fixture.service",
+        "usr/lib/systemd/system-generators/fixture",
+        "boot/grub2/custom.cfg",
+        "boot/loader/entries/fixture.conf",
+        "etc/crypttab",
+        "etc/fstab",
+    ):
+        with tempfile.TemporaryDirectory(dir=work) as tmp:
+            write(Path(tmp), name, "synthetic")
+            require(
+                [*CHECK, "overlay", tmp],
+                1,
+                "protective overlay writes boot-control input",
+            )
 
     image = work / "fixture.ext4"
     caproot = work / "caps"

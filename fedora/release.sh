@@ -77,6 +77,26 @@ cubie_boot_kmods() {
     esac
 }
 
+# Check the staged root's selected board modules, not the initramfs contents.
+cubie_check_root_kmods() {
+    local root=$1 version=$2 boot module path
+    local -a board
+    boot=$(cubie_boot_kmods "$version")
+    read -ra board <<<"${boot%% -- *}"
+    for module in "${board[@]}" dwmac-sun55i; do
+        path=$(chroot "$root" modinfo -k "$version" -n "$module") || return 1
+        case "$path" in
+        "/lib/modules/$version/extra/"* | "/usr/lib/modules/$version/extra/"*) ;;
+        *) return 1 ;;
+        esac
+        chroot "$root" test -f "$path" || return 1
+    done
+    case "$version" in
+    7.2.* | 7.3.*) ;;
+    *) grep -qx 'CONFIG_PINCTRL_SUN60I_A733=y' "$root/usr/lib/modules/$version/config" || return 1 ;;
+    esac
+}
+
 # Sourced by mkdevcard.sh, verify-devcard.sh and build-*rpms.sh: reference the
 # exported release variables here so shellcheck sees them used without a disable.
 : "${FEDORA_RELEASE}" "${FEDORA_RAWHIDE_VERSION}" "${RELEASEVER}" "${RELEASE_NUM}" \
