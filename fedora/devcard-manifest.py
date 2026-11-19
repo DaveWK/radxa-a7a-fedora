@@ -15,12 +15,11 @@ Commands:
       Write {"files": [...]} of the staged ESP tree ESP_DIR (every file and
       directory with its type and sha256) to OUT, so the build can capture it
       before mtools empties the mount point.
-  write IMG ROOT RPM_RECORDS FIXTURES_DIR MANIFEST --esp-dir DIR | --esp-model FILE
+  write IMG ROOT RPM_RECORDS MANIFEST --esp-dir DIR | --esp-model FILE
       Write MANIFEST for the built image IMG: the sfdisk GPT, the sha256 of
       every partition's bytes and of the firmware gap (LBA 256 to the first
       partition), the whole-image sha256, the ESP files (from DIR or FILE),
-      the initramfs files under ROOT/boot, the DTB stamps, the pinned-unit
-       fixture digests, and board RPMs (NEVRA, %{ARCH}, sha256) using the
+      the initramfs files under ROOT/boot, the DTB stamps, and board RPMs (NEVRA, %{ARCH}, sha256) using the
        JSON records retained from RPM selection. IMG and ROOT are only read.
   verify IMG MANIFEST
       Load MANIFEST, check its schema, and recompute every value from IMG:
@@ -228,19 +227,6 @@ def _initramfs_model(root):
     return files
 
 
-def _pinned_units_model(fixtures_dir, grow_root):
-    base = Path(fixtures_dir)
-    units = {}
-    for mode in (grow_root, "initramfs"):
-        for suffix in ("unit.txt", "inventory.json"):
-            name = f"repart-{mode}.{suffix}"
-            path = base / name
-            if not path.is_file():
-                raise ManifestError(f"missing pinned-unit fixture {path}")
-            units[name] = _sha256_path(path)
-    return units
-
-
 def _rpm_model(records):
     """Rehash the DNF inputs against the records held since RPM selection."""
     if not isinstance(records, list) or not records:
@@ -262,9 +248,7 @@ def _rpm_model(records):
     return sorted(entries, key=lambda e: e["nevra"])
 
 
-def write_manifest(
-    img, root, esp_files, rpm_records, fixtures_dir, manifest, grow_root="yes"
-):
+def write_manifest(img, root, esp_files, rpm_records, manifest):
     img = Path(img)
     root = Path(root)
     payload = {
@@ -282,7 +266,6 @@ def write_manifest(
             "firmware_stamp_sha256": _sha256_path(root / FW_DTB_STAMP),
             "package_stamp_sha256": _sha256_path(root / PKG_DTB_VERSION),
         },
-        "pinned_units": _pinned_units_model(fixtures_dir, grow_root),
         "rpms": _rpm_model(rpm_records),
         "image_sha256": _sha256_path(img),
     }
@@ -446,7 +429,7 @@ def verify_manifest(img, manifest):
             raise ManifestError(f"{mpath}: missing initramfs")
         _compare("initramfs", exp_initramfs, _verify_initramfs(root_file, data, tmp))
 
-    # RPM files, DTB and pinned-unit fixtures are read off the image's tree
+    # RPM files and DTB stamps are read off the image's tree
     # only through the digests already recorded: nothing more is recomputed.
     return data
 
@@ -461,9 +444,7 @@ def main(argv=None):
     p.add_argument("img", type=Path)
     p.add_argument("root", type=Path)
     p.add_argument("rpm_records")
-    p.add_argument("fixtures_dir", type=Path)
     p.add_argument("manifest", type=Path)
-    p.add_argument("--grow-root", choices=("yes", "no"), default="yes")
     esp = p.add_mutually_exclusive_group(required=True)
     esp.add_argument("--esp-dir", type=Path)
     esp.add_argument("--esp-model", type=Path)
@@ -508,9 +489,7 @@ def main(argv=None):
                 a.root,
                 esp_files,
                 rpm_records,
-                a.fixtures_dir,
                 a.manifest,
-                a.grow_root,
             )
             print(_sha256_path(a.manifest))
         else:

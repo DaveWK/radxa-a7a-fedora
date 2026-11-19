@@ -6,14 +6,12 @@ import stat
 from collections import deque
 from pathlib import PurePosixPath
 
-RUNTIME_LINKS = {"etc/mtab": "/proc/self/mounts"}
-
 
 class PathError(RuntimeError):
     """A path does not resolve to an admitted staged entry."""
 
 
-def resolve(root, relative, *, masks=False):
+def resolve(root, relative):
     relative = PurePosixPath(relative)
     if relative.is_absolute():
         raise PathError(f"{relative}: expected a staged relative path")
@@ -42,8 +40,6 @@ def resolve(root, relative, *, masks=False):
             if followed > 40:
                 raise PathError(f"{relative}: symlink loop or more than 40 links")
             target = os.readlink(path)
-            if masks and target == "/dev/null" and not parts:
-                return None
             if target.startswith("/"):
                 resolved.clear()
                 target = target.lstrip("/")

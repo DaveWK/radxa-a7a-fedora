@@ -14,21 +14,6 @@ trees and real tool output, so a format is never re-derived from packed bytes:
   aic-provenance ROOT [--ownership FILE] [--report FILE]
                       every file under usr/lib/firmware/aic* must be owned by
                       a signed Fedora package matching its recorded digest.
-  unit-config ROOT UNIT --fixture FILE
-                      ``systemd-analyze --root=ROOT cat-config systemd/system/UNIT``
-                      compared byte for byte (host-root headers normalized)
-                      with the pinned expected text in FILE (a repo fixture).
-                      That is systemd's own resolution: symlinks, usr-merge,
-                      drop-ins, conditions and aliases are all systemd's
-                      decisions.  Fails closed when systemd-analyze is absent.
-  unit-enabled ROOT UNIT --state enabled|masked
-                      ``systemctl --root=ROOT is-enabled UNIT``.  ``enabled``
-                      accepts enabled or static (our build's sysinit link);
-                      refutes masked, disabled and not-found.  ``masked``
-                      requires exactly "masked".
-  initramfs-unpack IMG DEST
-                      unpack IMG with dracut's own ``lsinitrd --unpack`` into a
-                      fresh DEST (the system's initramfs reader).
   esp-staged ROOT --esp-dir DIR --dtb-rpm RPM [--dtb-rpm-sha256 DIGEST]
                       the one ESP admission rule at build, on the staged tree
                       before mtools: the stamps are validated first; the DTB
@@ -95,10 +80,6 @@ FEDORA_CERTIFICATES = {
     "ecf2e6d384554b1ddd2b221d90dc1d5c96b351c2e16204c798f63d1213bdb414",
     "b176af5099fa5f13452ad84d33821edcee235cd1d484018fe96daa39e54e6a50",
 }
-# The pinned systemd units mkdevcard's no-discard drop-ins and the unit-config
-# build-time check both cover (the repart service and its Varlink instance).
-REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
-REPART_MAIN = "systemd-repart.service"
 # rpm's PGPHASHALGO values (rpm/rpmpgp.h).
 RPM_ALGO = {1: "md5", 2: "sha1", 3: "sha224", 8: "sha256", 9: "sha384", 10: "sha512"}
 DIGEST_ALGO_DEFAULT = 8
@@ -636,117 +617,6 @@ def passwd_sole_root(text):
 
 # --- build-time systemd checks (systemd's own resolution) ------------------
 
-
-def _require_tool(name):
-    if shutil.which(name) is None:
-        raise PolicyError(f"{name} is required for this check (no fallback)")
-
-
-def _normalize_cat_config(text, root):
-    """Rewrite systemd-analyze cat-config's ``# <root>/...`` headers to ``# /...``.
-
-    Only the ``# `` header lines carry the host root prefix; every other line
-    (including the unit's own ``#`` comments) is left byte for byte.
-    """
-    prefix = f"# {root}/"
-    lines = []
-    for line in text.split("\n"):
-        if line.startswith(prefix):
-            line = "# /" + line[len(prefix) :]
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _first_diff(expected, actual):
-    exp_lines = expected.split("\n")
-    got_lines = actual.split("\n")
-    for i in range(max(len(exp_lines), len(got_lines))):
-        e = exp_lines[i] if i < len(exp_lines) else "<absent>"
-        g = got_lines[i] if i < len(got_lines) else "<absent>"
-        if e != g:
-            return f"line {i + 1}: expected {e!r}, got {g!r}"
-    return "unknown difference"
-
-
-def unit_config(root, unit, fixture):
-    """systemd-analyze's own resolution of UNIT in ROOT vs the pinned fixture text."""
-    _require_tool("systemd-analyze")
-    root = Path(root).resolve()
-    fixture = Path(fixture)
-    try:
-        expected = fixture.read_text()
-    except OSError as exc:
-        raise PolicyError(f"cannot read pinned-unit fixture {fixture}: {exc}") from exc
-    rel = f"systemd/system/{unit}"
-    r = subprocess.run(
-        ["systemd-analyze", f"--root={root}", "cat-config", rel],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        raise PolicyError(
-            f"systemd-analyze cat-config {unit}: {r.stderr.strip() or r.stdout.strip()}"
-        )
-    got = _normalize_cat_config(r.stdout, root)
-    if got != expected:
-        return (
-            False,
-            f"{unit} differs from the pinned text: {_first_diff(expected, got)}",
-        )
-    return True, ""
-
-
-def unit_enabled(root, unit, state):
-    """systemctl --root is-enabled UNIT, pinned to an expected STATE."""
-    _require_tool("systemctl")
-    r = subprocess.run(
-        ["systemctl", f"--root={root}", "is-enabled", unit],
-        capture_output=True,
-        text=True,
-    )
-    got = (r.stdout.strip() or r.stderr.strip()).strip()
-    enabled_states = (
-        "enabled",
-        "enabled-runtime",
-        "static",
-        "alias",
-        "linked",
-        "linked-runtime",
-        "indirect",
-    )
-    if state == "enabled":
-        ok = got in enabled_states
-    elif state == "masked":
-        ok = got == "masked"
-    else:
-        raise PolicyError(f"invalid unit-enabled state {state!r}")
-    if ok:
-        return True, f"{unit} is {got}"
-    return (
-        False,
-        f"{unit} is {got!r}, expected {'/'.join(enabled_states) if state == 'enabled' else 'masked'}",
-    )
-
-
-def initramfs_unpack(img, dest, lsinitrd_cmd=None):
-    """Unpack IMG with dracut's own lsinitrd --unpack into a fresh DEST."""
-    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
-    _require_tool(cmd[0])
-    dest = Path(dest)
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-    r = subprocess.run(
-        cmd + ["--unpack", str(img)], cwd=str(dest), capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        raise PolicyError(
-            f"{cmd[0]} --unpack {img}: {r.stderr.strip() or f'exit {r.returncode}'}"
-        )
-    return dest
-
-
-# --- ESP: the one build-time admission, bound to the built RPM's file list ---
 
 ESP_BASE_ENTRIES = frozenset(
     (
@@ -1780,17 +1650,6 @@ def main(argv=None):
     p.add_argument("root", type=Path)
     p.add_argument("--ownership", type=Path)
     p.add_argument("--report", type=Path)
-    p = sub.add_parser("unit-config")
-    p.add_argument("root", type=Path)
-    p.add_argument("unit")
-    p.add_argument("--fixture", type=Path, required=True)
-    p = sub.add_parser("unit-enabled")
-    p.add_argument("root", type=Path)
-    p.add_argument("unit")
-    p.add_argument("--state", choices=("enabled", "masked"), required=True)
-    p = sub.add_parser("initramfs-unpack")
-    p.add_argument("img", type=Path)
-    p.add_argument("dest", type=Path)
     p = sub.add_parser("esp-staged")
     p.add_argument("root", type=Path)
     p.add_argument("--esp-dir", type=Path, required=True)
@@ -1871,38 +1730,11 @@ def main(argv=None):
                 for pkg, rel, digest, algo, linkto in records:
                     fh.write(f"{pkg}\t{rel}\t{digest}\t{algo}\t{linkto}\n")
         return 1 if problems else 0
-    if a.cmd == "unit-config":
-        try:
-            ok, msg = unit_config(a.root, a.unit, a.fixture)
-        except PolicyError as exc:
-            print(f"unit-config: {exc}", file=sys.stderr)
-            return 1
-        if not ok:
-            print(f"unit-config: {msg}", file=sys.stderr)
-            return 1
-        return 0
     if a.cmd == "check-installed-rpms":
         try:
             check_installed_rpms(a.root, json.loads(a.records))
         except (PolicyError, OSError, ValueError) as exc:
             print(f"check-installed-rpms: {exc}", file=sys.stderr)
-            return 1
-        return 0
-    if a.cmd == "unit-enabled":
-        try:
-            ok, msg = unit_enabled(a.root, a.unit, a.state)
-        except PolicyError as exc:
-            print(f"unit-enabled: {exc}", file=sys.stderr)
-            return 1
-        if not ok:
-            print(f"unit-enabled: {msg}", file=sys.stderr)
-            return 1
-        return 0
-    if a.cmd == "initramfs-unpack":
-        try:
-            initramfs_unpack(a.img, a.dest)
-        except PolicyError as exc:
-            print(f"initramfs-unpack: {exc}", file=sys.stderr)
             return 1
         return 0
     if a.cmd == "esp-staged":

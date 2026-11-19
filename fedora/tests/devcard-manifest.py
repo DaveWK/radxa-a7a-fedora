@@ -24,17 +24,6 @@ TOP = here.parent.parent
 MANIFEST_PY = TOP / "fedora" / "devcard-manifest.py"
 
 
-def synthetic_pins(work):
-    pins = work / "pins"
-    pins.mkdir()
-    for mode in ("yes", "no", "initramfs"):
-        (pins / f"repart-{mode}.unit.txt").write_text("fixture\n")
-        (pins / f"repart-{mode}.inventory.json").write_text(
-            '{"schema":1,"entries":{}}\n'
-        )
-    return pins
-
-
 FAILURES = []
 ONLY = {n for n in os.environ.get("A7A_TEST_ONLY", "").split(",") if n}
 
@@ -199,7 +188,6 @@ def manifest_roundtrip():
             str(img),
             str(root),
             str(rpms),
-            str(synthetic_pins(tmp)),
             str(manifest),
             "--esp-model",
             str(em),
@@ -228,7 +216,6 @@ def manifest_refuses_differences():
             str(img),
             str(root),
             str(rpms),
-            str(synthetic_pins(tmp)),
             str(manifest),
             "--esp-model",
             str(em),

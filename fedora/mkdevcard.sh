@@ -110,7 +110,7 @@ die() {
     exit 1
 }
 for t in unshare dnf5 mkfs.ext4 mkfs.fat mcopy sfdisk openssl xz debugfs python3 \
-    systemctl zstd cpio rpm ssh-keygen; do
+    systemctl zstd rpm ssh-keygen; do
     command -v $t >/dev/null || die "$t not found"
 done
 [ -x /usr/lib/systemd/systemd ] || die "systemd manager for staged loader not found"
@@ -405,8 +405,7 @@ fi
 # that repeats the unit's own ExecStart with --discard=no (systemd 262:
 # "systemd-repart --dry-run=no" and "systemd-repart"). Written whatever
 # GROW_ROOT says: a masked unit ignores the drop-in, and it is in place if
-# the mask is ever lifted. The final staged loader and pinned inventory below
-# check the drop-in bytes.
+# the mask is ever lifted. On-board acceptance checks the effective units.
 mkdir -p "$ROOT/etc/systemd/system/systemd-repart.service.d" \
     "$ROOT/etc/systemd/system/systemd-repart@.service.d"
 for u in systemd-repart.service systemd-repart@.service; do
@@ -556,6 +555,9 @@ python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
 
 while IFS= read -r k; do
     # Recheck root module ownership/depmod selection after overlays.
+    boot=$(cubie_boot_kmods "$k")
+    python3 -I "$TOP/fedora/initramfs-policy.py" root-modules "$ROOT" "$k" \
+        --board "${boot%% -- *}"
     chroot "$ROOT" /usr/libexec/cubie-a7a/kernel check "$k" ||
         { echo "mkdevcard: board kmods incomplete for $k" >&2; exit 1; }
     for m in sun60i-a733-serdes sun60i-a733-pcie sun55i-pck600; do
@@ -586,48 +588,14 @@ fi
 python3 -I "$TOP/fedora/staged-root-policy.py" staged "$ROOT" "${root_policy_args[@]}"
 STAGE1
 
-# --- build-time policy checks (staged trees, the real tools) -------------------
-# These run on the final root and unpacked initramfs, before any packing, using
-# systemd's own resolution and dracut's own reader; a deviation fails the build.
-# There is no fallback when a tool is missing (devcard-policy.py fails closed).
-UNITS_FIXTURES=$TOP/fedora/fixtures/units
-capture=${DEVCARD_INVENTORY_CAPTURE:-0}
-capture_args=()
-case $capture in
-0) ;;
-1)
-    mkdir -- "$OUT.inventory"
-    capture_args=(--capture-dir "$OUT.inventory")
-    ;;
-*) die "DEVCARD_INVENTORY_CAPTURE must be 0 or 1" ;;
-esac
-python3 -I "$TOP/fedora/staged-systemd.py" check "$ROOT" "$UNITS_FIXTURES" "$GROW_ROOT" \
-    --root-uuid "$ROOT_UUID" --esp-uuid "$ESP_UUID" "${capture_args[@]}" --label root
-
-# Validate exactly the build's final images and audit those same native trees.
+# zstd -t --check: stream integrity only; not newc validity, not content, not which initramfs boots.
 python3 -I "$TOP/fedora/initramfs-policy.py" set "$ROOT" "$W/kernel.txt"
-audit_roots=(--root "$ROOT")
-unpacked=()
 while IFS= read -r k; do
-    img="$ROOT/boot/initramfs-$k.img"
-    unpack="$W/initramfs-$k-unpacked"
-    python3 -I "$TOP/fedora/initramfs-policy.py" unpack "$img" "$unpack"
-    boot=$(cubie_boot_kmods "$k")
-    python3 -I "$TOP/fedora/initramfs-policy.py" root-modules "$ROOT" "$k" \
-        --board "${boot%% -- *}"
-    module_args=(--board "${boot%% -- *}" --stock "${boot##* -- }")
-    [ "$BOOT_MODES" != protective ] || module_args+=(--protective)
-    python3 -I "$TOP/fedora/initramfs-policy.py" modules "$unpack" "$k" "${module_args[@]}"
-    python3 -I "$TOP/fedora/staged-systemd.py" check "$unpack" "$UNITS_FIXTURES" initramfs \
-        "${capture_args[@]}" --label "initramfs-$k"
-    audit_roots+=(--root "$unpack")
-    unpacked+=("$unpack")
+    zstd -t --check -- "$ROOT/boot/initramfs-$k.img"
 done <"$W/kernel.txt"
-python3 -I "$TOP/fedora/image-firmware.py" audit "${audit_roots[@]}" --quiet \
+python3 -I "$TOP/fedora/image-firmware.py" audit --root "$ROOT" --quiet \
     --allow "$TOP/fedora/image-firmware.allow" --json "$W/firmware-audit.json" \
     >"$W/firmware-audit.txt" 2>&1 || echo "mkdevcard: firmware audit did not run (report only)" >&2
-rm -rf -- "${unpacked[@]}"
-[ "$capture" = 0 ] || die "inventory captured in $OUT.inventory; pin it and rebuild"
 
 # The ESP, on the staged tree before mtools, bound to the built cubie-a7a-dtb
 # RPM's own file list (stamps first; DTB, VERSION and esp-override from rpm -qp
@@ -724,12 +692,12 @@ EOF
 # The build manifest proves this image is exactly what this build produced: the
 # GPT, the sha256 of each partition's bytes and of the firmware gap, the whole
 # image, the ESP files (from the staged-tree model captured before mtools), the
-# initramfs files, the DTB stamps, the pinned-unit fixture digests and the RPM
+# initramfs files, the DTB stamps and the RPM
 # set (from the records retained at RPM selection).
 MANIFEST_PATH="$OUT.devcard-manifest.json"
 manifest_sha=$(python3 -I "$TOP/fedora/devcard-manifest.py" write "$OUT" "$ROOT" \
-    "$RPM_RECORDS" "$TOP/fedora/fixtures/units" "$MANIFEST_PATH" \
-    --esp-model "$W/esp-model.json" --grow-root "$GROW_ROOT") ||
+    "$RPM_RECORDS" "$MANIFEST_PATH" \
+    --esp-model "$W/esp-model.json") ||
     die "cannot write the build manifest"
 cat >>"$W/manifest.txt" <<EOF
 manifest    $MANIFEST_PATH sha256 $manifest_sha

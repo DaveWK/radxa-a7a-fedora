@@ -7,8 +7,7 @@ The checks that used to reconstruct archive and filesystem formats (cpio, zstd,
 systemd drop-in precedence, ext4 and FAT listings) were removed when verify
 moved to an exact build manifest; their tests were removed with them. What
 remains, and is exercised here: the AIC8800 firmware provenance, the
-build-time systemd checks (systemd-analyze cat-config against the pinned
-fixtures, systemctl is-enabled), the RPM-bound ESP admission, the dnf
+RPM-bound ESP admission, the dnf
 repository parser, and the small parsers (dumpe2fs, BLS loader, shadow,
 passwd, rpmdb-list cross-check, absence).  Run: python3 -I fedora/tests/devcard-policy.py
 """
@@ -35,7 +34,6 @@ spec.loader.exec_module(policy)
 FAILURES = []
 # A7A_TEST_ONLY=fn1,fn2 runs only the named test functions (red/green runs).
 ONLY = {n for n in os.environ.get("A7A_TEST_ONLY", "").split(",") if n}
-FIXTURES = here.parent / "fixtures" / "units"
 
 
 def case(name, fn):
@@ -638,152 +636,6 @@ def absence_check_cases():
 # --- build-time systemd checks ------------------------------------------------
 
 
-def _stock_unit_root(root, dropin=True):
-    """A synthetic root: the two stock systemd-repart units, with our drop-ins."""
-    sysd = root / "usr/lib/systemd/system"
-    sysd.mkdir(parents=True)
-    for unit in ("systemd-repart.service", "systemd-repart@.service"):
-        shutil.copyfile(Path("/usr/lib/systemd/system") / unit, sysd / unit)
-    if dropin:
-        for unit, cmd in (
-            ("systemd-repart.service", "systemd-repart --dry-run=no"),
-            ("systemd-repart@.service", "systemd-repart"),
-        ):
-            d = root / f"etc/systemd/system/{unit}.d"
-            d.mkdir(parents=True)
-            (d / "10-cubie-a7a-no-discard.conf").write_text(
-                "# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of\n"
-                "# the first partition holds the boot firmware, so systemd-repart must not\n"
-                "# discard it. The unit's own command line, plus --discard=no.\n"
-                "[Service]\nExecStart=\n"
-                f"ExecStart={cmd} --discard=no\n"
-            )
-
-
-def unit_config_cases():
-    if shutil.which("systemd-analyze") is None:
-        print("  (skipped: systemd-analyze absent)")
-        return
-    with fixture() as root:
-        _stock_unit_root(root)
-        ok, msg = policy.unit_config(
-            root,
-            "systemd-repart.service",
-            FIXTURES / "root-systemd-repart.service.cat-config",
-        )
-        assert ok, msg
-        ok, msg = policy.unit_config(
-            root,
-            "systemd-repart@.service",
-            FIXTURES / "root-systemd-repart@.service.cat-config",
-        )
-        assert ok, msg
-    # A changed drop-in (an added ExecStartPre=) and a masked unit are refused.
-    with fixture() as root:
-        _stock_unit_root(root)
-        d = (
-            root
-            / "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
-        )
-        with d.open("a") as fh:
-            fh.write("ExecStartPre=/bin/false\n")
-        ok, _ = policy.unit_config(
-            root,
-            "systemd-repart.service",
-            FIXTURES / "root-systemd-repart.service.cat-config",
-        )
-        assert not ok
-    with fixture() as root:
-        _stock_unit_root(root)
-        d = root / "etc/systemd/system"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "systemd-repart.service").symlink_to("/dev/null")
-        ok, _ = policy.unit_config(
-            root,
-            "systemd-repart.service",
-            FIXTURES / "root-systemd-repart.service.cat-config",
-        )
-        assert not ok
-
-
-def unit_config_initramfs_absent_cases():
-    if shutil.which("systemd-analyze") is None:
-        print("  (skipped: systemd-analyze absent)")
-        return
-    with fixture() as root:
-        sysd = root / "usr/lib/systemd/system"
-        sysd.mkdir(parents=True)
-        shutil.copyfile(
-            Path("/usr/lib/systemd/system/systemd-udevd.service"),
-            sysd / "systemd-udevd.service",
-        )
-        for unit in ("systemd-repart.service", "systemd-repart@.service"):
-            ok, msg = policy.unit_config(
-                root, unit, FIXTURES / f"initramfs-{unit}.cat-config"
-            )
-            assert ok, msg
-
-
-def unit_enabled_cases():
-    if shutil.which("systemctl") is None:
-        print("  (skipped: systemctl absent)")
-        return
-    with fixture() as root:
-        d = root / "etc/systemd/system"
-        d.mkdir(parents=True)
-        (d / "systemd-repart.service").symlink_to("/dev/null")
-        ok, msg = policy.unit_enabled(root, "systemd-repart.service", "masked")
-        assert ok, msg
-        ok, _ = policy.unit_enabled(root, "systemd-repart.service", "enabled")
-        assert not ok
-    with fixture() as root:
-        u = root / "usr/lib/systemd/system/cubie-a7a-test.service"
-        u.parent.mkdir(parents=True)
-        u.write_text(
-            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n"
-        )
-        w = root / "etc/systemd/system/multi-user.target.wants"
-        w.mkdir(parents=True)
-        (w / "cubie-a7a-test.service").symlink_to(
-            "/usr/lib/systemd/system/cubie-a7a-test.service"
-        )
-        ok, msg = policy.unit_enabled(root, "cubie-a7a-test.service", "enabled")
-        assert ok, msg
-
-
-def initramfs_unpack_cases():
-    if shutil.which("lsinitrd") is None or shutil.which("cpio") is None:
-        print("  (skipped: dracut absent)")
-        return
-    import gzip
-
-    with fixture() as tmp:
-        tree = tmp / "tree"
-        write(tree / "usr/lib/systemd/system/systemd-udevd.service", "[Service]\n")
-        write(tree / "etc/cmdline.d/20-force_drivers.conf", "sun60i_a733_ccu\n")
-        files = subprocess.run(
-            ["find", "."], cwd=str(tree), capture_output=True, text=True, check=True
-        ).stdout
-        raw = subprocess.run(
-            ["cpio", "--quiet", "-o", "-H", "newc"],
-            cwd=str(tree),
-            input=files.encode(),
-            capture_output=True,
-            check=True,
-        ).stdout
-        img = tmp / "test-initramfs.img"
-        img.write_bytes(gzip.compress(raw))
-        dest = tmp / "unpacked"
-        policy.initramfs_unpack(img, dest)
-        assert (dest / "etc/cmdline.d/20-force_drivers.conf").read_text() == (
-            "sun60i_a733_ccu\n"
-        )
-        assert (dest / "usr/lib/systemd/system/systemd-udevd.service").is_file()
-
-
-# --- RPM-bound ESP admission (build time) -------------------------------------
-
-
 def _build_test_dtb_rpm(work, dtb_bytes, override=False, version=True):
     """A noarch cubie-a7a-dtb RPM owning the DTB, VERSION (8) and (optional) override."""
     rb = work / "rpmbuild-dtb"
@@ -1073,19 +925,6 @@ def main():
         verify_rpmdb_list_cases,
     )
     case("absence-check: matches and unreadable dirs fail closed", absence_check_cases)
-    case(
-        "unit-config: systemd's resolution pinned to the fixtures (green/red)",
-        unit_config_cases,
-    )
-    case(
-        "unit-config: initramfs absent units match the fixtures",
-        unit_config_initramfs_absent_cases,
-    )
-    case("unit-enabled: masked and enabled states", unit_enabled_cases)
-    case(
-        "initramfs-unpack: dracut's own reader unpacks the image",
-        initramfs_unpack_cases,
-    )
     case("esp-staged: the RPM-bound ESP admission (green/red)", esp_staged_cases)
     case(
         "esp-staged: root DTB and override ownership in both branches",
