@@ -528,6 +528,11 @@ rm -rf "$ROOT"/var/cache/dnf/* "$ROOT"/var/lib/dnf/repos "$ROOT"/var/log/dnf* \
 # runtimes under /opt), copied over the root as root:root; systemd units in
 # it are enabled, and the dynamic linker cache is refreshed.
 if [ -n "$OVERLAY" ]; then
+    # Refuse AIC8800 firmware paths before the copy: only a Fedora package may
+    # put those files in an image (DECISIONS 2026-11-11; Dave 2026-11-19:
+    # linux-firmware's own files are fine, ours are not).
+    python3 -I "$TOP/fedora/devcard-policy.py" aic-overlay "$OVERLAY" >/dev/null ||
+        { echo "mkdevcard: OVERLAY carries AIC8800 firmware (user opt-in only)" >&2; exit 1; }
     cp -a --no-preserve=ownership "$OVERLAY"/. "$ROOT"/
     for u in "$OVERLAY"/usr/lib/systemd/system/*.service; do
         [ -e "$u" ] || continue
@@ -537,12 +542,15 @@ if [ -n "$OVERLAY" ]; then
     (cd "$OVERLAY" && find . -type f | LC_ALL=C sort | xargs sha256sum) >"$W/overlay.sha256"
 fi
 
-# Our OVERLAY / AIC_OVERRIDE path must not copy AIC8800 firmware into the
-# image (DECISIONS 2026-11-11; Dave 2026-11-19: Fedora's standard
-# linux-firmware package is fine and is not rejected).  verify-devcard.sh
-# checks the built image the same way.
-python3 -I "$TOP/fedora/devcard-policy.py" aic-find "$ROOT" >/dev/null ||
-    { echo "mkdevcard: AIC8800 firmware from the OVERLAY path (user opt-in only)" >&2; exit 1; }
+# Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
+# package and match that package's recorded digest: provenance, not path.
+# Fedora's linux-firmware owns aic/aic8800d80 and passes; an unowned file
+# (overlay addition), a modified file (overlay replacement) or a non-Fedora
+# package fails (DECISIONS 2026-11-11; Dave 2026-11-19: the standard
+# linux-firmware package is fine).
+python3 -I "$TOP/fedora/devcard-policy.py" aic-provenance "$ROOT" \
+    --report "$W/aic-provenance.tsv" >/dev/null ||
+    { echo "mkdevcard: AIC8800 firmware is unowned, modified or not from a Fedora package (user opt-in only)" >&2; exit 1; }
 
 # The no-discard drop-ins were written before the overlay.  Re-check the final
 # root and the final initramfs, so an overlay cannot drop a drop-in or replace

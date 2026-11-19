@@ -4,9 +4,13 @@
 checks behind mkdevcard.sh and verify-devcard.sh).
 
 Every parser is exercised with fixtures, including the empty and missing
-cases.  Run: python3 -I fedora/tests/devcard-policy.py
+cases.  The AIC8800 provenance tests use recorded ownership lists (both TSV
+and ``rpm -qlv --dump`` format) because host tests do not install RPMs;
+``_live_ownership`` reads the real rpm database the same way.
+Run: python3 -I fedora/tests/devcard-policy.py
 """
 
+import hashlib
 import importlib.util
 import sys
 import tempfile
@@ -48,6 +52,10 @@ def fixture():
         yield Path(tmp)
 
 
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 MANIFEST = """\
 # name bytes sha256 role
 fw_patch_table_8800d80_u02.bin 1384 abc required
@@ -55,67 +63,228 @@ fmacfw_8800d80_u02.bin 358072 def required
 """
 
 
-def aic_clean_root():
+def ownership_tsv(root, entries):
+    """A recorded TSV ownership FILE for entries under ROOT.
+
+    Each entry is ``(rel, pkg)``, ``(rel, pkg, linkto)``, or
+    ``(rel, pkg, linkto, is_fedora)``.
+    """
+    lines = []
+    for item in entries:
+        rel, pkg = item[0], item[1]
+        linkto = item[2] if len(item) > 2 else ""
+        is_fedora = item[3] if len(item) > 3 else True
+        digest = "" if linkto else sha256(root / rel)
+        flag = "1" if is_fedora else "0"
+        lines.append(f"{pkg}\t{rel}\t{digest}\t8\t{linkto}\t{flag}")
+    path = root / "ownership.tsv"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def ownership_rpm_dump(root, entries, pkg="linux-firmware"):
+    """A recorded ``rpm -qlv --dump`` FILE for (rel, linkto) pairs under ROOT."""
+    lines = [f"# package: {pkg}"]
+    for rel, linkto in entries:
+        if linkto:
+            lines.append(
+                f"/{rel} {len(linkto)} 1792368000 {'0' * 64} 0120777 root root 0 0 0 {linkto}"
+            )
+        else:
+            p = root / rel
+            size = p.stat().st_size
+            lines.append(
+                f"/{rel} {size} 1792368000 {sha256(p)} 0100644 root root 0 0 0 X"
+            )
+    path = root / "ownership.dump"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def aic_overlay_refuses_firmware_paths():
+    with fixture() as tmp:
+        overlay = tmp / "overlay"
+        bad1 = overlay / "usr/lib/firmware/aic8800_fw/USB/aic8800D80/fw.bin"
+        bad2 = overlay / "usr/lib/firmware/aic/aic8800d80/new.bin"
+        bad3 = overlay / "lib/firmware/aic/aic8800d80/via-usrmerge.bin"
+        bad4 = overlay / "lib/firmware/aic8800_fw/via-usrmerge.bin"
+        good = overlay / "opt/vendor/runtime/lib.so"
+        for p in (bad1, bad2, bad3, bad4, good):
+            write(p, "")
+        hits = policy.aic_overlay_inputs(overlay)
+        assert hits == sorted([str(bad1), str(bad2), str(bad3), str(bad4)]), hits
+
+
+def aic_overlay_refuses_symlink():
+    with fixture() as tmp:
+        overlay = tmp / "overlay"
+        link = overlay / "usr/lib/firmware/aic/aic8800d80/fmacfw.bin.xz"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("/opt/evil.bin")
+        assert policy.aic_overlay_inputs(overlay) == [str(link)]
+
+
+def aic_overlay_missing_dir():
+    with fixture() as tmp:
+        assert policy.aic_overlay_inputs(tmp / "nope") == []
+
+
+def aic_overlay_other_firmware_allowed():
+    with fixture() as tmp:
+        overlay = tmp / "overlay"
+        write(overlay / "usr/lib/firmware/rtl_nic/rtl8125b-2.fw", "")
+        assert policy.aic_overlay_inputs(overlay) == []
+
+
+def aic_provenance_fedora_owned_passes():
     with fixture() as root:
-        assert policy.aic_find(root) == []
-
-
-def aic_missing_root():
-    with fixture() as root:
-        assert policy.aic_find(root / "nope") == []
-
-
-def aic_empty_firmware_dir():
-    with fixture() as root:
-        (root / "usr/lib/firmware").mkdir(parents=True)
-        assert policy.aic_find(root) == []
-
-
-def aic_linux_firmware_allowed():
-    # Fedora's standard linux-firmware package is fine (Dave 2026-11-19).
-    with fixture() as root:
-        write(root / "usr/share/cubie-a7a/aic8800-d80-usb.manifest", MANIFEST)
         f = root / "usr/lib/firmware/aic/aic8800d80/fw_patch_table_8800d80_u02.bin.xz"
-        write(f, "")
-        assert policy.aic_find(root) == []
+        write(f, "fedora-bytes")
+        rel = f.relative_to(root).as_posix()
+        own = ownership_tsv(root, [(rel, "linux-firmware")])
+        problems, records = policy.aic_problems(root, own)
+        assert problems == [], problems
+        assert [r[1] for r in records] == [rel]
+        dump = ownership_rpm_dump(root, [(rel, "")])
+        problems, records = policy.aic_problems(root, dump)
+        assert problems == [], problems
+        assert [r[1] for r in records] == [rel]
 
 
-def aic_override_dir_rejected():
+def aic_provenance_clean_root():
     with fixture() as root:
-        f = root / "usr/lib/firmware/aic8800_fw/USB/aic8800D80/fw.bin"
-        write(f, "")
-        assert [str(p) for p in policy.aic_find(root)] == [str(f)]
+        own = root / "ownership.tsv"
+        own.write_text("")
+        assert policy.aic_problems(root, own) == ([], [])
 
 
-def aic_stray_aic8800_path_rejected():
+def aic_provenance_overlay_added_file_fails():
     with fixture() as root:
-        f = root / "usr/lib/firmware/elsewhere/aic8800d80.bin"
-        write(f, "")
-        assert [str(p) for p in policy.aic_find(root)] == [str(f)]
+        fedora = root / "usr/lib/firmware/aic/aic8800d80/fw_patch.bin.xz"
+        write(fedora, "fedora")
+        added_same_dir = root / "usr/lib/firmware/aic/aic8800d80/extra.bin"
+        write(added_same_dir, "ours-same-dir")
+        added_override = root / "usr/lib/firmware/aic8800_fw/USB/aic8800D80/fw.bin"
+        write(added_override, "ours-override")
+        own = ownership_tsv(
+            root, [(fedora.relative_to(root).as_posix(), "linux-firmware")]
+        )
+        problems, _ = policy.aic_problems(root, own)
+        assert len(problems) == 2, problems
+        assert all("owned by no installed package" in p for p in problems), problems
+        assert any("extra.bin" in p for p in problems), problems
+        assert any("aic8800_fw" in p for p in problems), problems
 
 
-def aic_manifest_name_elsewhere():
+def aic_provenance_overlay_replacement_fails():
+    with fixture() as root:
+        f = root / "usr/lib/firmware/aic/aic8800d80/fw_patch.bin.xz"
+        write(f, "fedora-bytes")
+        own = ownership_tsv(root, [(f.relative_to(root).as_posix(), "linux-firmware")])
+        write(f, "replaced-bytes")
+        problems, _ = policy.aic_problems(root, own)
+        assert len(problems) == 1, problems
+        assert "modified" in problems[0], problems
+
+
+def aic_provenance_non_fedora_package_fails():
+    with fixture() as root:
+        f = root / "usr/lib/firmware/aic/aic8800d80/fw_patch.bin.xz"
+        write(f, "local-rpm-bytes")
+        own = ownership_tsv(
+            root, [(f.relative_to(root).as_posix(), "cubie-a7a-aic8800-usb", "", False)]
+        )
+        problems, _ = policy.aic_problems(root, own)
+        assert len(problems) == 1, problems
+        assert "non-Fedora package" in problems[0], problems
+
+
+def aic_provenance_stray_and_manifest_paths_fail():
     with fixture() as root:
         write(root / "usr/share/cubie-a7a/aic8800-d80-usb.manifest", MANIFEST)
-        f = root / "usr/lib/firmware/unrelated/fw_patch_table_8800d80_u02.bin"
-        write(f, "")
-        assert [str(p) for p in policy.aic_find(root)] == [str(f)]
+        stray = root / "usr/lib/firmware/elsewhere/aic8800d80.bin"
+        man = root / "usr/lib/firmware/unrelated/fmacfw_8800d80_u02.bin.zst"
+        write(stray, "x")
+        write(man, "y")
+        own = root / "ownership.tsv"
+        own.write_text("")
+        problems, _ = policy.aic_problems(root, own)
+        assert len(problems) == 2, problems
+        assert any("elsewhere" in p for p in problems), problems
+        assert any("unrelated" in p for p in problems), problems
 
 
-def aic_manifest_missing():
+def aic_provenance_symlink_cases():
     with fixture() as root:
-        f = root / "usr/lib/firmware/unrelated/fw_patch_table_8800d80_u02.bin"
-        write(f, "")
-        # No manifest: only the path pattern applies, and this name is not one.
-        assert policy.aic_find(root) == []
+        target = root / "usr/lib/firmware/aic/aic8800d80/real.bin"
+        write(target, "bytes")
+        link = root / "usr/lib/firmware/aic/aic8800d80/link.bin"
+        link.symlink_to(target.name)
+        trel = target.relative_to(root).as_posix()
+        lrel = link.relative_to(root).as_posix()
+        # Owned symlink to owned target passes (both TSV and rpm --dump).
+        own = ownership_tsv(
+            root, [(trel, "linux-firmware"), (lrel, "linux-firmware", target.name)]
+        )
+        problems, _ = policy.aic_problems(root, own)
+        assert problems == [], problems
+        dump = ownership_rpm_dump(root, [(trel, ""), (lrel, target.name)])
+        problems, _ = policy.aic_problems(root, dump)
+        assert problems == [], problems
+        # Unowned symlink pointing to a Fedora-owned file must fail.
+        own_only_target = ownership_tsv(root, [(trel, "linux-firmware")])
+        problems, _ = policy.aic_problems(root, own_only_target)
+        assert len(problems) == 1 and "owned by no installed package" in problems[0]
 
 
-def aic_manifest_suffixes():
+def aic_provenance_symlink_outside_fails():
+    with fixture() as root:
+        link = root / "usr/lib/firmware/aic/aic8800d80/link.bin"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../../../../../etc/hosts")
+        lrel = link.relative_to(root).as_posix()
+        own = ownership_tsv(
+            root, [(lrel, "linux-firmware", "../../../../../etc/hosts")]
+        )
+        problems, _ = policy.aic_problems(root, own)
+        assert len(problems) == 1, problems
+        assert "symlink" in problems[0], problems
+
+
+def aic_provenance_missing_rpmdb_fails_closed():
+    with fixture() as root:
+        assert policy.main(["aic-provenance", str(root)]) == 1
+
+
+def aic_provenance_report_written():
+    with fixture() as root:
+        f = root / "usr/lib/firmware/aic/aic8800d80/fw.bin.xz"
+        write(f, "bytes")
+        own = ownership_tsv(root, [(f.relative_to(root).as_posix(), "linux-firmware")])
+        report = root / "report.tsv"
+        rc = policy.main(
+            [
+                "aic-provenance",
+                str(root),
+                "--ownership",
+                str(own),
+                "--report",
+                str(report),
+            ]
+        )
+        assert rc == 0, rc
+        assert report.read_text().startswith("linux-firmware\t"), report.read_text()
+
+
+def aic_manifest_names_cases():
     with fixture() as root:
         write(root / "usr/share/cubie-a7a/aic8800-d80-usb.manifest", MANIFEST)
-        f = root / "usr/lib/firmware/unrelated/fmacfw_8800d80_u02.bin.zst"
-        write(f, "")
-        assert [str(p) for p in policy.aic_find(root)] == [str(f)]
+        names = policy.aic_manifest_names(root)
+        assert names == [
+            "fw_patch_table_8800d80_u02.bin",
+            "fmacfw_8800d80_u02.bin",
+        ], names
+        assert policy.aic_manifest_names(root / "nope") == []
 
 
 def enabled_repos_cases():
@@ -296,15 +465,36 @@ def repart_initramfs_cases():
 
 
 def main():
-    case("aic: clean root", aic_clean_root)
-    case("aic: missing root", aic_missing_root)
-    case("aic: empty firmware dir", aic_empty_firmware_dir)
-    case("aic: linux-firmware files allowed", aic_linux_firmware_allowed)
-    case("aic: override dir rejected", aic_override_dir_rejected)
-    case("aic: stray aic8800 path rejected", aic_stray_aic8800_path_rejected)
-    case("aic: manifest name under another directory", aic_manifest_name_elsewhere)
-    case("aic: missing manifest", aic_manifest_missing)
-    case("aic: manifest name with .zst suffix", aic_manifest_suffixes)
+    case("aic-overlay: refuses firmware paths", aic_overlay_refuses_firmware_paths)
+    case("aic-overlay: refuses symlink", aic_overlay_refuses_symlink)
+    case("aic-overlay: missing directory", aic_overlay_missing_dir)
+    case("aic-overlay: other firmware allowed", aic_overlay_other_firmware_allowed)
+    case("aic-provenance: Fedora-owned files pass", aic_provenance_fedora_owned_passes)
+    case("aic-provenance: clean root", aic_provenance_clean_root)
+    case(
+        "aic-provenance: overlay-added file fails",
+        aic_provenance_overlay_added_file_fails,
+    )
+    case(
+        "aic-provenance: overlay replacement fails",
+        aic_provenance_overlay_replacement_fails,
+    )
+    case(
+        "aic-provenance: non-Fedora package fails",
+        aic_provenance_non_fedora_package_fails,
+    )
+    case(
+        "aic-provenance: stray and manifest paths fail",
+        aic_provenance_stray_and_manifest_paths_fail,
+    )
+    case("aic-provenance: symlink ownership", aic_provenance_symlink_cases)
+    case("aic-provenance: symlink outside fails", aic_provenance_symlink_outside_fails)
+    case(
+        "aic-provenance: missing rpmdb fails closed",
+        aic_provenance_missing_rpmdb_fails_closed,
+    )
+    case("aic-provenance: report written", aic_provenance_report_written)
+    case("aic-manifest names", aic_manifest_names_cases)
     case("enabled repos: populated and missing dirs", enabled_repos_cases)
     case("enabled repos: empty and missing", enabled_repos_empty)
     case("dumpe2fs: sizes and empty", dumpe2fs_cases)

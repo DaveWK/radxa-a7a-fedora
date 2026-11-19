@@ -8,13 +8,20 @@ command prints a stable, shell-friendly result and exits nonzero on a policy
 violation, so a caller can use it directly as a check.
 
 Commands:
-  aic-find ROOT       AIC8800 firmware our own paths put in ROOT: anything
-                      under the user-override directory aic8800_fw (the
-                      OVERLAY / AIC_OVERRIDE path) and any manifest-named
-                      file outside Fedora's standard linux-firmware path
-                      aic/aic8800d80 (DECISIONS 2026-11-11; Dave 2026-11-19:
-                      the standard linux-firmware package is fine).
-                      Prints one path per line; exit 1 when any is found.
+  aic-overlay DIR     AIC8800 firmware paths in an OVERLAY directory that
+                      must be refused before the copy: anything under
+                      usr/lib/firmware/ or lib/firmware/ matching aic/,
+                      aic8800*, or *aic8800* (DECISIONS 2026-11-11; Dave
+                      2026-11-19: Fedora's standard linux-firmware files are
+                      fine, our own are not).  Prints one path per line;
+                      exit 1 when any is found.
+  aic-provenance ROOT [--ownership FILE] [--report FILE]
+                      every file under usr/lib/firmware/aic* (and any stray
+                      aic8800* or manifest-named file under firmware/) in ROOT
+                      must be owned by a signed Fedora package and match that
+                      package's recorded digest.  Ownership comes from ROOT's
+                      rpm database, or from a recorded TSV / rpm -qlv --dump
+                      FILE.  Prints one problem per line; exit 1 on failure.
   repart-root ROOT    every effective systemd-repart unit carries the
                       --discard=no drop-in; exit 1 with a diagnostic otherwise.
   repart-initramfs-listing
@@ -32,6 +39,8 @@ Commands:
 """
 
 import argparse
+import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -39,15 +48,27 @@ from pathlib import Path
 
 AIC_PATTERN = re.compile(r"aic8800", re.IGNORECASE)
 MANIFEST = "usr/share/cubie-a7a/aic8800-d80-usb.manifest"
+FIRMWARE_PREFIXES = (("usr", "lib", "firmware"), ("lib", "firmware"))
 FIRMWARE = "usr/lib/firmware"
-# Fedora's standard linux-firmware package installs the D80 files here; Dave
-# 2026-11-19: that package is fine and must not be rejected.  Our own
-# OVERLAY / AIC_OVERRIDE path is aic8800_fw, which the image must not carry.
-LINUX_FIRMWARE_AIC = "aic/aic8800d80"
-OVERRIDE_DIR = "aic8800_fw"
+# Provenance, not path: Fedora's standard linux-firmware package owns
+# aic/aic8800d80 and is fine (Dave 2026-11-19); any unowned, modified or
+# non-Fedora file under an AIC firmware path is ours and forbidden
+# (DECISIONS 2026-11-11).
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
 REPART_DROPIN = "10-cubie-a7a-no-discard.conf"
 REPART_REPARTD = ("etc/repart.d", "usr/lib/repart.d", "usr/local/lib/repart.d")
+# rpm's PGPHASHALGO values (rpm/rpmpgp.h).
+RPM_ALGO = {1: "md5", 2: "sha1", 3: "sha224", 8: "sha256", 9: "sha384", 10: "sha512"}
+DIGEST_ALGO_DEFAULT = 8
+RPMDB_CANDIDATES = (
+    "usr/lib/sysimage/rpm/rpmdb.sqlite",
+    "var/lib/rpm/rpmdb.sqlite",
+    "var/lib/rpm/Packages",
+)
+
+
+class PolicyError(RuntimeError):
+    """A policy check could not be performed; callers must fail closed."""
 
 
 def aic_manifest_names(root):
@@ -66,49 +87,291 @@ def aic_manifest_names(root):
     return names
 
 
-def _under_firmware(root):
-    fw = Path(root) / FIRMWARE
-    if not fw.is_dir():
-        return []
-    return [p for p in fw.rglob("*") if p.is_file() or p.is_symlink()]
+def _firmware_rel(rel):
+    """Strip usr/lib/firmware/ or lib/firmware/ prefix, or return None."""
+    parts = rel.split("/")
+    for prefix in FIRMWARE_PREFIXES:
+        if len(parts) > len(prefix) and tuple(parts[: len(prefix)]) == prefix:
+            return "/".join(parts[len(prefix) :])
+    return None
 
 
-def _from_linux_firmware(rel):
-    return rel == LINUX_FIRMWARE_AIC or rel.startswith(LINUX_FIRMWARE_AIC + "/")
+def _aic_overlay_rel(fw_rel):
+    """True when a firmware-relative overlay path targets AIC8800 firmware."""
+    head = fw_rel.split("/", 1)[0].lower()
+    return (
+        head == "aic" or head.startswith("aic8800") or bool(AIC_PATTERN.search(fw_rel))
+    )
 
 
-def aic_find(root):
-    """Every AIC8800 file our own paths put in the image's firmware tree.
+def _aic_root_rel(fw_rel):
+    """True when a firmware-relative root path is under aic* or names aic8800."""
+    head = fw_rel.split("/", 1)[0].lower()
+    return head.startswith("aic") or bool(AIC_PATTERN.search(fw_rel))
 
-    Fedora's standard linux-firmware files (aic/aic8800d80) are allowed.
-    Two tests catch ours: anything under the user-override directory
-    aic8800_fw (what OVERLAY / AIC_OVERRIDE would populate) and any other
-    path naming aic8800, plus each manifest name with its optional
-    .xz/.zst suffix outside linux-firmware's directory (a copy under an
-    unrelated directory).
+
+def aic_overlay_inputs(overlay):
+    """Overlay inputs that would land in an AIC8800 firmware path.
+
+    mkdevcard.sh refuses these before the overlay copy: only a Fedora package
+    may put AIC8800 firmware in an image, and the overlay is ours.
     """
-    fw = Path(root) / FIRMWARE
+    base = Path(overlay)
     hits = []
-    for path in _under_firmware(root):
-        rel = str(path.relative_to(fw))
-        if _from_linux_firmware(rel):
+    if not base.is_dir():
+        return hits
+    for path in base.rglob("*"):
+        if not (path.is_file() or path.is_symlink()):
             continue
-        if rel == OVERRIDE_DIR or rel.startswith(OVERRIDE_DIR + "/"):
+        rel = path.relative_to(base).as_posix()
+        fw_rel = _firmware_rel(rel)
+        if fw_rel is not None and _aic_overlay_rel(fw_rel):
             hits.append(str(path))
-        elif AIC_PATTERN.search(rel):
-            hits.append(str(path))
-    names = aic_manifest_names(root)
-    if names:
-        wanted = set()
-        for name in names:
-            wanted.update((name, name + ".xz", name + ".zst"))
-        for path in _under_firmware(root):
-            rel = str(path.relative_to(fw))
-            if _from_linux_firmware(rel):
-                continue
-            if path.name in wanted and str(path) not in hits:
-                hits.append(str(path))
     return sorted(hits)
+
+
+def _firmware_dirs(root):
+    """Firmware directories under ROOT without traversing usr-merge twice."""
+    root = Path(root)
+    dirs = []
+    usr_fw = root / "usr/lib/firmware"
+    if usr_fw.is_dir():
+        dirs.append(usr_fw)
+    lib = root / "lib"
+    lib_fw = root / "lib/firmware"
+    if (
+        lib.is_dir()
+        and not lib.is_symlink()
+        and lib_fw.is_dir()
+        and not lib_fw.is_symlink()
+    ):
+        dirs.append(lib_fw)
+    return dirs
+
+
+def aic_root_files(root):
+    """Every regular file and symlink under usr/lib/firmware/aic*, plus any
+    stray aic8800* or manifest-named file under firmware/.
+    """
+    root = Path(root)
+    wanted = set()
+    for name in aic_manifest_names(root):
+        wanted.update((name, name + ".xz", name + ".zst"))
+    out = []
+    for fw in _firmware_dirs(root):
+        for path in fw.rglob("*"):
+            if not (path.is_file() or path.is_symlink()):
+                continue
+            fw_rel = path.relative_to(fw).as_posix()
+            if _aic_root_rel(fw_rel) or path.name in wanted:
+                out.append(path)
+    return sorted(out)
+
+
+def _file_digest(path, algo):
+    h = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _resolve_within(root, path):
+    """The regular file a symlink points at inside ROOT, or None on escape/loop."""
+    root_res = Path(root).resolve()
+    cur = path
+    seen = set()
+    while cur.is_symlink():
+        if cur in seen:
+            return None
+        seen.add(cur)
+        dest = os.readlink(cur)
+        if os.path.isabs(dest):
+            cur = root_res / dest.lstrip("/")
+        else:
+            cur = cur.parent / dest
+        cur = Path(os.path.normpath(cur))
+        try:
+            cur.relative_to(root_res)
+        except ValueError:
+            return None
+    if not cur.is_file():
+        return None
+    try:
+        resolved = cur.resolve()
+        resolved.relative_to(root_res)
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _recorded_ownership(path):
+    """Index path -> (pkg, digest, algo, linkto, is_fedora) from a recorded file.
+
+    Accepts either:
+      - tab-separated ``pkg<TAB>path<TAB>digest[<TAB>algo[<TAB>linkto[<TAB>fedora]]]``
+      - ``rpm -qlv --dump`` / ``rpm -q --dump`` lines (11 whitespace fields,
+        with optional ``# package: <name>`` comment header; default linux-firmware)
+    """
+    index = {}
+    text = Path(path).read_text()
+    dump_pkg = "linux-firmware"
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            m = re.match(r"#\s*package:\s*(\S+)", stripped)
+            if m:
+                dump_pkg = m.group(1)
+            continue
+        if "\t" in line:
+            parts = line.split("\t")
+            if len(parts) < 3:
+                raise PolicyError(f"{path}:{number}: bad ownership record {line!r}")
+            pkg, name, digest = parts[0], parts[1], parts[2].lower()
+            algo = int(parts[3]) if len(parts) > 3 and parts[3] else DIGEST_ALGO_DEFAULT
+            linkto = parts[4] if len(parts) > 4 else ""
+            if len(parts) > 5 and parts[5] != "":
+                is_fedora = parts[5].lower() not in ("0", "false", "no", "non-fedora")
+            else:
+                is_fedora = True
+            index[name.lstrip("/")] = (pkg, digest, algo, linkto, is_fedora)
+            continue
+        # rpm -qlv --dump: path size mtime digest mode owner group iscfg isdoc rdev symlink
+        parts = stripped.split()
+        if len(parts) < 11:
+            raise PolicyError(f"{path}:{number}: bad ownership record {line!r}")
+        name = parts[0].lstrip("/")
+        digest = parts[3].lower()
+        mode = parts[4]
+        linkto = "" if parts[10] == "X" else parts[10]
+        if mode.startswith("04"):
+            continue  # directory entry in rpm --dump
+        if linkto:
+            digest = ""
+        index[name] = (dump_pkg, digest, DIGEST_ALGO_DEFAULT, linkto, True)
+    return index
+
+
+def _live_ownership(root):
+    """Index path -> (pkg, digest, algo, linkto, is_fedora) from ROOT's rpmdb."""
+    root = Path(root)
+    if not any((root / cand).is_file() for cand in RPMDB_CANDIDATES):
+        raise PolicyError(f"no rpm database found under {root}")
+    try:
+        import rpm
+    except ImportError as exc:
+        raise PolicyError(f"python3-rpm is unavailable: {exc}") from exc
+    try:
+        ts = rpm.TransactionSet(str(root))
+        index = {}
+        for hdr in ts.dbMatch():
+            filenames = hdr["filenames"]
+            if not filenames:
+                continue
+            raw_algo = hdr["filedigestalgo"]
+            algo = int(raw_algo) if raw_algo is not None else DIGEST_ALGO_DEFAULT
+            pkg = str(hdr["name"])
+            vendor = str(hdr["vendor"] or "")
+            signed = bool(hdr["rsaheader"] or hdr["sigpgp"] or hdr["dsaheader"])
+            is_fedora = vendor == "Fedora Project" and signed
+            digests = hdr["filedigests"] or []
+            linktos = hdr["filelinktos"] or []
+            for idx, name in enumerate(filenames):
+                digest = str(digests[idx]).lower() if idx < len(digests) else ""
+                linkto = str(linktos[idx]) if idx < len(linktos) else ""
+                index[str(name).lstrip("/")] = (pkg, digest, algo, linkto, is_fedora)
+    except Exception as exc:
+        raise PolicyError(f"cannot read the rpm database under {root}: {exc}") from exc
+    if not index:
+        raise PolicyError(f"no installed packages found under {root}")
+    return index
+
+
+def _digest_problems(path, label, entry):
+    pkg, recorded, algo, _linkto, _is_fedora = entry
+    if not recorded or set(recorded) == {"0"}:
+        return [f"{label}: {pkg} records no file digest"]
+    name = RPM_ALGO.get(algo)
+    if name is None:
+        return [f"{label}: {pkg} records digest algorithm {algo}, unsupported here"]
+    try:
+        actual = _file_digest(path, name)
+    except OSError as exc:
+        return [f"{label}: unreadable ({exc})"]
+    if actual != recorded:
+        return [
+            f"{label}: owned by {pkg} but modified "
+            f"(actual {actual}, package records {recorded})"
+        ]
+    return []
+
+
+def aic_problems(root, ownership=None):
+    """Every provenance problem in ROOT's AIC8800 firmware tree.
+
+    Every file under usr/lib/firmware/aic* (and any stray aic8800* or
+    manifest-named firmware file) must be owned by a signed Fedora package
+    with a digest matching that package's recorded digest.  A symlink must
+    itself be owned by a Fedora package with a matching target, and resolve
+    inside ROOT to a Fedora-owned file with a matching digest.
+    """
+    root = Path(root)
+    if ownership:
+        index = _recorded_ownership(ownership)
+    else:
+        index = _live_ownership(root)
+    problems = []
+    records = []
+    root_res = root.resolve()
+    for path in aic_root_files(root):
+        rel = path.relative_to(root).as_posix()
+        entry = index.get(rel)
+        if entry is None:
+            problems.append(f"{rel}: owned by no installed package")
+            continue
+        pkg, digest, algo, linkto, is_fedora = entry
+        if not is_fedora:
+            problems.append(f"{rel}: owned by non-Fedora package {pkg}")
+            continue
+        if path.is_symlink():
+            actual_link = os.readlink(path)
+            if not linkto:
+                problems.append(f"{rel}: symlink replaces a non-symlink owned by {pkg}")
+                continue
+            if actual_link != linkto:
+                problems.append(
+                    f"{rel}: symlink owned by {pkg} was modified "
+                    f"(actual -> {actual_link}, package records -> {linkto})"
+                )
+                continue
+            target = _resolve_within(root, path)
+            if target is None:
+                problems.append(f"{rel}: symlink does not resolve inside the image")
+                continue
+            target_rel = target.relative_to(root_res).as_posix()
+            target_entry = index.get(target_rel)
+            if target_entry is None:
+                problems.append(
+                    f"{rel}: symlink target {target_rel} is owned by no package"
+                )
+                continue
+            if not target_entry[4]:
+                problems.append(
+                    f"{rel}: symlink target {target_rel} is owned by "
+                    f"non-Fedora package {target_entry[0]}"
+                )
+                continue
+            problems.extend(_digest_problems(target, rel, target_entry))
+            records.append((pkg, rel, target_entry[1], target_entry[2], linkto))
+            continue
+        if linkto:
+            problems.append(f"{rel}: regular file replaces a symlink owned by {pkg}")
+            continue
+        problems.extend(_digest_problems(path, rel, entry))
+        records.append((pkg, rel, digest, algo, ""))
+    return problems, records
 
 
 def enabled_repo_ids(dirs):
@@ -329,8 +592,12 @@ def repart_initramfs_ok(listing):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("aic-find")
+    p = sub.add_parser("aic-overlay")
+    p.add_argument("overlay", type=Path)
+    p = sub.add_parser("aic-provenance")
     p.add_argument("root", type=Path)
+    p.add_argument("--ownership", type=Path)
+    p.add_argument("--report", type=Path)
     p = sub.add_parser("repart-root")
     p.add_argument("root", type=Path)
     p = sub.add_parser("repart-initramfs-listing")
@@ -345,11 +612,24 @@ def main(argv=None):
     p = sub.add_parser("passwd-sole-root")
     p.add_argument("path", type=Path)
     a = ap.parse_args(argv)
-    if a.cmd == "aic-find":
-        hits = aic_find(a.root)
+    if a.cmd == "aic-overlay":
+        hits = aic_overlay_inputs(a.overlay)
         for hit in hits:
             print(hit)
         return 1 if hits else 0
+    if a.cmd == "aic-provenance":
+        try:
+            problems, records = aic_problems(a.root, a.ownership)
+        except PolicyError as exc:
+            print(f"aic-provenance: {exc}", file=sys.stderr)
+            return 1
+        for problem in problems:
+            print(problem)
+        if a.report:
+            with open(a.report, "w") as fh:
+                for pkg, rel, digest, algo, linkto in records:
+                    fh.write(f"{pkg}\t{rel}\t{digest}\t{algo}\t{linkto}\n")
+        return 1 if problems else 0
     if a.cmd == "repart-root":
         ok, problems = repart_root_ok(a.root)
         for problem in problems:
