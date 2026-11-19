@@ -833,12 +833,12 @@ def _rpm_payload_sha256(records, rel, rpm_path):
     return digest
 
 
-def esp_staged(root, esp_dir, dtb_rpm, overlay=None, dtb_rpm_sha256=None):
+def esp_staged(root, esp_dir, dtb_rpm, *, dtb_rpm_sha256=None):
     """The one ESP admission rule, at build, on the staged tree before mtools.
 
-    Order: the stamps are validated first (a malformed one is refused, never
-    read as "no DTB"); the DTB bytes, the VERSION file and the esp-override
-    presence are bound to the built cubie-a7a-dtb RPM's own file list; the
+    The stamps are validated before staged admission, which runs after the
+    RPM installer. A malformed stamp is never read as "no DTB". The DTB bytes,
+    VERSION file and esp-override are bound to the built RPM's own file list; the
     entry set with types is exactly our build's.  Returns (ok, problems).
     """
     root = Path(root)

@@ -885,17 +885,21 @@ def esp_staged_cases():
         # An extra ESP file is refused.
         write(esp / "efi/fedora/extra.efi", "y")
         ok, problems = policy.esp_staged(root, esp, rpm)
-        assert not ok and any("extra" in p for p in problems), problems
+        assert not ok and problems == ["ESP extra=['efi/fedora/extra.efi']"], problems
         (esp / "efi/fedora/extra.efi").unlink()
         # A DTB not matching the RPM payload is refused.
         (esp / "dtb/allwinner/sun60i-a733-cubie-a7a.dtb").write_bytes(b"tampered")
         ok, problems = policy.esp_staged(root, esp, rpm)
-        assert not ok and any("sha256" in p for p in problems), problems
+        assert not ok and problems == [
+            f"ESP {policy.ESP_DTB} sha256 {sha256_bytes(b'tampered')} is not the packaged DTB's {sha256_bytes(dtb_bytes)}"
+        ], problems
         (esp / "dtb/allwinner/sun60i-a733-cubie-a7a.dtb").write_bytes(dtb_bytes)
         # A VERSION not owned/matching the RPM payload is refused.
         (root / "usr/lib/cubie-a7a/dtb/VERSION").write_text("7\n")
         ok, problems = policy.esp_staged(root, esp, rpm)
-        assert not ok and any("VERSION" in p for p in problems), problems
+        assert not ok and problems == [
+            f"{policy.PKG_DTB_VERSION} differs from the cubie-a7a-dtb RPM payload"
+        ], problems
 
 
 def esp_override_and_root_cases():
@@ -914,20 +918,26 @@ def esp_override_and_root_cases():
         installed_dtb = root / policy.PKG_DTB
         ok, problems = policy.esp_staged(root, plain, rpm)
         assert ok, problems
-        rejected = {}
 
-        def record(label, esp=plain, package=rpm):
+        def refuse(label, path, reason, esp=plain, package=rpm):
             try:
                 passed, errors = policy.esp_staged(root, esp, package)
             except policy.PolicyError as exc:
                 passed, errors = False, [str(exc)]
-            rejected[label] = [] if passed else errors
+            assert not passed and len(errors) == 1, (label, errors)
+            assert str(path) in errors[0] and reason in errors[0], (label, errors)
 
-        record("no ESP", esp=work / "missing")
+        missing = work / "missing"
+        refuse("no ESP", missing, "missing or non-directory ESP", esp=missing)
         version.unlink()
-        record("missing VERSION")
+        refuse("missing VERSION", policy.PKG_DTB_VERSION, "No such file or directory")
         version.write_text("8\n")
-        record("unowned VERSION", package=no_version)
+        refuse(
+            "unowned VERSION",
+            policy.PKG_DTB_VERSION,
+            f"{no_version} does not own",
+            package=no_version,
+        )
         for kind in ("directory", "live symlink", "dangling symlink"):
             if kind == "directory":
                 override.mkdir()
@@ -935,25 +945,72 @@ def esp_override_and_root_cases():
                 override.symlink_to(
                     version if kind == "live symlink" else work / "absent"
                 )
-            record(kind)
+            refuse(
+                kind,
+                policy.PKG_ESP_OVERRIDE,
+                "exists but is not owned by cubie-a7a-dtb",
+            )
             if kind == "directory":
                 override.rmdir()
             else:
                 override.unlink()
         installed_dtb.write_bytes(b"wrong")
-        record("wrong root DTB with no ESP DTB")
+        mismatch = "differs from the cubie-a7a-dtb RPM payload"
+        refuse("wrong root DTB with no ESP DTB", policy.PKG_DTB, mismatch)
         (root / policy.FW_DTB_STAMP).write_text("0\n")
-        record("wrong root DTB with ESP DTB", esp=with_dtb)
+        refuse("wrong root DTB with ESP DTB", policy.PKG_DTB, mismatch, esp=with_dtb)
         installed_dtb.write_bytes(dtb)
         (root / policy.FW_DTB_STAMP).write_text("8\n")
         override.write_bytes(b"wrong")
-        record("malformed owned override", esp=with_dtb, package=forced)
+        refuse(
+            "malformed owned override",
+            policy.PKG_ESP_OVERRIDE,
+            mismatch,
+            esp=with_dtb,
+            package=forced,
+        )
         override.write_bytes(b"")
         ok, problems = policy.esp_staged(root, with_dtb, forced)
         assert ok, problems
-        assert all(
-            rejected.values()
-        ), f"admitted: {', '.join(k for k, v in rejected.items() if not v)}"
+
+
+def esp_selected_rpm_digest_case():
+    with fixture() as work:
+        dtb = b"\xd0\x0d\xfe\xed packaged dtb\n"
+        rpm = _build_test_dtb_rpm(work, dtb)
+        root = work / "root"
+        _esp_staged_root(root, "8\n", fw_stamp="8\n")
+        esp = _esp_fixture_tree(work, dtb, b"", with_dtb=False)
+        args = [
+            sys.executable,
+            "-I",
+            policy.__file__,
+            "esp-staged",
+            str(root),
+            "--esp-dir",
+            str(esp),
+            "--dtb-rpm",
+            str(rpm),
+            "--dtb-rpm-sha256",
+        ]
+        good = subprocess.run(
+            args + [sha256_bytes(rpm.read_bytes())], capture_output=True, text=True
+        )
+        assert good.returncode == 0, good.stderr
+        bad = subprocess.run(args + ["0" * 64], capture_output=True, text=True)
+        assert (
+            bad.returncode == 1
+            and bad.stderr.strip()
+            == f"esp-staged: sha256 mismatch for snapshot RPM: {rpm}"
+        ), f"selected RPM {rpm}: expected digest refusal, got exit {bad.returncode}: {bad.stderr}"
+
+        stamp = root / policy.FW_DTB_STAMP
+        stamp.write_text("invalid\n")
+        bad = subprocess.run(args + ["0" * 64], capture_output=True, text=True)
+        assert (
+            bad.returncode == 1
+            and f"malformed DTB stamp {policy.FW_DTB_STAMP}:" in bad.stderr
+        ), f"{stamp}: expected stamp refusal before RPM digest, got exit {bad.returncode}: {bad.stderr}"
 
 
 def sha256_bytes(data):
@@ -1033,6 +1090,10 @@ def main():
     case(
         "esp-staged: root DTB and override ownership in both branches",
         esp_override_and_root_cases,
+    )
+    case(
+        "esp-staged: the selected DTB RPM digest and admission order",
+        esp_selected_rpm_digest_case,
     )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")
