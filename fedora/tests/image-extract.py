@@ -415,8 +415,9 @@ def test_image_firmware_truncation_and_list_refusal():
         )
         assert ctrl.returncode == 1, (ctrl.returncode, ctrl.stdout, ctrl.stderr)
 
-        # Case 1 (S0-7a): debugfs wrapper truncates ls of /usr/lib/firmware after
-        # `.`, `..`, and `open` (hiding `rtl_nic`), exit 0, banner-only stderr.
+        # Case 1 (S0-7a): debugfs wrapper drops a regular-file row (rtl8125b-2.fw)
+        # from ls -l -p "/usr/lib/firmware/rtl_nic" while KEEPING the trailing
+        # `debugfs: stat` sentinel intact (exit 0, banner-only stderr).
         inject_dbg = work / "inject-dbg.log"
         dbg_wrap = work / "bin-dbg/debugfs"
         dbg_wrap.parent.mkdir()
@@ -429,19 +430,13 @@ def test_image_firmware_truncation_and_list_refusal():
             "args = sys.argv[1:]\n"
             "stdin_bytes = sys.stdin.buffer.read() if not sys.stdin.isatty() else b''\n"
             "res = subprocess.run([real] + args, input=stdin_bytes, capture_output=True)\n"
-            "is_fw_ls = any('ls ' in a and '/usr/lib/firmware\"' in a for a in args) or b'ls -l -p \"/usr/lib/firmware\"' in stdin_bytes\n"
-            "if is_fw_ls and res.returncode == 0:\n"
-            "    kept = []\n"
-            "    for line in res.stdout.splitlines(keepends=True):\n"
-            "        if line.startswith(b'debugfs: ls '):\n"
-            "            kept.append(line)\n"
-            "            continue\n"
-            "        if line.startswith(b'/'):\n"
-            "            if b'/rtl_nic/' in line:\n"
-            "                break\n"
-            "            kept.append(line)\n"
+            "is_rtl_ls = b'ls -l -p \"/usr/lib/firmware/rtl_nic\"' in stdin_bytes\n"
+            "if is_rtl_ls and res.returncode == 0:\n"
+            "    lines = res.stdout.splitlines(keepends=True)\n"
+            "    kept = [ln for ln in lines if b'/rtl8125b-2.fw/' not in ln]\n"
+            "    assert len(kept) < len(lines) and any(ln.startswith(b'debugfs: stat ') for ln in kept)\n"
             "    with log_path.open('a') as fh:\n"
-            "        fh.write(f'injected:fw-debugfs-trunc:args={args!r}\\n')\n"
+            "        fh.write(f'injected:fw-debugfs-drop-reg-keep-sentinel:args={args!r}\\n')\n"
             "    sys.stdout.buffer.write(b''.join(kept))\n"
             "    sys.stderr.buffer.write(res.stderr)\n"
             "    sys.exit(0)\n"
@@ -467,10 +462,10 @@ def test_image_firmware_truncation_and_list_refusal():
         )
         assert (
             inject_dbg.is_file()
-            and "injected:fw-debugfs-trunc:" in inject_dbg.read_text()
+            and "injected:fw-debugfs-drop-reg-keep-sentinel:" in inject_dbg.read_text()
         )
         assert r_dbg.returncode == 2, (
-            f"image-firmware check --image accepted truncated debugfs listing "
+            f"image-firmware check --image accepted debugfs listing with dropped regular file "
             f"(rc={r_dbg.returncode}):\n{r_dbg.stdout}\n{r_dbg.stderr}"
         )
 

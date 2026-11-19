@@ -44,6 +44,8 @@ import json
 import os
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -199,6 +201,23 @@ class Debugfs:
     """Read-only view of an ext4 filesystem inside a disk image."""
 
     _BANNER_RE = re.compile(r"^debugfs [0-9.]+ \([^()]+\)$")
+    _EXT4_INCOMPAT_FILETYPE = 0x0002
+    _EXT4_INCOMPAT_EXTENTS = 0x0040
+    _EXT4_INCOMPAT_INLINE_DATA = 0x8000
+    _EXT4_INCOMPAT_ENCRYPT = 0x10000
+    _EXT4_FL_EXTENTS = 0x80000
+    _EXT4_FL_ENCRYPT = 0x00800
+    _EXT4_FL_INLINE_DATA = 0x10000000
+    _EXT4_FT_CSUM = 0xDE
+    _MODE_TO_FT = {
+        stat.S_IFREG: 1,
+        stat.S_IFDIR: 2,
+        stat.S_IFCHR: 3,
+        stat.S_IFBLK: 4,
+        stat.S_IFIFO: 5,
+        stat.S_IFSOCK: 6,
+        stat.S_IFLNK: 7,
+    }
 
     def __init__(self, image, partition):
         if not shutil.which("debugfs") or not shutil.which("sfdisk"):
@@ -224,9 +243,156 @@ class Debugfs:
             )
             if part is None:
                 raise InputError(f"{image}: no root partition (use --partition)")
-        self.dev = f"{image}?offset={part['start'] * 512}"
+        self.image = image
+        self.part_offset = part["start"] * 512
+        self.part_size = part["size"] * 512
+        self.dev = f"{image}?offset={self.part_offset}"
         self.label = f"{image} partition {parts.index(part) + 1}"
+        self.block_size = self._read_ext4_superblock()
         self.cache = {}
+
+    def _read_ext4_superblock(self):
+        """Pin to mkfs.ext4 extent+filetype ext4 without inline_data or encrypt."""
+        try:
+            with open(self.image, "rb") as fh:
+                fh.seek(self.part_offset + 1024)
+                sb = fh.read(1024)
+        except OSError as exc:
+            raise InputError(
+                f"{self.label}: cannot read ext4 superblock: {exc}"
+            ) from exc
+        if len(sb) != 1024 or struct.unpack_from("<H", sb, 0x38)[0] != 0xEF53:
+            raise InputError(f"{self.label}: not an ext4 filesystem superblock")
+        log_bs = struct.unpack_from("<I", sb, 0x18)[0]
+        if log_bs > 2:
+            raise InputError(
+                f"{self.label}: unsupported ext4 block size (log={log_bs}); "
+                "expected 1024, 2048 or 4096"
+            )
+        block_size = 1024 << log_bs
+        incompat = struct.unpack_from("<I", sb, 0x60)[0]
+        if not (incompat & self._EXT4_INCOMPAT_FILETYPE) or not (
+            incompat & self._EXT4_INCOMPAT_EXTENTS
+        ):
+            raise InputError(
+                f"{self.label}: refused ext4 without filetype+extents (incompat={hex(incompat)})"
+            )
+        if incompat & (self._EXT4_INCOMPAT_INLINE_DATA | self._EXT4_INCOMPAT_ENCRYPT):
+            raise InputError(
+                f"{self.label}: refused ext4 with inline_data or encrypt (incompat={hex(incompat)})"
+            )
+        return block_size
+
+    def _raw_dir_entries(self, stat_ino, stat_text, path):
+        """Independently parse raw ext4 directory blocks from the image file."""
+        m_flags = re.search(r"Flags:\s+0x([0-9a-fA-F]+)", stat_text)
+        m_size = re.search(r"Size:\s+(\d+)", stat_text)
+        if not m_flags or not m_size:
+            raise InputError(
+                f"{self.label}: incomplete debugfs stat for {path} (missing Flags or Size)"
+            )
+        flags = int(m_flags.group(1), 16)
+        size = int(m_size.group(1))
+        if not (flags & self._EXT4_FL_EXTENTS):
+            raise InputError(
+                f"{self.label}: refused non-extent directory {path} (flags={hex(flags)})"
+            )
+        if flags & (self._EXT4_FL_INLINE_DATA | self._EXT4_FL_ENCRYPT):
+            raise InputError(
+                f"{self.label}: refused inline_data or encrypted directory {path} (flags={hex(flags)})"
+            )
+        if size == 0 or size % self.block_size != 0:
+            raise InputError(f"{self.label}: invalid directory size {size} for {path}")
+        m_ext = re.search(r"EXTENTS:\n(.*)", stat_text, re.S)
+        if not m_ext:
+            raise InputError(
+                f"{self.label}: missing EXTENTS in debugfs stat for {path}"
+            )
+        blks = {}
+        for token in m_ext.group(1).replace("\n", " ").split(","):
+            token = token.strip()
+            if not token or token.startswith("(ETB"):
+                continue
+            m = re.fullmatch(r"\((\d+)(?:-(\d+))?\):(\d+)(?:-(\d+))?", token)
+            if not m:
+                raise InputError(
+                    f"{self.label}: unrecognized extent {token!r} in {path}"
+                )
+            l0 = int(m.group(1))
+            l1 = int(m.group(2)) if m.group(2) else l0
+            p0 = int(m.group(3))
+            p1 = int(m.group(4)) if m.group(4) else p0
+            if (l1 - l0) != (p1 - p0):
+                raise InputError(f"{self.label}: mismatched extent {token!r} in {path}")
+            for off in range(l1 - l0 + 1):
+                lidx = l0 + off
+                pidx = p0 + off
+                if lidx in blks or (pidx + 1) * self.block_size > self.part_size:
+                    raise InputError(
+                        f"{self.label}: out-of-range or duplicate extent in {path}"
+                    )
+                blks[lidx] = pidx
+        num_blks = size // self.block_size
+        if len(blks) != num_blks or any(i not in blks for i in range(num_blks)):
+            raise InputError(
+                f"{self.label}: incomplete extent map for {path} "
+                f"(got {len(blks)}, expected {num_blks})"
+            )
+        raw_entries = {}
+        self_seen = False
+        parent_seen = False
+        try:
+            with open(self.image, "rb") as fh:
+                for lidx in range(num_blks):
+                    fh.seek(self.part_offset + blks[lidx] * self.block_size)
+                    buf = fh.read(self.block_size)
+                    if len(buf) != self.block_size:
+                        raise InputError(
+                            f"{self.label}: short read on directory block of {path}"
+                        )
+                    pos = 0
+                    while pos < self.block_size:
+                        if pos + 8 > self.block_size:
+                            raise InputError(
+                                f"{self.label}: corrupt ext4 dir record in {path}"
+                            )
+                        ino, rec_len, name_len, ftype = struct.unpack_from(
+                            "<IHBB", buf, pos
+                        )
+                        if (
+                            rec_len < 8
+                            or rec_len % 4 != 0
+                            or pos + rec_len > self.block_size
+                        ):
+                            raise InputError(
+                                f"{self.label}: corrupt ext4 dir rec_len={rec_len} in {path}"
+                            )
+                        if ino != 0 and name_len > 0 and ftype != self._EXT4_FT_CSUM:
+                            if 8 + name_len > rec_len:
+                                raise InputError(
+                                    f"{self.label}: corrupt ext4 dir name_len in {path}"
+                                )
+                            name = buf[pos + 8 : pos + 8 + name_len].decode(
+                                "utf-8", errors="surrogateescape"
+                            )
+                            if name == ".":
+                                self_seen = ino == stat_ino
+                            elif name == "..":
+                                parent_seen = True
+                            else:
+                                if name in raw_entries:
+                                    raise InputError(
+                                        f"{self.label}: duplicate raw dir entry {name!r} in {path}"
+                                    )
+                                raw_entries[name] = (ino, ftype)
+                        pos += rec_len
+        except OSError as exc:
+            raise InputError(
+                f"{self.label}: cannot read raw directory blocks for {path}: {exc}"
+            ) from exc
+        if not self_seen or not parent_seen:
+            raise InputError(f"{self.label}: raw ext4 directory {path} missing . or ..")
+        return raw_entries
 
     def _stderr_diagnostics(self, stderr):
         lines = [line for line in stderr.splitlines() if line.strip()]
@@ -310,6 +476,7 @@ class Debugfs:
             stat_links = int(m_links.group(1))
 
             entries = {}
+            ls_check = {}
             self_seen = False
             parent_seen = False
             child_dirs = 0
@@ -328,9 +495,16 @@ class Debugfs:
                 if f[5] == "..":
                     parent_seen = True
                     continue
+                child_ino = int(f[1])
                 mode = int(f[2], 8)
                 size = int(f[6]) if f[6].isdigit() else 0
+                ft = self._MODE_TO_FT.get(stat.S_IFMT(mode))
+                if ft is None:
+                    raise InputError(
+                        f"{self.label}: unsupported mode {oct(mode)} for {path}/{f[5]}"
+                    )
                 entries[f[5]] = (mode, size)
+                ls_check[f[5]] = (child_ino, ft)
                 if (mode & 0o170000) == 0o040000:
                     child_dirs += 1
             if not self_seen or not parent_seen:
@@ -341,6 +515,12 @@ class Debugfs:
                 raise InputError(
                     f"{self.label}: incomplete debugfs listing for {path} "
                     f"(saw {child_dirs} subdirs, inode Links={stat_links})"
+                )
+            raw_entries = self._raw_dir_entries(stat_ino, stat_text, path)
+            if ls_check != raw_entries:
+                raise InputError(
+                    f"{self.label}: debugfs listing mismatch for {path} "
+                    f"(ls={len(ls_check)} entries, raw ext4 dir={len(raw_entries)})"
                 )
             self.cache[path] = entries
         return self.cache[path]
