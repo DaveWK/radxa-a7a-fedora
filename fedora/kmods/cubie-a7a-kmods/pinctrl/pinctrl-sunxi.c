@@ -912,13 +912,16 @@ static int sunxi_pmx_request(struct pinctrl_dev *pctldev, unsigned offset)
 	unsigned short bank_offset = bank - pctl->desc->pin_base /
 					    PINS_PER_BANK;
 	struct sunxi_pinctrl_regulator *s_reg = &pctl->regulators[bank_offset];
-	struct regulator *reg = s_reg->regulator;
+	struct regulator *reg;
 	char supply[16];
 	int ret;
 
 	if (WARN_ON_ONCE(bank_offset >= ARRAY_SIZE(pctl->regulators)))
 		return -EINVAL;
 
+	guard(mutex)(&s_reg->lock);
+
+	reg = s_reg->regulator;
 	if (reg) {
 		refcount_inc(&s_reg->refcount);
 		return 0;
@@ -935,7 +938,8 @@ static int sunxi_pmx_request(struct pinctrl_dev *pctldev, unsigned offset)
 	if (ret) {
 		dev_err(pctl->dev,
 			"Couldn't enable bank P%c regulator\n", 'A' + bank);
-		goto out;
+		regulator_put(reg);
+		return ret;
 	}
 
 	sunxi_pinctrl_set_io_bias_cfg(pctl, offset, reg);
@@ -944,11 +948,6 @@ static int sunxi_pmx_request(struct pinctrl_dev *pctldev, unsigned offset)
 	refcount_set(&s_reg->refcount, 1);
 
 	return 0;
-
-out:
-	regulator_put(reg);
-
-	return ret;
 }
 
 static int sunxi_pmx_free(struct pinctrl_dev *pctldev, unsigned offset)
@@ -958,6 +957,8 @@ static int sunxi_pmx_free(struct pinctrl_dev *pctldev, unsigned offset)
 	unsigned short bank_offset = bank - pctl->desc->pin_base /
 					    PINS_PER_BANK;
 	struct sunxi_pinctrl_regulator *s_reg = &pctl->regulators[bank_offset];
+
+	guard(mutex)(&s_reg->lock);
 
 	if (!refcount_dec_and_test(&s_reg->refcount))
 		return 0;
@@ -1610,6 +1611,8 @@ int sunxi_pinctrl_init_with_flags(struct platform_device *pdev,
 	platform_set_drvdata(pdev, pctl);
 
 	raw_spin_lock_init(&pctl->lock);
+	for (i = 0; i < ARRAY_SIZE(pctl->regulators); i++)
+		mutex_init(&pctl->regulators[i].lock);
 
 	pctl->membase = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(pctl->membase))

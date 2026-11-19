@@ -14,6 +14,7 @@
 #define __PINCTRL_SUNXI_H
 
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 
 #define PA_BASE	0
@@ -169,6 +170,8 @@ struct sunxi_pinctrl_group {
 };
 
 struct sunxi_pinctrl_regulator {
+	/* Serialises pin requests and frees of one bank */
+	struct mutex		lock;
 	struct regulator	*regulator;
 	refcount_t		refcount;
 };

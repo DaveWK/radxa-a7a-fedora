@@ -1,6 +1,6 @@
 Name:           cubie-a7a-board-support
 Version:        0.16
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Radxa Cubie A7A support for the stock Fedora kernel
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -160,6 +160,23 @@ fi
 %{_usrsrc}/%{dkms_name}-%{dkms_ver}/
 
 %changelog
+* Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-2
+- pinctrl-sun60i-a733 (built for 7.2 and 7.3 kernels): a mutex per pin bank
+  around the bank supply bookkeeping in sunxi_pmx_request() and
+  sunxi_pmx_free(). The pinctrl core serialises these callbacks per pin,
+  not per bank, so two devices with pins in one bank that probe at the same
+  time could both take the "no supply yet" path: one regulator handle was
+  leaked and the bank's user count restarted at 1. On 2026-11-18 one boot
+  in five of the 6 GB board then logged "refcount_t: underflow;
+  use-after-free" from sunxi_pmx_free when a deferred probe released its
+  pins (bank PF by the register dump; with the device tree of that boot,
+  older than binding stamp 25, mmc0 and the PF4 regulator GPIO have pins
+  there and probe in parallel). No functional change without the race
+- Mainline v7.4-rc3 has the same unlocked code, and on 7.4 kernels the pin
+  controller is the kernel's own, which this package does not replace
+- Checked in a host model of the two functions (fedora/tests) and by a
+  build. Not yet run on a board
+
 * Wed Nov 18 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.16-1
 - Linux 7.4 (Fedora Rawhide, 7.4.0-0.rc3.26.fc46): mainline has the A733
   pin controllers since v7.4-rc1 and Fedora builds them in
