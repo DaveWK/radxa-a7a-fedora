@@ -788,11 +788,11 @@ def _dtb_stamp(root, rel):
 
 
 def _rpm_dump(rpm_path):
-    """{rel (no leading /): (digest_hex, linkto)} from ``rpm -qp --dump``.
+    """{rel (no leading /): (digest_hex, regular)} from ``rpm -qp --dump``.
 
     The RPM's own file list: path size mtime digest mode owner group iscfg isdoc
-    rdev symlink.  Directories are skipped; a symlink carries its target and an
-    empty payload digest.
+    rdev symlink. Keep non-regular entries so callers can distinguish ownership
+    of the wrong entry type from absence.
     """
     r = subprocess.run(
         ["rpm", "-qp", "--dump", str(rpm_path)], capture_output=True, text=True
@@ -808,11 +808,8 @@ def _rpm_dump(rpm_path):
             raise PolicyError(f"{rpm_path}:{number}: malformed rpm --dump row {line!r}")
         rel = parts[0].lstrip("/")
         mode = parts[4]
-        if mode.startswith("04"):
-            continue  # directory
-        linkto = "" if parts[10] == "X" else parts[10]
-        digest = "" if linkto else parts[3].lower()
-        index[rel] = (digest, linkto)
+        regular = stat.S_ISREG(int(mode, 8)) and parts[10] == "X"
+        index[rel] = (parts[3].lower(), regular)
     return index
 
 
@@ -821,8 +818,8 @@ def _rpm_payload_sha256(records, rel, rpm_path):
     entry = records.get(rel)
     if entry is None:
         raise PolicyError(f"{rpm_path} does not own {rel}")
-    digest, linkto = entry
-    if linkto or not SHA256_HEX_RE.fullmatch(digest):
+    digest, regular = entry
+    if not regular or not SHA256_HEX_RE.fullmatch(digest):
         raise PolicyError(f"{rpm_path} records no sha256 for {rel}")
     return digest
 
@@ -837,39 +834,43 @@ def esp_staged(root, esp_dir, dtb_rpm, overlay=None):
     """
     root = Path(root)
     problems = []
+    fw = _dtb_stamp(root, FW_DTB_STAMP)
+    pkg = _dtb_stamp(root, PKG_DTB_VERSION)
     # The passed RPM must be the DTB package.
     q = subprocess.run(
         ["rpm", "-qp", "--qf", "%{NAME}", str(dtb_rpm)], capture_output=True, text=True
     )
     if q.returncode != 0 or q.stdout.strip() != PKG_DTB_PACKAGE:
         return False, [f"{dtb_rpm} is not a {PKG_DTB_PACKAGE} RPM"]
-    fw = _dtb_stamp(root, FW_DTB_STAMP)
     records = _rpm_dump(dtb_rpm)
     pkg_dtb_digest = _rpm_payload_sha256(records, PKG_DTB, dtb_rpm)
-    pkg_version_digest = _rpm_payload_sha256(records, PKG_DTB_VERSION, dtb_rpm)
-    # VERSION in the staged root must be the RPM's own VERSION payload.
-    root_version = root / PKG_DTB_VERSION
-    if root_version.is_symlink() or not root_version.is_file():
-        problems.append(f"{PKG_DTB_VERSION} missing or not a regular file in the root")
-    elif _file_digest(root_version, "sha256") != pkg_version_digest:
-        problems.append(
-            f"{PKG_DTB_VERSION} differs from the {PKG_DTB_PACKAGE} RPM payload"
+
+    def check_root_payload(rel, expected):
+        path = root / rel
+        if path.is_symlink() or not path.is_file():
+            problems.append(f"{rel} missing or not a regular file in the root")
+        elif _file_digest(path, "sha256") != expected:
+            problems.append(f"{rel} differs from the {PKG_DTB_PACKAGE} RPM payload")
+
+    check_root_payload(
+        PKG_DTB_VERSION, _rpm_payload_sha256(records, PKG_DTB_VERSION, dtb_rpm)
+    )
+    check_root_payload(PKG_DTB, pkg_dtb_digest)
+    has_override = PKG_ESP_OVERRIDE in records
+    if has_override:
+        check_root_payload(
+            PKG_ESP_OVERRIDE, _rpm_payload_sha256(records, PKG_ESP_OVERRIDE, dtb_rpm)
         )
-    # The esp-override is a regular file iff the RPM owns that file.
-    root_override = root / PKG_ESP_OVERRIDE
-    ov_entry = records.get(PKG_ESP_OVERRIDE)
-    has_override = ov_entry is not None and ov_entry[1] == ""
-    override_present = root_override.is_file() and not root_override.is_symlink()
-    if has_override != override_present:
+    elif os.path.lexists(root / PKG_ESP_OVERRIDE):
         problems.append(
-            f"{PKG_ESP_OVERRIDE} presence ({override_present}) disagrees with "
-            f"the {PKG_DTB_PACKAGE} RPM ({has_override})"
+            f"{PKG_ESP_OVERRIDE} exists but is not owned by {PKG_DTB_PACKAGE}"
         )
-    pkg = _dtb_stamp(root, PKG_DTB_VERSION)
     expect_dtb = has_override or pkg > fw
 
     entries = {}
     base = Path(esp_dir)
+    if base.is_symlink() or not base.is_dir():
+        return False, problems + [f"missing or non-directory ESP: {base}"]
 
     def on_error(exc):
         raise PolicyError(f"cannot traverse {exc.filename or base}: {exc}") from exc

@@ -784,7 +784,7 @@ def initramfs_unpack_cases():
 # --- RPM-bound ESP admission (build time) -------------------------------------
 
 
-def _build_test_dtb_rpm(work, dtb_bytes, override=False):
+def _build_test_dtb_rpm(work, dtb_bytes, override=False, version=True):
     """A noarch cubie-a7a-dtb RPM owning the DTB, VERSION (8) and (optional) override."""
     rb = work / "rpmbuild-dtb"
     for sub in ("SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS", "tmp"):
@@ -792,6 +792,9 @@ def _build_test_dtb_rpm(work, dtb_bytes, override=False):
     (rb / "SOURCES" / "fake.dtb").write_bytes(dtb_bytes)
     override_line = (
         "touch %{buildroot}/usr/lib/cubie-a7a/dtb/esp-override\n" if override else ""
+    )
+    version_line = (
+        "echo 8 > %{buildroot}/usr/lib/cubie-a7a/dtb/VERSION\n" if version else ""
     )
     spec = rb / "SPECS" / "cubie-a7a-dtb.spec"
     spec.write_text(
@@ -805,11 +808,11 @@ def _build_test_dtb_rpm(work, dtb_bytes, override=False):
         "%install\n"
         "mkdir -p %{buildroot}/usr/lib/cubie-a7a/dtb/allwinner\n"
         "cp %{_sourcedir}/fake.dtb %{buildroot}/usr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb\n"
-        "echo 8 > %{buildroot}/usr/lib/cubie-a7a/dtb/VERSION\n"
+        + version_line
         + override_line
         + "%files\n"
         "/usr/lib/cubie-a7a/dtb/allwinner/sun60i-a733-cubie-a7a.dtb\n"
-        "/usr/lib/cubie-a7a/dtb/VERSION\n"
+        + ("/usr/lib/cubie-a7a/dtb/VERSION\n" if version else "")
         + ("/usr/lib/cubie-a7a/dtb/esp-override\n" if override else "")
     )
     subprocess.run(
@@ -829,10 +832,13 @@ def _build_test_dtb_rpm(work, dtb_bytes, override=False):
     return next((rb / "RPMS").rglob("cubie-a7a-dtb-*.rpm"))
 
 
-def _esp_fixture_tree(root, dtb_bytes, marker):
+def _esp_fixture_tree(root, dtb_bytes, marker, with_dtb=True):
     """Write the expected ESP entries (base + DTB) under root/esp."""
     esp = root / "esp"
-    for d in ("efi/boot", "efi/fedora", "dtb/allwinner"):
+    dirs = ["efi/boot", "efi/fedora"]
+    if with_dtb:
+        dirs.append("dtb/allwinner")
+    for d in dirs:
         (esp / d).mkdir(parents=True)
     for rel in (
         "efi/boot/bootaa64.efi",
@@ -845,17 +851,22 @@ def _esp_fixture_tree(root, dtb_bytes, marker):
         "efi/fedora/shimaa64.efi",
     ):
         write(esp / rel, "x")
-    (esp / "dtb/allwinner/sun60i-a733-cubie-a7a.dtb").write_bytes(dtb_bytes)
-    (esp / "dtb/allwinner/sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb").write_bytes(marker)
+    if with_dtb:
+        (esp / policy.ESP_DTB).write_bytes(dtb_bytes)
+        (esp / policy.ESP_DTB_MARK).write_bytes(marker)
     return esp
 
 
-def _esp_staged_root(root, version, fw_stamp="0\n"):
-    """The staged root portions esp-staged reads: the two stamps and the VERSION."""
+def _esp_staged_root(
+    root, version, fw_stamp="0\n", dtb=b"\xd0\x0d\xfe\xed packaged dtb\n"
+):
+    """The ESP admission inputs in the staged root: two stamps and installed DTB."""
     (root / "var/lib/cubie-a7a").mkdir(parents=True)
     (root / "usr/lib/cubie-a7a/dtb").mkdir(parents=True)
     (root / "var/lib/cubie-a7a/firmware-dtb-version").write_text(fw_stamp)
     (root / "usr/lib/cubie-a7a/dtb/VERSION").write_text(version)
+    (root / policy.PKG_DTB).parent.mkdir()
+    (root / policy.PKG_DTB).write_bytes(dtb)
 
 
 def esp_staged_cases():
@@ -885,6 +896,64 @@ def esp_staged_cases():
         (root / "usr/lib/cubie-a7a/dtb/VERSION").write_text("7\n")
         ok, problems = policy.esp_staged(root, esp, rpm)
         assert not ok and any("VERSION" in p for p in problems), problems
+
+
+def esp_override_and_root_cases():
+    with fixture() as work:
+        dtb = b"\xd0\x0d\xfe\xed packaged dtb\n"
+        marker = (sha256_bytes(dtb) + "\n").encode()
+        rpm = _build_test_dtb_rpm(work / "unforced", dtb)
+        forced = _build_test_dtb_rpm(work / "forced", dtb, override=True)
+        no_version = _build_test_dtb_rpm(work / "no-version", dtb, version=False)
+        root = work / "root"
+        _esp_staged_root(root, "8\n", fw_stamp="8\n")
+        plain = _esp_fixture_tree(work / "plain", dtb, marker, with_dtb=False)
+        with_dtb = _esp_fixture_tree(work / "with-dtb", dtb, marker)
+        version = root / policy.PKG_DTB_VERSION
+        override = root / policy.PKG_ESP_OVERRIDE
+        installed_dtb = root / policy.PKG_DTB
+        ok, problems = policy.esp_staged(root, plain, rpm)
+        assert ok, problems
+        rejected = {}
+
+        def record(label, esp=plain, package=rpm):
+            try:
+                passed, errors = policy.esp_staged(root, esp, package)
+            except policy.PolicyError as exc:
+                passed, errors = False, [str(exc)]
+            rejected[label] = [] if passed else errors
+
+        record("no ESP", esp=work / "missing")
+        version.unlink()
+        record("missing VERSION")
+        version.write_text("8\n")
+        record("unowned VERSION", package=no_version)
+        for kind in ("directory", "live symlink", "dangling symlink"):
+            if kind == "directory":
+                override.mkdir()
+            else:
+                override.symlink_to(
+                    version if kind == "live symlink" else work / "absent"
+                )
+            record(kind)
+            if kind == "directory":
+                override.rmdir()
+            else:
+                override.unlink()
+        installed_dtb.write_bytes(b"wrong")
+        record("wrong root DTB with no ESP DTB")
+        (root / policy.FW_DTB_STAMP).write_text("0\n")
+        record("wrong root DTB with ESP DTB", esp=with_dtb)
+        installed_dtb.write_bytes(dtb)
+        (root / policy.FW_DTB_STAMP).write_text("8\n")
+        override.write_bytes(b"wrong")
+        record("malformed owned override", esp=with_dtb, package=forced)
+        override.write_bytes(b"")
+        ok, problems = policy.esp_staged(root, with_dtb, forced)
+        assert ok, problems
+        assert all(
+            rejected.values()
+        ), f"admitted: {', '.join(k for k, v in rejected.items() if not v)}"
 
 
 def sha256_bytes(data):
@@ -961,6 +1030,10 @@ def main():
         initramfs_unpack_cases,
     )
     case("esp-staged: the RPM-bound ESP admission (green/red)", esp_staged_cases)
+    case(
+        "esp-staged: root DTB and override ownership in both branches",
+        esp_override_and_root_cases,
+    )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")
         return 1
