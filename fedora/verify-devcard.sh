@@ -13,6 +13,11 @@ IMG=${1:?usage: verify-devcard.sh IMAGE MANIFEST --expect-manifest-sha256 HEX [-
 MANIFEST=${2:?missing manifest}
 shift 2
 verify_args=("$@")
+# Refuse ambiguous legacy configuration instead of dropping a firmware request.
+if [[ ${FW-none} != none ]]; then
+    echo "verify-devcard: legacy FW is unsupported; pass --firmware FILE explicitly" >&2
+    exit 2
+fi
 if [[ -v MAIN_BIN ]]; then
     for arg in "$@"; do
         case $arg in

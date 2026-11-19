@@ -785,7 +785,8 @@ def _args_profile(args):
 
 
 def receipt_payload(args):
-    # Source/run/profile name the build inputs; they are not recovered from the image.
+    # Source means the image-builder commit, not the builder of the consumed RPMs.
+    # Source/run/profile are build inputs, not recovered from the image.
     matches(args.source_commit, re.compile(r"[0-9a-f]{40}"), "source_commit")
     matches(args.run_id, re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*"), "run_id")
     raw = read_regular(args.manifest, "manifest")
@@ -881,6 +882,12 @@ def check_receipt(raw, expected):
     fields(actual, " ".join(expected), "receipt")
     if not integer(actual["schema"]):
         raise ManifestError("receipt.schema: expected an integer")
+    firmware = actual["firmware"]
+    if firmware is not None:
+        fields(firmware, "seek_lba size sha256", "receipt.firmware")
+        for key in ("seek_lba", "size"):
+            if not integer(firmware[key]):
+                raise ManifestError(f"receipt.firmware.{key}: expected an integer")
     for name in expected:
         _compare(f"receipt.{name}", expected[name], actual[name])
 

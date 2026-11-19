@@ -42,9 +42,10 @@
 #              whose kernel changes daily; Fedora 45 follows updates.
 #   EXTRA_PACKAGES="a b"   more Fedora packages by name or NEVRA (no paths/globs)
 #   BOOT_MODES=protective  three GRUB entries per kernel (fedora/bootmodes/):
-#     default: root read-only under a RAM overlay, HAT stack off, nothing
-#              on the card written (/etc/kernel/cmdline carries it, so
-#              kernel updates keep it); "~maintenance": rw, HAT off;
+#     default: read-only root under a RAM overlay, journal replay disabled,
+#              HAT stack off. This is not independent write/discard protection.
+#              /etc/kernel/cmdline keeps the options across kernel updates.
+#              "~maintenance": rw, HAT off;
 #              "~full": rw, HAT on. Root growth (systemd-repart + growfs)
 #              is masked on the default entry and happens on the first
 #              maintenance boot. cubie-a7a-bootmode selects a one-shot entry
@@ -53,10 +54,9 @@
 #              one-shot maintenance boot (grubenv next_entry), so the
 #              machine-id and SSH host keys are written once to the card;
 #              every later boot is the protective default.
-#   GROW_ROOT=no  the root is never grown, on any entry: no
+#   GROW_ROOT=no  disable the normal root-growth path on every entry: no
 #              /etc/repart.d config, no x-systemd.growfs, systemd-repart and
-#              systemd-growfs-root masked in /etc/systemd/system (for cards
-#              that must not be written beyond the image).
+#              systemd-growfs-root masked in /etc/systemd/system.
 #   ROOT_MIN_MIB=N  root filesystem at least N MiB (default: content + 30 %
 #              + 512 MiB), e.g. room for package installs when GROW_ROOT=no.
 #
@@ -123,14 +123,16 @@ if [ "$(uname -m)" != aarch64 ]; then
     grep -q '^flags: .*F' /proc/sys/fs/binfmt_misc/qemu-aarch64 || die "qemu-aarch64 binfmt needs the F (fix-binary) flag"
 fi
 build_source() {
-    local source untracked
+    local toplevel source untracked
+    toplevel=$(git --no-optional-locks -C "$TOP" rev-parse --show-toplevel) || return 1
+    [ "$toplevel" = "$TOP" ] || return 1
     source=$(git --no-optional-locks -C "$TOP" rev-parse --verify 'HEAD^{commit}') || return 1
     git --no-optional-locks -C "$TOP" diff --quiet "$source" -- fedora/ || return 1
     untracked=$(git --no-optional-locks -C "$TOP" ls-files --others --exclude-standard -- fedora/) || return 1
     [ -z "$untracked" ] || return 1
     printf '%s\n' "$source"
 }
-BUILD_SOURCE=$(build_source) || die "build requires an identifiable clean Fedora source checkout"
+BUILD_SOURCE=$(build_source) || die "TOP must be the root of a clean Fedora image-builder checkout"
 DRAM_FIRMWARE_IDENTITY=${DRAM_FIRMWARE_IDENTITY:-}
 firmware_args=()
 if [ "$FIRMWARE" = none ]; then

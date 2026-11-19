@@ -209,6 +209,7 @@ def manifest_roundtrip():
         }
         env = os.environ.copy()
         env.pop("MAIN_BIN", None)
+        env["FW"] = "none"
         require(
             run(
                 img, manifest, "--expect-manifest-sha256", expected, shell=True, env=env
@@ -216,6 +217,18 @@ def manifest_roundtrip():
             0,
         )
         require(run(img, manifest, shell=True, env=env), 2, "--expect-manifest-sha256")
+        require(
+            run(
+                img,
+                manifest,
+                "--expect-manifest-sha256",
+                expected,
+                shell=True,
+                env={**env, "FW": "/missing/file"},
+            ),
+            2,
+            "legacy FW is unsupported; pass --firmware FILE explicitly",
+        )
         require(
             run(
                 "verify",
@@ -491,6 +504,68 @@ def firmware_binding():
         )
 
 
+def receipt_integer_types():
+    expected = {
+        "schema": 1,
+        "firmware": {"seek_lba": 256, "size": 32, "sha256": "0" * 64},
+    }
+    API["check_receipt"](json.dumps(expected), expected)
+    for key in ("seek_lba", "size"):
+        actual = json.loads(json.dumps(expected))
+        actual["firmware"][key] = float(actual["firmware"][key])
+        try:
+            API["check_receipt"](json.dumps(actual), expected)
+        except API["ManifestError"] as exc:
+            assert f"receipt.firmware.{key}: expected an integer" in str(exc), exc
+        else:
+            raise AssertionError(f"receipt accepted a float in {key}")
+
+
+def source_checkout_boundary():
+    source = (MANIFEST_PY.parent / "mkdevcard.sh").read_text()
+    start = source.index("build_source() {\n")
+    end = source.index("\nBUILD_SOURCE=", start)
+    shell = f"set -euo pipefail\nTOP=$1\n{source[start:end]}\nbuild_source\n"
+    with fixture() as tmp:
+        own = tmp / "enclosing"
+        export = own / "source-export"
+        for folder in (own, export):
+            path = folder / "fedora" / "build-input"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n")
+        sudo_free("git", "init", "-q", own)
+        sudo_free("git", "-C", own, "add", "--", "fedora", "source-export")
+        sudo_free(
+            "git",
+            "-C",
+            own,
+            "-c",
+            "user.name=DaveWK",
+            "-c",
+            "user.email=13626476+DaveWK@users.noreply.github.com",
+            "commit",
+            "-qm",
+            "Synthetic enclosing checkout",
+            "--",
+            "fedora",
+            "source-export",
+        )
+        for path, expected in ((own, 0), (export, 1)):
+            result = subprocess.run(
+                ["bash", "-s", "--", path], input=shell, text=True, capture_output=True
+            )
+            require(result, expected)
+            if expected == 0:
+                assert (
+                    result.stdout.strip()
+                    == sudo_free("git", "-C", own, "rev-parse", "HEAD")
+                    .stdout.decode()
+                    .strip()
+                )
+            else:
+                assert not result.stdout
+
+
 def main():
     case(
         "manifest and CLI: roundtrip, mandatory pin/scratch/tools, FAT",
@@ -505,6 +580,13 @@ def main():
         receipt_bindings,
     )
     case("firmware: seek, required requested files and embedded main", firmware_binding)
+    case(
+        "receipt: firmware integer fields reject matching floats", receipt_integer_types
+    )
+    case(
+        "receipt: builder root excludes a source export in an enclosing Git repo",
+        source_checkout_boundary,
+    )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")
         return 1
