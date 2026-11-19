@@ -32,7 +32,12 @@ if [ "$FWREPO" != none ] && [ ! -f "$FWREPO/tools/a7a-fwlog/a7a-fwlog.c" ]; then
     echo "build-rpms: $FWREPO is missing (FWREPO=none skips cubie-a7a-fwlog)" >&2
     exit 1
 fi
-OUT=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
+publish=${1:-$TOP/build/fedora/rpmbuild$RELEASE_SUFFIX}
+mkdir -p "$publish/tmp"
+publish=$(realpath "$publish")
+# A fresh topdir isolates both specs and binary outputs from earlier builds.
+OUT=$(mktemp -d "$publish/tmp/build-rpms.XXXXXXXX")
+trap 'rm -rf "$OUT"' EXIT
 mkdir -p "$OUT"/{SOURCES,SPECS,SRPMS,RPMS,BUILD,tmp}
 
 ver() { sed -n 's/^Version:[[:space:]]*//p' "$1"; }
@@ -52,7 +57,6 @@ spec=$TOP/fedora/rpm/cubie-a7a-board-support/cubie-a7a-board-support.spec
 v=$(ver "$spec")
 # Under the output directory, not /tmp (a RAM tmpfs on the build hosts).
 stage=$(mktemp -d -p "$OUT/tmp")
-trap 'rm -rf "$stage"' EXIT
 # dkms.conf keeps PACKAGE_VERSION="@VERSION@": the spec sets it to the
 # package's version-release, so every package build is a new DKMS version.
 cp -a "$TOP/fedora/kmods/cubie-a7a-kmods" "$stage/cubie-a7a-kmods-$v"
@@ -129,20 +133,21 @@ for s in "$OUT"/SPECS/*.spec; do
         *cubie-a7a-aic8800-usb.spec)
             # The built RPM must carry only the reviewed driver inputs and
             # listed package outputs: no firmware, nothing unlisted.
-            rpm_file=$(find "$OUT/RPMS" -name 'cubie-a7a-aic8800-usb-*.rpm' -print -quit)
-            [ -n "$rpm_file" ] || {
-                echo "build-rpms: $s built no cubie-a7a-aic8800-usb RPM" >&2
+            shopt -s nullglob
+            rpms=("$OUT"/RPMS/*/cubie-a7a-aic8800-usb-*.rpm)
+            if ((${#rpms[@]} != 1)); then
+                echo "build-rpms: expected one current AIC8800 binary RPM" >&2
                 exit 1
-            }
-            python3 -I "$TOP/fedora/stage-aic8800.py" payload "$rpm_file" \
-                --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list" ||
-                {
-                    echo "build-rpms: cubie-a7a-aic8800-usb RPM payload check failed" >&2
-                    exit 1
-                }
+            fi
+            python3 -I "$TOP/fedora/stage-aic8800.py" payload "${rpms[0]}" \
+                --list "$TOP/fedora/rpm/cubie-a7a-aic8800-usb/driver-inputs.list"
             ;;
         esac
         ;;
     esac
 done
-find "$OUT/SRPMS" "$OUT/RPMS" -name '*.rpm' -printf '%p\n'
+# Preserve the consumer layout, publishing only after checking this run.
+cp -a "$OUT"/{SPECS,SOURCES,RPMS,SRPMS} "$publish/"
+while IFS= read -r -d '' rpm_file; do
+    printf '%s/%s\n' "$publish" "${rpm_file#"$OUT"/}"
+done < <(find "$OUT/SRPMS" "$OUT/RPMS" -name '*.rpm' -print0)

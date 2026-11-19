@@ -12,6 +12,7 @@ Run: python3 -I fedora/tests/aic-staging.py
 
 import hashlib
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -307,6 +308,122 @@ def test_real_rpmbuild_from_fixture():
         assert stage_aic.payload(rpms[0], list_path) == 0
 
 
+def _fixture_repo_copy(root, src):
+    """Copy fedora/ into ROOT/repo/fedora with fixture driver-inputs.list."""
+    repo_fed = root / "repo/fedora"
+    shutil.copytree(
+        repo_fedora,
+        repo_fed,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    list_dst = repo_fed / "rpm/cubie-a7a-aic8800-usb/driver-inputs.list"
+    shutil.copy2(fixture_list(root, src), list_dst)
+    return repo_fed
+
+
+def test_build_rpms_reused_dir_older_rpm_does_not_satisfy_check():
+    """A reused output directory holding an older clean matching RPM must not
+    satisfy the payload check when the current build writes a bad RPM."""
+    if not shutil.which("rpmbuild"):
+        return
+    with tempfile.TemporaryDirectory(prefix="a7a-build-reused-") as td:
+        root = Path(td)
+        src = fixture_src(root)
+        repo_fed = _fixture_repo_copy(root, src)
+        spec_path = repo_fed / "rpm/cubie-a7a-aic8800-usb/cubie-a7a-aic8800-usb.spec"
+        orig_spec = spec_path.read_text()
+        out = root / "out"
+
+        # Step 1: build an older clean RPM (Release: 1%{?dist}) into OUT.
+        spec_v1 = orig_spec.replace(
+            "Release:        2%{?dist}", "Release:        1%{?dist}"
+        )
+        assert spec_v1 != orig_spec
+        spec_path.write_text(spec_v1)
+        env = os.environ.copy()
+        env["AIC8800_SRC"] = str(src)
+        r1 = subprocess.run(
+            ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r1.returncode == 0, f"v1 build failed:\n{r1.stdout}\n{r1.stderr}"
+        v1_rpms = list((out / "RPMS").rglob("cubie-a7a-aic8800-usb-0.4-1.*.rpm"))
+        assert len(v1_rpms) == 1, v1_rpms
+
+        # A successful build subprocess which produced no *current* binary
+        # cannot be certified using an old file. Deliberately suppress this
+        # single output; use the real builder for every other operation.
+        wrapper = root / "bin/rpmbuild"
+        wrapper.parent.mkdir()
+        real = shutil.which("rpmbuild")
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            'if [[ " ${*} " == *" -bb "* && "${!#}" == */cubie-a7a-aic8800-usb.spec ]]; then exit 0; fi\n'
+            f'exec "{real}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        env["PATH"] = f"{wrapper.parent}:{env['PATH']}"
+        spec_path.write_text(orig_spec)
+        r2 = subprocess.run(
+            ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            r2.returncode != 0
+        ), "an old clean RPM satisfied the check without a current build output"
+        assert "expected one current" in r2.stderr, r2.stderr
+
+
+def test_build_rpms_stale_spec_not_rebuilt_when_skipped():
+    """A stale spec left in a reused OUT/SPECS must not rebuild after staging
+    was skipped (AIC8800_SRC unset)."""
+    if not shutil.which("rpmbuild"):
+        return
+    with tempfile.TemporaryDirectory(prefix="a7a-build-stale-") as td:
+        root = Path(td)
+        src = fixture_src(root)
+        repo_fed = _fixture_repo_copy(root, src)
+        out = root / "out"
+
+        # Step 1: build with AIC8800_SRC so OUT/SPECS and OUT/SOURCES hold AIC files.
+        env_with = os.environ.copy()
+        env_with["AIC8800_SRC"] = str(src)
+        r1 = subprocess.run(
+            ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+            env=env_with,
+            capture_output=True,
+            text=True,
+        )
+        assert r1.returncode == 0, f"initial build failed:\n{r1.stdout}\n{r1.stderr}"
+        # Remove the AIC RPMs from OUT/RPMS and OUT/SRPMS, leaving stale SPECS + SOURCES.
+        for p in list((out / "RPMS").rglob("cubie-a7a-aic8800-usb-*.rpm")) + list(
+            (out / "SRPMS").rglob("cubie-a7a-aic8800-usb-*.rpm")
+        ):
+            p.unlink()
+        assert (out / "SPECS/cubie-a7a-aic8800-usb.spec").is_file()
+
+        # Step 2: run without AIC8800_SRC; staging is skipped so AIC must NOT rebuild.
+        env_without = os.environ.copy()
+        env_without.pop("AIC8800_SRC", None)
+        r2 = subprocess.run(
+            ["bash", str(repo_fed / "build-rpms.sh"), str(out)],
+            env=env_without,
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            r2.returncode == 0
+        ), f"skipped-AIC build failed:\n{r2.stdout}\n{r2.stderr}"
+        rebuilt = list((out / "RPMS").rglob("cubie-a7a-aic8800-usb-*.rpm")) + list(
+            (out / "SRPMS").rglob("cubie-a7a-aic8800-usb-*.rpm")
+        )
+        assert rebuilt == [], f"stale AIC spec was rebuilt after skip: {rebuilt}"
+
+
 def main():
     case("stage: copies only the listed inputs", test_stage_copies_only_listed_inputs)
     case("stage: refuses firmware in the source", test_stage_refuses_firmware_in_source)
@@ -326,6 +443,14 @@ def main():
     case("payload: rejects firmware", test_payload_rejects_firmware)
     case("payload: rejects an unlisted output", test_payload_rejects_unlisted_output)
     case("rpmbuild: fixture RPM passes payload check", test_real_rpmbuild_from_fixture)
+    case(
+        "build-rpms: reused OUT with older clean RPM does not hide bad build",
+        test_build_rpms_reused_dir_older_rpm_does_not_satisfy_check,
+    )
+    case(
+        "build-rpms: stale spec not rebuilt after AIC staging skipped",
+        test_build_rpms_stale_spec_not_rebuilt_when_skipped,
+    )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")
         return 1
