@@ -134,6 +134,14 @@ build_source() {
     printf '%s\n' "$source"
 }
 BUILD_SOURCE=$(build_source) || die "TOP must be the root of a clean Fedora image-builder checkout"
+# Keep the outputs of earlier builds; each build receives fresh owned paths.
+python3 -I - "$TOP" "$W" "$OUT" <<'PATHS'
+from pathlib import Path
+import sys
+base=Path(sys.argv[1]).resolve()/'build'
+for value in sys.argv[2:]:
+ p=Path(value).resolve();assert p.is_relative_to(base) and not p.exists(), 'fresh owned build/output path required'
+PATHS
 DRAM_FIRMWARE_IDENTITY=${DRAM_FIRMWARE_IDENTITY:-}
 firmware_args=()
 if [ "$FIRMWARE" = none ]; then
@@ -151,10 +159,16 @@ else
     if ! [[ $SEEK =~ ^[1-9][0-9]{0,4}$ ]] || ((SEEK < 256 || SEEK >= 32768)); then
         die "firmware seek must be in the reserved LBA gap"
     fi
-    FW_SIZE=$(stat -Lc %s -- "$FIRMWARE")
+    # Stage 1 creates W/root later; claim W now for this run's private copy.
+    mkdir -p -- "$(dirname -- "$W")"
+    mkdir -m 700 -- "$W"
+    FW_SNAPSHOT=$(mktemp -- "$W/firmware.XXXXXXXX")
+    cat -- "$FIRMWARE" >"$FW_SNAPSHOT"
+    FW_SIZE=$(stat -Lc %s -- "$FW_SNAPSHOT")
+    ((FW_SIZE > 0)) || die "empty or missing firmware: $FIRMWARE"
     FW_END=$((SEEK * 512 + FW_SIZE))
     ((FW_END <= 16 * 1024 * 1024)) || die "firmware ends at $FW_END, inside the first partition"
-    FW_SHA=$(sha256sum <"$FIRMWARE")
+    FW_SHA=$(sha256sum <"$FW_SNAPSHOT")
     firmware_args=(--firmware-sha256 "${FW_SHA%% *}" --firmware-seek "$SEEK" --firmware-size "$FW_SIZE")
 fi
 # Read the run's snapshot once and retain the records through image sealing.
@@ -277,14 +291,6 @@ PACKAGES=(
 )
 EXCLUDES=(cockpit\* initial-setup\* cloud-init dracut-config-rescue)
 
-# Keep the outputs of earlier builds; each build receives fresh owned paths.
-python3 -I - "$TOP" "$W" "$OUT" <<'PATHS'
-from pathlib import Path
-import sys
-base=Path(sys.argv[1]).resolve()/'build'
-for value in sys.argv[2:]:
- p=Path(value).resolve();assert p.is_relative_to(base) and not p.exists(), 'fresh owned build/output path required'
-PATHS
 mkdir -p "$W/root" "$(dirname "$OUT")"
 ROOT=$W/root
 
@@ -735,8 +741,12 @@ EOF
 dd if="$W/esp.img" of="$OUT" bs=1M seek=16 conv=notrunc,sparse status=none
 dd if="$W/root.img" of="$OUT" bs=512 seek=$ROOT_START conv=notrunc,sparse status=none
 if [ -n "$FIRMWARE" ]; then
-    dd if="$FIRMWARE" of="$OUT" bs=512 seek="$SEEK" conv=notrunc status=none
-    cmp -n "$FW_SIZE" -i 0:$((SEEK * 512)) "$FIRMWARE" "$OUT" || die "firmware readback"
+    [ "$(stat -Lc %s -- "$FW_SNAPSHOT")" = "$FW_SIZE" ] || die "firmware snapshot size changed"
+    dd if="$FW_SNAPSHOT" of="$OUT" bs=512 iflag=count_bytes count="$FW_SIZE" seek="$SEEK" conv=notrunc status=none
+    FW_DISK_SHA=$(dd if="$OUT" bs=64K iflag=skip_bytes,count_bytes skip=$((SEEK * 512)) count="$FW_SIZE" status=none | sha256sum)
+    [ "${FW_DISK_SHA%% *}" = "${FW_SHA%% *}" ] || die "firmware digest on disk"
+    cmp -n "$FW_SIZE" -i 0:$((SEEK * 512)) "$FW_SNAPSHOT" "$OUT" || die "firmware readback"
+    cmp -n $((ESP_START * 512 - FW_END)) -i "$FW_END":0 "$OUT" /dev/zero || die "firmware gap tail not zero"
 else
     # The firmware gap (LBA 256-32767) must be zero.
     cmp -n $((ESP_START * 512 - 256 * 512)) -i $((256 * 512)):0 "$OUT" /dev/zero || die "firmware gap not zero"
