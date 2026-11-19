@@ -56,13 +56,53 @@ for line in open(sys.argv[1]):
 PY
 }
 
+# The manifest must exist, be readable, non-empty and well-formed: every
+# entry needs name, numeric size, 64-hex sha256 and role (required|optional),
+# with at least one required entry.  Anything else is an error, never an
+# "installed 0/0" status.
+check_manifest() {
+    [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing or unreadable"
+    [ -n "$(entries)" ] || die "manifest $MANIFEST has no entries"
+    python3 -I - "$MANIFEST" <<'PY' || exit 1
+import re
+import sys
+
+required = 0
+problems = []
+for number, line in enumerate(open(sys.argv[1]), 1):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    parts = stripped.split()
+    if len(parts) < 4:
+        problems.append(f"line {number}: need 'name size sha256 role'")
+        continue
+    if not re.fullmatch(r"[0-9]+", parts[1]):
+        problems.append(f"line {number}: bad size {parts[1]!r}")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", parts[2]):
+        problems.append(f"line {number}: bad sha256 {parts[2]!r}")
+    if parts[3] not in ("required", "optional"):
+        problems.append(f"line {number}: bad role {parts[3]!r}")
+    elif parts[3] == "required":
+        required += 1
+if not required:
+    problems.append("no entry has role 'required'")
+if problems:
+    sys.stderr.write("cubie-a7a-wifi-firmware: manifest %s: %s\n" % (sys.argv[1], "; ".join(problems)))
+    sys.exit(1)
+PY
+}
+
 # The first required file's name (the source-directory probe).
 first_required() {
     [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing"
     python3 -I - "$MANIFEST" <<'PY'
 import sys
 for line in open(sys.argv[1]):
-    parts = line.split()
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    parts = stripped.split()
     if len(parts) >= 4 and parts[3] == "required":
         print(parts[0])
         break
@@ -150,6 +190,7 @@ sdio_build() {
 
 cmd_status() {
     local name size sha role f got req=0 req_ok=0 bad=0 lf_ok=0 lf_files=0 sdio=0
+    check_manifest
     chip_status
     echo "override: $FWDIR"
     while read -r name size sha role; do
@@ -194,6 +235,7 @@ cmd_status() {
         fi
     done < <(entries)
     links_status
+    [ "$req" -gt 0 ] || die "manifest $MANIFEST has no required entries"
     if [ "$bad" = 1 ]; then
         echo "result:   a file does not match the manifest; run 'cubie-a7a-wifi-firmware remove' and install again"
         return 4
@@ -352,7 +394,7 @@ case $cmd in
     exit 0
     ;;
 esac
-[ -r "$MANIFEST" ] && [ -n "$(entries)" ] || die "manifest $MANIFEST missing or empty"
+check_manifest
 case $cmd in
 status)
     [ $# = 0 ] || {

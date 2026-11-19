@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Host tests for cubie-a7a-wifi-firmware's manifest handling: an empty,
+# missing, unreadable or malformed manifest is an error, never an
+# "installed 0/0" status, and first_required() must skip comments.
+# Run: bash fedora/tests/wifi-firmware-manifest.sh
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+pkg_dir=$here/../rpm/cubie-a7a-aic8800-usb
+script=$pkg_dir/cubie-a7a-wifi-firmware
+real_manifest=$pkg_dir/aic8800-d80-usb.manifest
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+
+ok() {
+    pass=$((pass + 1))
+    echo "ok   $*"
+}
+
+bad() {
+    fail=$((fail + 1))
+    echo "FAIL $*"
+}
+
+status_with() { # MANIFEST
+    env CUBIE_A7A_WIFI_MANIFEST="$1" \
+        CUBIE_A7A_WIFI_FWDIR="$tmp/fw" \
+        CUBIE_A7A_LINUX_FWDIR="$tmp/lf" \
+        CUBIE_A7A_SYSFS="$tmp/sysfs" \
+        "$script" status 2>&1
+}
+
+expect_manifest_error() { # NAME MANIFEST EXPECTED-SUBSTRING
+    local name=$1 manifest=$2 want=$3 out rc
+    out=$(status_with "$manifest")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        bad "$name: exited 0"
+        return
+    fi
+    case $out in
+    *"installed (0/0"* | *"installed 0/0"*)
+        bad "$name: reported installed 0/0"
+        return
+        ;;
+    esac
+    case $out in
+    *"$want"*) ok "$name" ;;
+    *) bad "$name: message lacks '$want': $out" ;;
+    esac
+}
+
+mkdir -p "$tmp/sysfs"
+sha_a=$(printf 'a%.0s' {1..64})
+sha_b=$(printf 'b%.0s' {1..64})
+sha_c=$(printf 'c%.0s' {1..64})
+
+# Missing manifest.
+expect_manifest_error "missing manifest" "$tmp/nope.manifest" "missing or unreadable"
+
+# Empty manifest.
+: >"$tmp/empty.manifest"
+expect_manifest_error "empty manifest" "$tmp/empty.manifest" "has no entries"
+
+# Comments-only manifest.
+printf '# only a comment\n   # another comment\n' >"$tmp/comments-only.manifest"
+expect_manifest_error "comments-only manifest" "$tmp/comments-only.manifest" "has no entries"
+
+# Unreadable manifest.
+printf 'a.bin 1 %s required\n' "$sha_a" >"$tmp/unreadable.manifest"
+chmod 000 "$tmp/unreadable.manifest"
+if [ "$(id -u)" = 0 ]; then
+    ok "unreadable manifest: skipped (running as root)"
+else
+    expect_manifest_error "unreadable manifest" "$tmp/unreadable.manifest" "missing or unreadable"
+fi
+chmod 644 "$tmp/unreadable.manifest"
+
+# Malformed entries: too few fields, bad size, bad sha256, bad role.
+printf 'fw_patch_table_8800d80_u02.bin\n' >"$tmp/malformed-cols.manifest"
+expect_manifest_error "malformed manifest (few fields)" "$tmp/malformed-cols.manifest" "name size sha256 role"
+
+printf 'a.bin notanumber %s required\n' "$sha_a" >"$tmp/malformed-size.manifest"
+expect_manifest_error "malformed manifest (bad size)" "$tmp/malformed-size.manifest" "bad size"
+
+printf 'a.bin 1 not-a-sha256 required\n' >"$tmp/malformed-sha.manifest"
+expect_manifest_error "malformed manifest (bad sha256)" "$tmp/malformed-sha.manifest" "bad sha256"
+
+printf 'a.bin 1 %s bogus\n' "$sha_a" >"$tmp/malformed-role.manifest"
+expect_manifest_error "malformed manifest (bad role)" "$tmp/malformed-role.manifest" "bad role"
+
+# No required entry (only optional).
+printf 'a.bin 1 %s optional\nb.bin 1 %s optional\n' "$sha_a" "$sha_b" >"$tmp/no-required.manifest"
+expect_manifest_error "manifest without a required entry" "$tmp/no-required.manifest" "required"
+
+# Valid manifest (and the real package manifest) with absent files: reports
+# missing firmware, never a manifest error and never installed 0/0.
+for pair in "fixture:$tmp/good.manifest" "packaged:$real_manifest"; do
+    label=${pair%%:*}
+    mpath=${pair#*:}
+    if [ "$label" = fixture ]; then
+        printf 'real.bin 3 %s required\n' "$sha_a" >"$mpath"
+    fi
+    out=$(status_with "$mpath")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        bad "$label manifest: status unexpectedly succeeded"
+    elif [[ $out == *"manifest "* || $out == *"installed (0/0"* ]]; then
+        bad "$label manifest: reported manifest error or 0/0: $out"
+    elif [[ $out == *"firmware not installed"* ]]; then
+        ok "$label manifest with absent required files reports firmware not installed"
+    else
+        bad "$label manifest: unexpected output: $out"
+    fi
+done
+
+# first_required() skips a comment line that has 4 tokens with token 4 == required
+# (e.g. "# word2 word3 required" or "# foo.bin 1 <sha> required"), so install
+# probes for the real required file instead of the commented text.
+mkdir -p "$tmp/src"
+printf 'abc' >"$tmp/src/real.bin"
+cat >"$tmp/comment.manifest" <<EOF
+# fmacfw_8800d80_u02.bin 1 $sha_c required
+# word1 word2 required
+real.bin 3 $(sha256sum "$tmp/src/real.bin" | cut -d' ' -f1) required
+EOF
+out=$(env CUBIE_A7A_WIFI_MANIFEST="$tmp/comment.manifest" \
+    CUBIE_A7A_WIFI_FWDIR="$tmp/fw-install" \
+    CUBIE_A7A_LINUX_FWDIR="$tmp/lf" \
+    CUBIE_A7A_SYSFS="$tmp/sysfs" \
+    "$script" install "$tmp/src" 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$tmp/fw-install/real.bin" ]; then
+    ok "install: first_required skips commented entries"
+else
+    bad "install: first_required failed with commented entries (rc=$rc): $out"
+fi
+
+if [ "$fail" -gt 0 ]; then
+    echo "$fail test(s) FAILED ($pass passed)"
+    exit 1
+fi
+echo "all wifi-firmware manifest tests passed ($pass)"
