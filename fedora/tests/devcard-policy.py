@@ -535,7 +535,14 @@ REPART_DROPIN = (
     "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
 )
 STOCK_UNIT = "[Service]\nExecStart=systemd-repart --dry-run=no\n"
-GOOD_DROPIN = policy.repart_dropin_text("systemd-repart.service", STOCK_UNIT)
+# The exact bytes mkdevcard.sh writes (pinned here independently of the
+# writer, repart_dropin_writer_cases checks that the writer produces them).
+GOOD_DROPIN = (
+    "# Radxa Cubie A7A (fedora/mkdevcard.sh): the unpartitioned gap in front of\n"
+    "# the first partition holds the boot firmware, so systemd-repart must not\n"
+    "# discard it. The unit's own command line, plus --discard=no.\n"
+    "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no --discard=no\n"
+)
 
 
 def build_repart_root(root, dropin=GOOD_DROPIN, etc_unit=None):
@@ -902,7 +909,10 @@ def repart_initramfs_bytes_from_cpio():
     """F6 B2: types and bytes come from the cpio records, not lsinitrd."""
     with fixture() as work:
         t = work / "tree"
-        build_repart_root(t, dropin="[Service]\nExecStart=\nExecStart=systemd-repart\n")
+        bad = "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no\n#"
+        bad += "#" * (len(GOOD_DROPIN) - len(bad) - 1) + "\n"
+        assert len(bad) == len(GOOD_DROPIN)  # the same size: only the bytes differ
+        build_repart_root(t, dropin=bad)
         img = work / "bad.img"
         _build_cpio_initramfs(t, img)
         real = shutil.which("lsinitrd")
@@ -914,7 +924,7 @@ def repart_initramfs_bytes_from_cpio():
         wrap = work / "lsinitrd-lie"
         wrap.write_text(
             "#!/bin/sh\n"
-            'if [ "$1" = "-f" ]; then\n'
+            f'if [ "$1" = "-f" ] && [ "$2" = "{REPART_DROPIN}" ]; then\n'
             f'  echo "injected-f:$*" >> "{log}"\n'
             f'  cat "{good}"\n'
             "  exit 0\n"
@@ -924,6 +934,7 @@ def repart_initramfs_bytes_from_cpio():
         wrap.chmod(0o755)
         ok, problems = policy.repart_initramfs_ok(img, [str(wrap)])
         assert not ok, f"lsinitrd -f bytes trusted over the archive: {problems}"
+        assert "injected-f:" not in log.read_text(), "lsinitrd -f was consulted"
 
 
 def repart_grow_root_cases():
@@ -991,9 +1002,11 @@ def repart_dropin_writer_cases():
     with fixture() as t:
         unit = t / "u.service"
         unit.write_text(STOCK_UNIT)
-        assert policy.repart_dropin_text("systemd-repart.service", STOCK_UNIT).endswith(
-            "ExecStart=\nExecStart=systemd-repart --dry-run=no --discard=no\n"
+        assert (
+            policy.repart_dropin_text("systemd-repart.service", STOCK_UNIT)
+            == GOOD_DROPIN
         )
+        assert policy.main(["repart-dropin", "systemd-repart.service", str(unit)]) == 0
         for stock in (
             "[Service]\nExecStart=systemd-repart\n",
             "[Service]\nExecStart=systemd-repart --dry-run=no --discard=yes\n",
