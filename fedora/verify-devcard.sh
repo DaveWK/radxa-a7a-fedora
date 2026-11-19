@@ -221,7 +221,10 @@ if [ "$AIC_OVERRIDE" = yes ]; then
     ovr=$ROOT/usr/lib/firmware/aic8800_fw/USB/aic8800D80
     check "AIC8800 override: the five required USB files, size and SHA256 as the manifest" bash -c "test -s '$man' && awk '\$4==\"required\"{print \$1, \$2, \$3}' '$man' | { n=0; while read -r f b h; do test \"\$(stat -c %s '$ovr'/\$f)\" = \$b && test \"\$(sha256sum <'$ovr'/\$f | cut -d' ' -f1)\" = \$h || exit 1; n=\$((n+1)); done; test \$n = 5; }"
     check "AIC8800 override: every file in it is a manifest file with the manifest's SHA256" bash -c "for f in '$ovr'/*; do h=\$(awk -v n=\"\$(basename \"\$f\")\" '\$1==n{print \$3}' '$man'); test -n \"\$h\" && test \"\$(sha256sum <\"\$f\" | cut -d' ' -f1)\" = \"\$h\" || exit 1; done"
-    echo "  info  AIC8800 override files: $(ls "$ovr" 2>/dev/null | tr '\n' ' ')"
+    ovr_files=("$ovr"/*)
+    # An empty or missing directory lists nothing, not the literal pattern.
+    [ "${ovr_files[0]}" = "$ovr"'/*' ] && ovr_files=()
+    echo "  info  AIC8800 override files: ${ovr_files[*]##*/}"
 else
     check "no user-override AIC8800 firmware in the image (aic8800_fw)" bash -c "! find '$ROOT/usr/lib/firmware' -path '*aic8800_fw*' -print -quit | grep -q ."
 fi
