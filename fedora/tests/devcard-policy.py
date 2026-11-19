@@ -688,165 +688,149 @@ def _build_cpio_initramfs(tree, out_img):
     out_img.write_bytes(res.stdout)
 
 
-def repart_precedence_cases():
-    for scope in ("service.d", "systemd-.service.d", "systemd-repart@demo.service.d"):
+def repart_pinned_refusals():
+    """B1: aliases, unexpected repart drop-in dirs and unexpected service.d are refused."""
+    # 1. Alias symlink to systemd-repart.service + alias drop-in directory (root + initramfs).
+    with fixture() as tree:
+        build_repart_root(tree)
+        alias = tree / "etc/systemd/system/repart-alias.service"
+        alias.symlink_to("systemd-repart.service")
+        write(
+            tree / "etc/systemd/system/repart-alias.service.d/90-bad.conf",
+            "[Service]\nExecStart=\nExecStart=systemd-repart\n",
+        )
+        ok, problems = policy.repart_root_ok(tree)
+        assert not ok and any("alias symlink" in p for p in problems), problems
+        assert any("alias drop-in directory" in p for p in problems), problems
+        img = tree / "alias.img"
+        _build_cpio_initramfs(tree, img)
+        ok, problems = policy.repart_initramfs_ok(img)
+        assert not ok and any("alias symlink" in p for p in problems), problems
+        assert any("alias drop-in directory" in p for p in problems), problems
+
+    # 2. Multi-hop alias symlink chain (a.service -> b.service -> systemd-repart.service).
+    with fixture() as tree:
+        build_repart_root(tree)
+        (tree / "etc/systemd/system/b.service").symlink_to("systemd-repart.service")
+        (tree / "etc/systemd/system/a.service").symlink_to("b.service")
+        ok, problems = policy.repart_root_ok(tree)
+        assert not ok and any("alias symlink" in p for p in problems), problems
+        img = tree / "chain.img"
+        _build_cpio_initramfs(tree, img)
+        ok, problems = policy.repart_initramfs_ok(img)
+        assert not ok and any("alias symlink" in p for p in problems), problems
+
+    # 3. Alias symlink FROM checked unit (not /dev/null mask).
+    with fixture() as tree:
+        build_repart_root(tree)
+        write(
+            tree / "usr/lib/systemd/system/other.service",
+            "[Service]\nExecStart=systemd-repart --discard=no\n",
+        )
+        (tree / "etc/systemd/system/systemd-repart.service").symlink_to("other.service")
+        ok, problems = policy.repart_root_ok(tree)
+        assert not ok and any("alias symlink from" in p for p in problems), problems
+        img = tree / "from.img"
+        _build_cpio_initramfs(tree, img)
+        ok, problems = policy.repart_initramfs_ok(img)
+        assert not ok and any("alias symlink from" in p for p in problems), problems
+
+    # 4. [Install] Alias= in checked unit and in drop-in (root + initramfs).
+    for where in ("unit", "dropin"):
         with fixture() as tree:
             build_repart_root(tree)
-            if "@" in scope:
+            if where == "unit":
                 write(
-                    tree / "usr/lib/systemd/system/systemd-repart@.service", GOOD_DROPIN
+                    tree / REPART_UNIT,
+                    "[Service]\nExecStart=systemd-repart\n[Install]\nAlias=repart-alias.service\n",
                 )
-            write(
-                tree / "etc/systemd/system" / scope / "90-reset.conf",
-                "[Service]\nExecStart=\nExecStart=systemd-repart\n",
-            )
-            ok, _ = policy.repart_root_ok(tree)
-            assert not ok, scope
-            img = tree / "test.img"
+            else:
+                write(
+                    tree / REPART_DROPIN,
+                    GOOD_DROPIN + "[Install]\nAlias=repart-alias.service\n",
+                )
+            ok, problems = policy.repart_root_ok(tree)
+            assert not ok and any("[Install] Alias=" in p for p in problems), problems
+            img = tree / f"install-{where}.img"
             _build_cpio_initramfs(tree, img)
             ok, problems = policy.repart_initramfs_ok(img)
-            assert not ok and any("--discard=no" in p for p in problems), (
-                scope,
+            assert not ok and any("[Install] Alias=" in p for p in problems), problems
+
+    # 5. Unexpected drop-in directories for systemd-repart* (dashed & instance).
+    for dname in (
+        "systemd-.service.d",
+        "systemd-@.service.d",
+        "systemd-@demo.service.d",
+        "systemd-repart@demo.service.d",
+        "systemd-repart-extra.service.d",
+    ):
+        with fixture() as tree:
+            build_repart_root(tree)
+            write(
+                tree / "etc/systemd/system" / dname / "50-extra.conf",
+                "[Service]\nTimeoutStartSec=5\n",
+            )
+            ok, problems = policy.repart_root_ok(tree)
+            assert not ok and any("unexpected repart drop-in" in p for p in problems), (
+                dname,
+                problems,
+            )
+            img = tree / "dropin.img"
+            _build_cpio_initramfs(tree, img)
+            ok, problems = policy.repart_initramfs_ok(img)
+            assert not ok and any("unexpected repart drop-in" in p for p in problems), (
+                dname,
+                problems,
+            )
+
+    # 6. Type-wide service.d drop-ins: stock Fedora 10-timeout-abort.conf without
+    #    ExecStart/Alias passes; any unexpected file or ExecStart/Alias is refused.
+    with fixture() as tree:
+        build_repart_root(tree)
+        write(
+            tree / "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "[Service]\nTimeoutStopFailureMode=abort\n",
+        )
+        ok, problems = policy.repart_root_ok(tree)
+        assert ok, problems
+        img = tree / "vendor-ok.img"
+        _build_cpio_initramfs(tree, img)
+        ok, problems = policy.repart_initramfs_ok(img)
+        assert ok, problems
+
+    for rel, body in (
+        (
+            "etc/systemd/system/service.d/90-extra.conf",
+            "[Service]\nTimeoutStartSec=5\n",
+        ),
+        (
+            "usr/lib/systemd/system/service.d/90-extra.conf",
+            "[Service]\nTimeoutStartSec=5\n",
+        ),
+        (
+            "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "[Service]\nExecStart=\nExecStart=systemd-repart --discard=no\n",
+        ),
+    ):
+        with fixture() as tree:
+            build_repart_root(tree)
+            write(tree / rel, body)
+            ok, problems = policy.repart_root_ok(tree)
+            assert not ok and any("type-wide drop-in" in p for p in problems), (
+                rel,
+                problems,
+            )
+            img = tree / "service-d.img"
+            _build_cpio_initramfs(tree, img)
+            ok, problems = policy.repart_initramfs_ok(img)
+            assert not ok and any("type-wide drop-in" in p for p in problems), (
+                rel,
                 problems,
             )
 
 
-def repart_dir_before_scope_precedence():
-    """Load-path directories beat name scopes; type-wide service.d comes last."""
-    # 1. Unsafe /etc/.../systemd-.service.d/50-test.conf MUST beat safe
-    #    /usr/lib/.../systemd-repart.service.d/50-test.conf (root + initramfs).
-    with fixture() as tree:
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart.service",
-            "[Unit]\nDescription=Repart\n[Service]\nExecStart=systemd-repart --dry-run=no\n",
-        )
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart.service.d/50-test.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no --discard=no\n",
-        )
-        write(
-            tree / "etc/systemd/system/systemd-.service.d/50-test.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no\n",
-        )
-        ok, problems = policy.repart_root_ok(tree)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-        img = tree / "test.img"
-        _build_cpio_initramfs(tree, img)
-        ok, problems = policy.repart_initramfs_ok(img)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-
-    # 2. Safe /usr/lib/.../systemd-repart.service.d/50-test.conf MUST beat unsafe
-    #    type-wide /etc/.../service.d/50-test.conf (type-wide defaults last).
-    with fixture() as tree:
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart.service",
-            "[Unit]\nDescription=Repart\n[Service]\nExecStart=systemd-repart --dry-run=no\n",
-        )
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart.service.d/50-test.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no --discard=no\n",
-        )
-        write(
-            tree / "etc/systemd/system/service.d/50-test.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no\n",
-        )
-        ok, problems = policy.repart_root_ok(tree)
-        assert ok, problems
-        img = tree / "test.img"
-        _build_cpio_initramfs(tree, img)
-        ok, problems = policy.repart_initramfs_ok(img)
-        assert ok, problems
-
-    # 3. Mask in /etc/.../systemd-.service.d/10-board.conf -> /dev/null masks
-    #    safe /usr/lib/.../systemd-repart.service.d/10-board.conf.
-    with fixture() as tree:
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart.service",
-            "[Unit]\nDescription=Repart\n[Service]\nExecStart=systemd-repart --dry-run=no\n",
-        )
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart.service.d/10-board.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart --dry-run=no --discard=no\n",
-        )
-        mask = tree / "etc/systemd/system/systemd-.service.d/10-board.conf"
-        mask.parent.mkdir(parents=True, exist_ok=True)
-        mask.symlink_to("/dev/null")
-        ok, problems = policy.repart_root_ok(tree)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-        img = tree / "test.img"
-        _build_cpio_initramfs(tree, img)
-        ok, problems = policy.repart_initramfs_ok(img)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-
-
-def repart_instance_dashed_scope():
-    """Dashed scopes retaining the instance (systemd-@demo.service.d) apply."""
-    # Case 1: template + unsafe /etc/.../systemd-@demo.service.d (no explicit instance unit).
-    with fixture() as tree:
-        build_repart_root(tree)
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart@.service",
-            "[Unit]\nDescription=Repart@\n[Service]\nExecStart=systemd-repart --discard=no\n",
-        )
-        write(
-            tree / "etc/systemd/system/systemd-@demo.service.d/50-inst.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart\n",
-        )
-        ok, problems = policy.repart_root_ok(tree)
-        assert not ok and any(
-            "systemd-repart@demo.service" in p for p in problems
-        ), problems
-        img = tree / "test.img"
-        _build_cpio_initramfs(tree, img)
-        ok, problems = policy.repart_initramfs_ok(img)
-        assert not ok and any(
-            "systemd-repart@demo.service" in p for p in problems
-        ), problems
-
-    # Case 2: unsafe /etc/.../systemd-@demo.service.d/50-inst.conf beats safe
-    #         /usr/lib/.../systemd-repart@demo.service.d/50-inst.conf.
-    with fixture() as tree:
-        build_repart_root(tree)
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart@.service",
-            "[Unit]\nDescription=Repart@\n[Service]\nExecStart=systemd-repart\n",
-        )
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart@demo.service.d/50-inst.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart --discard=no\n",
-        )
-        write(
-            tree / "etc/systemd/system/systemd-@demo.service.d/50-inst.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart\n",
-        )
-        ok, problems = policy.repart_root_ok(tree)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-        img = tree / "test.img"
-        _build_cpio_initramfs(tree, img)
-        ok, problems = policy.repart_initramfs_ok(img)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-
-    # Case 3: unsafe /etc/.../systemd-@.service.d/50-tpl.conf applies to template.
-    with fixture() as tree:
-        build_repart_root(tree)
-        write(
-            tree / "usr/lib/systemd/system/systemd-repart@.service",
-            "[Unit]\nDescription=Repart@\n[Service]\nExecStart=systemd-repart --discard=no\n",
-        )
-        write(
-            tree / "etc/systemd/system/systemd-@.service.d/50-tpl.conf",
-            "[Service]\nExecStart=\nExecStart=systemd-repart\n",
-        )
-        ok, problems = policy.repart_root_ok(tree)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-        img = tree / "test.img"
-        _build_cpio_initramfs(tree, img)
-        ok, problems = policy.repart_initramfs_ok(img)
-        assert not ok and any("--discard=no" in p for p in problems), problems
-
-
 def repart_systemd_analyze_oracle():
-    """Cross-check _unit_files order against offline `systemd-analyze --root= verify`."""
+    """Cross-check exact-unit _unit_files order against offline systemd-analyze verify."""
     assert shutil.which("systemd-analyze"), "need systemd-analyze"
 
     def oracle_files(root, unit):
@@ -874,8 +858,6 @@ def repart_systemd_analyze_oracle():
                 fragment = stripped.split("Fragment Path: ", 1)[1].removeprefix(prefix)
             elif stripped.startswith("DropIn Path: "):
                 p = stripped.split("DropIn Path: ", 1)[1]
-                # systemd-analyze prints masked drop-ins too; filter /dev/null masks
-                # the same way _unit_files excludes them from effective files.
                 if not policy._masked(Path(p)):
                     dropins.append(p.removeprefix(prefix))
         assert (
@@ -884,99 +866,47 @@ def repart_systemd_analyze_oracle():
         return [fragment] + dropins
 
     with fixture() as root:
-        # Build a rich multi-dir, multi-scope fixture testing every precedence axis.
         write(
             root / "usr/lib/systemd/system/systemd-repart.service",
             "[Unit]\nDescription=Repart\n[Service]\nType=oneshot\nExecStart=/bin/u0\n",
         )
         write(
-            root / "usr/lib/systemd/system/systemd-repart-extra@.service",
-            "[Unit]\nDescription=RepartExtra\n[Service]\nType=oneshot\nExecStart=/bin/t0\n",
-        )
-        # Same-basename conflict across dir vs scope (/etc dashed beats /usr/lib unit).
-        write(
-            root / "usr/lib/systemd/system/systemd-repart.service.d/10-conflict.conf",
-            "[Service]\nExecStart=/bin/usr-unit\n",
+            root / "usr/lib/systemd/system/systemd-repart.service.d/10-dropin.conf",
+            "[Service]\nExecStart=/bin/usr-10\n",
         )
         write(
-            root / "etc/systemd/system/systemd-.service.d/10-conflict.conf",
-            "[Service]\nExecStart=/bin/etc-dashed\n",
-        )
-        # Same-basename conflict: /usr/lib unit beats /etc type-wide service.d.
-        write(
-            root / "usr/lib/systemd/system/systemd-repart.service.d/20-type.conf",
-            "[Service]\nExecStart=/bin/usr-unit-20\n",
+            root / "etc/systemd/system/systemd-repart.service.d/10-dropin.conf",
+            "[Service]\nExecStart=/bin/etc-10\n",
         )
         write(
-            root / "etc/systemd/system/service.d/20-type.conf",
-            "[Service]\nExecStart=/bin/etc-service-20\n",
-        )
-        # Same-basename conflict across run vs usr/local/lib vs usr/lib.
-        write(
-            root / "usr/lib/systemd/system/systemd-repart.service.d/30-dir.conf",
-            "[Service]\nExecStart=/bin/usr-lib-30\n",
+            root / "usr/lib/systemd/system/systemd-repart.service.d/20-dir.conf",
+            "[Service]\nExecStart=/bin/usr-lib-20\n",
         )
         write(
-            root / "usr/local/lib/systemd/system/systemd-repart.service.d/30-dir.conf",
-            "[Service]\nExecStart=/bin/usr-local-30\n",
+            root / "usr/local/lib/systemd/system/systemd-repart.service.d/20-dir.conf",
+            "[Service]\nExecStart=/bin/usr-local-20\n",
         )
         write(
-            root / "run/systemd/system/systemd-.service.d/30-dir.conf",
-            "[Service]\nExecStart=/bin/run-dashed-30\n",
+            root / "run/systemd/system/systemd-repart.service.d/20-dir.conf",
+            "[Service]\nExecStart=/bin/run-20\n",
         )
-        # Mask in /etc overrides /usr/lib drop-in.
         write(
             root / "usr/lib/systemd/system/systemd-repart.service.d/35-mask.conf",
             "[Service]\nExecStart=/bin/usr-masked\n",
         )
-        mask = root / "etc/systemd/system/systemd-.service.d/35-mask.conf"
+        mask = root / "etc/systemd/system/systemd-repart.service.d/35-mask.conf"
         mask.parent.mkdir(parents=True, exist_ok=True)
         mask.symlink_to("/dev/null")
-        # Multi-dash + instance conflicts for systemd-repart-extra@demo.service:
-        #   40-inst: /etc dashed-without-@ beats /etc dashed-with-@demo
-        write(
-            root / "etc/systemd/system/systemd-repart-@demo.service.d/40-inst.conf",
-            "[Service]\nExecStart=/bin/etc-repart-at-demo\n",
-        )
-        write(
-            root / "etc/systemd/system/systemd-.service.d/40-inst.conf",
-            "[Service]\nExecStart=/bin/etc-systemd-dash\n",
-        )
-        #   45-inst: /etc systemd-@demo beats /usr/lib systemd-repart-extra@demo
-        write(
-            root
-            / "usr/lib/systemd/system/systemd-repart-extra@demo.service.d/45-inst.conf",
-            "[Service]\nExecStart=/bin/usr-exact-inst\n",
-        )
-        write(
-            root / "etc/systemd/system/systemd-@demo.service.d/45-inst.conf",
-            "[Service]\nExecStart=/bin/etc-systemd-at-demo\n",
-        )
-        #   50-bare: /etc systemd-repart-@demo beats /etc systemd-repart-@
-        write(
-            root / "etc/systemd/system/systemd-repart-@.service.d/50-bare.conf",
-            "[Service]\nExecStart=/bin/etc-repart-at\n",
-        )
-        write(
-            root / "etc/systemd/system/systemd-repart-@demo.service.d/50-bare.conf",
-            "[Service]\nExecStart=/bin/etc-repart-at-demo-50\n",
-        )
-        #   60-only-type: type-wide service.d applies when no higher scope has it.
-        write(
-            root / "etc/systemd/system/service.d/60-only-type.conf",
-            "[Service]\nExecStart=/bin/etc-service-60\n",
-        )
 
         root_res = root.resolve()
-        for unit in ("systemd-repart.service", "systemd-repart-extra@demo.service"):
-            expected = oracle_files(root, unit)
-            actual = [
-                p.relative_to(root_res).as_posix()
-                for p in policy._unit_files(root, unit)
-            ]
-            assert (
-                actual == expected
-            ), f"{unit}:\n  actual  ={actual}\n  expected={expected}"
+        unit = "systemd-repart.service"
+        expected = oracle_files(root, unit)
+        actual = [
+            p.relative_to(root_res).as_posix() for p in policy._unit_files(root, unit)
+        ]
+        assert (
+            actual == expected
+        ), f"{unit}:\n  actual  ={actual}\n  expected={expected}"
 
 
 def unreadable_directories_fail_closed():
@@ -986,7 +916,7 @@ def unreadable_directories_fail_closed():
     with fixture() as root:
         # 1. Unreadable systemd drop-in directory
         build_repart_root(root)
-        locked_d = root / "etc/systemd/system/systemd-.service.d"
+        locked_d = root / "etc/systemd/system/systemd-repart.service.d"
         write(
             locked_d / "99-bad.conf",
             "[Service]\nExecStart=\nExecStart=systemd-repart\n",
@@ -1377,19 +1307,11 @@ def main():
     case("passwd: sole root policy", passwd_sole_root_cases)
     case("passwd: malformed uid/gid fails", passwd_malformed_ids_fail)
     case(
-        "repart: effective generic, dash and instance overrides",
-        repart_precedence_cases,
+        "repart: aliases, unexpected drop-ins and unexpected service.d refused (B1)",
+        repart_pinned_refusals,
     )
     case(
-        "repart: directory precedence before scope, type-wide last",
-        repart_dir_before_scope_precedence,
-    )
-    case(
-        "repart: dashed scopes retaining instance (systemd-@demo.service.d)",
-        repart_instance_dashed_scope,
-    )
-    case(
-        "repart: order matches offline systemd-analyze --root= verify oracle",
+        "repart: exact-unit order matches offline systemd-analyze --root= verify oracle",
         repart_systemd_analyze_oracle,
     )
     case(

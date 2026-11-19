@@ -85,6 +85,19 @@ FEDORA_CERTIFICATES = {
 # non-Fedora file under an AIC firmware path is ours and forbidden
 # (DECISIONS 2026-11-11).
 REPART_UNITS = ("systemd-repart.service", "systemd-repart@.service")
+# Exact drop-in directories created by fedora/mkdevcard.sh:427-436 for the two
+# checked units. Any other drop-in directory targeting systemd-repart (dashed
+# prefix, instance, or unit alias) is refused explicitly.
+ALLOWED_REPART_DROPIN_DIRS = frozenset(f"{unit}.d" for unit in REPART_UNITS)
+# Stock Fedora systemd ships one type-wide drop-in setting only
+# TimeoutStopFailureMode=abort; any other unmasked service.d/*.conf, or any
+# service.d/*.conf setting ExecStart/Alias, is refused explicitly.
+ALLOWED_VENDOR_SERVICE_D = frozenset(
+    (
+        "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "lib/systemd/system/service.d/10-timeout-abort.conf",
+    )
+)
 REPART_REPARTD = (
     "etc/repart.d",
     "run/repart.d",
@@ -718,8 +731,8 @@ def _logical_lines(text):
     return lines
 
 
-def _service_assignments(text):
-    """Ordered (key, value) pairs inside [Service], whitespace tolerated."""
+def _section_assignments(text, target_section):
+    """Ordered (key, value) pairs inside [TARGET_SECTION], whitespace tolerated."""
     out = []
     section = None
     for line in _logical_lines(text):
@@ -729,11 +742,16 @@ def _service_assignments(text):
         if stripped.startswith("[") and stripped.endswith("]"):
             section = stripped[1:-1].strip()
             continue
-        if section != "Service" or "=" not in stripped:
+        if section != target_section or "=" not in stripped:
             continue
         key, value = stripped.split("=", 1)
         out.append((key.strip(), value.strip()))
     return out
+
+
+def _service_assignments(text):
+    """Ordered (key, value) pairs inside [Service], whitespace tolerated."""
+    return _section_assignments(text, "Service")
 
 
 def _masked(path):
@@ -756,74 +774,6 @@ def _active_unit_dirs(root):
     return dirs
 
 
-def _repart_units(root):
-    names = set(REPART_UNITS)
-    dashed_instances = []
-    for directory in _active_unit_dirs(root):
-        path = root / directory
-        for entry in _scandir_if_exists(path):
-            raw = entry.name
-            stem = raw.removesuffix(".d")
-            if re.fullmatch(REPART_NAME, stem):
-                names.add(stem)
-            if raw.endswith(".d") and re.fullmatch(REPART_DASHED_DROPIN, stem):
-                base_stem = stem.removesuffix(".service")
-                if "@" in base_stem:
-                    dash_prefix, inst = base_stem.split("@", 1)
-                    if inst:
-                        dashed_instances.append((dash_prefix, inst))
-            if raw.endswith((".wants", ".requires")) and entry.is_dir():
-                for child in _scandir_if_exists(entry):
-                    if re.fullmatch(REPART_NAME, child.name):
-                        names.add(child.name)
-    # Any dashed-prefix instance drop-in (e.g. systemd-@demo.service.d) applies
-    # to every repart template unit sharing that dashed prefix (e.g.
-    # systemd-repart@.service instantiated as systemd-repart@demo.service).
-    for unit in list(names):
-        if not unit.endswith("@.service"):
-            continue
-        tpl_prefix = unit.removesuffix("@.service")
-        for dash_prefix, inst in dashed_instances:
-            if tpl_prefix.startswith(dash_prefix):
-                names.add(f"{tpl_prefix}@{inst}.service")
-    return sorted(names)
-
-
-def _unit_dropin_scopes(unit):
-    """Return systemd's name-based drop-in scopes for UNIT, highest precedence first.
-
-    Matches systemd-262.1-1.fc45 (`systemd-analyze --root= --generators=no verify`):
-      1. exact unit (e.g. systemd-a-b@demo.service)
-      2. template (e.g. systemd-a-b@.service), when instantiated
-      3. dashed prefixes without '@' (e.g. systemd-a-.service, systemd-.service)
-      4. for template/instantiated units, dashed prefixes retaining '@<inst>' and '@'
-         (e.g. systemd-a-@demo.service, systemd-a-@.service,
-          systemd-@demo.service, systemd-@.service)
-    Type-wide 'service.d' is searched separately after all load-path directories.
-    """
-    stem = unit.removesuffix(".service")
-    if "@" in stem:
-        prefix, instance = stem.split("@", 1)
-    else:
-        prefix, instance = stem, None
-    scopes = [unit]
-    if instance:
-        scopes.append(f"{prefix}@.service")
-    dashed = []
-    cur = prefix
-    while "-" in cur:
-        cur = cur.rsplit("-", 1)[0]
-        dashed.append(cur + "-")
-    for dash_prefix in dashed:
-        scopes.append(f"{dash_prefix}.service")
-    if instance is not None:
-        for dash_prefix in dashed:
-            if instance:
-                scopes.append(f"{dash_prefix}@{instance}.service")
-            scopes.append(f"{dash_prefix}@.service")
-    return scopes
-
-
 def _scan_dropin_dir(dropin_dir, root, by_name):
     for conf in _scandir_if_exists(dropin_dir):
         if not conf.name.endswith(".conf"):
@@ -839,42 +789,117 @@ def _scan_dropin_dir(dropin_dir, root, by_name):
 
 
 def _unit_files(root, unit):
-    """Resolve UNIT and its effective drop-ins in systemd's exact search order.
+    """Resolve exact UNIT and its exact UNIT.d drop-ins in load-path precedence order.
 
-    Load-path directories come first (/etc before /run before /usr/lib); within
-    each directory, unit -> template -> dashed scopes (including dashed scopes
-    retaining the instance); type-wide service.d defaults come last across all
-    load-path directories. For each basename, the first match wins; winners are
-    applied in global sorted basename order.
+    Only the exact units and drop-in directory names created by our build
+    (`systemd-repart.service`, `systemd-repart@.service`, and their `.d`
+    directories) are modeled. Dashed-prefix, instance, alias and unexpected
+    type-wide drop-ins are refused by `_check_repart_refusals`.
     """
     root = Path(root)
     unit_dirs = _active_unit_dirs(root)
-    bases = [unit]
-    if "@" in unit and not unit.endswith("@.service"):
-        bases.append(unit.split("@", 1)[0] + "@.service")
     base = None
-    for name in bases:
-        for directory in unit_dirs:
-            candidate = root / directory / name
-            if _masked(candidate):
-                return None
-            if candidate.is_file() or candidate.is_symlink():
-                base = _resolve_within(root, candidate)
-                if base is None:
-                    raise PolicyError(f"cannot resolve unit {candidate}")
-                break
-        if base is not None:
+    for directory in unit_dirs:
+        candidate = root / directory / unit
+        if _masked(candidate):
+            return None
+        if candidate.is_file() or candidate.is_symlink():
+            base = _resolve_within(root, candidate)
+            if base is None:
+                raise PolicyError(f"cannot resolve unit {candidate}")
             break
     if base is None:
         return []
-    name_scopes = _unit_dropin_scopes(unit)
     by_name = {}
     for directory in unit_dirs:
-        for scope in name_scopes:
-            _scan_dropin_dir(root / directory / (scope + ".d"), root, by_name)
-    for directory in unit_dirs:
-        _scan_dropin_dir(root / directory / "service.d", root, by_name)
+        _scan_dropin_dir(root / directory / (unit + ".d"), root, by_name)
     return [base] + [by_name[n] for n in sorted(by_name) if by_name[n] is not None]
+
+
+def _check_repart_refusals(root):
+    """Refuse aliases, unexpected drop-in dirs and unexpected service.d drop-ins."""
+    root = Path(root)
+    unit_dirs = _active_unit_dirs(root)
+    problems = []
+    alias_names = set()
+    for directory in unit_dirs:
+        dir_path = root / directory
+        for entry in _scandir_if_exists(dir_path):
+            name = entry.name
+            if name.endswith(".d"):
+                stem = name[:-2]
+                if stem == "service":
+                    continue
+                if (
+                    re.fullmatch(REPART_NAME, stem)
+                    or re.fullmatch(REPART_DASHED_DROPIN, stem)
+                ) and name not in ALLOWED_REPART_DROPIN_DIRS:
+                    problems.append(
+                        f"refused unexpected repart drop-in directory {directory}/{name}"
+                    )
+                continue
+            if name.endswith((".wants", ".requires")) and entry.is_dir():
+                for child in _scandir_if_exists(entry):
+                    if (
+                        re.fullmatch(REPART_NAME, child.name)
+                        and child.name not in REPART_UNITS
+                    ):
+                        problems.append(
+                            f"refused unexpected repart unit {directory}/{name}/{child.name}"
+                        )
+                continue
+            if re.fullmatch(REPART_NAME, name) and name not in REPART_UNITS:
+                problems.append(f"refused unexpected repart unit {directory}/{name}")
+            if entry.is_symlink() and not _masked(entry):
+                try:
+                    raw_target = os.readlink(entry)
+                except OSError as exc:
+                    raise PolicyError(f"cannot read symlink {entry}: {exc}") from exc
+                resolved = _resolve_within(root, entry)
+                raw_base = Path(raw_target).name
+                res_base = resolved.name if resolved is not None else ""
+                if name in REPART_UNITS:
+                    problems.append(
+                        f"refused alias symlink from checked unit {directory}/{name} -> {raw_target}"
+                    )
+                    alias_names.add(name)
+                elif re.fullmatch(REPART_NAME, raw_base) or re.fullmatch(
+                    REPART_NAME, res_base
+                ):
+                    problems.append(
+                        f"refused alias symlink to checked unit {directory}/{name} -> {raw_target}"
+                    )
+                    alias_names.add(name)
+        for conf in _scandir_if_exists(dir_path / "service.d"):
+            if not conf.name.endswith(".conf") or _masked(conf):
+                continue
+            rel = f"{directory}/service.d/{conf.name}"
+            resolved = _resolve_within(root, conf)
+            if resolved is None or not resolved.is_file():
+                problems.append(f"refused unreadable type-wide drop-in {rel}")
+                continue
+            try:
+                text = resolved.read_text()
+            except OSError:
+                problems.append(f"refused unreadable type-wide drop-in {rel}")
+                continue
+            touches = any(
+                k == "ExecStart" for k, _ in _section_assignments(text, "Service")
+            ) or any(k == "Alias" for k, _ in _section_assignments(text, "Install"))
+            if touches:
+                problems.append(
+                    f"refused type-wide drop-in {rel}: sets ExecStart or Alias"
+                )
+            elif rel not in ALLOWED_VENDOR_SERVICE_D:
+                problems.append(f"refused unexpected type-wide drop-in {rel}")
+    for alias in sorted(alias_names):
+        for directory in unit_dirs:
+            alias_d = root / directory / f"{alias}.d"
+            if alias_d.is_dir():
+                problems.append(
+                    f"refused alias drop-in directory {directory}/{alias}.d"
+                )
+    return problems
 
 
 def _effective_exec_start(files):
@@ -928,11 +953,23 @@ def _carries_no_discard(commands):
 
 
 def repart_root_ok(root):
-    """Every effective systemd-repart invocation carries --discard=no."""
+    """Every effective systemd-repart invocation carries --discard=no.
+
+    Pinned to our build's exact units (`systemd-repart.service`,
+    `systemd-repart@.service`) and drop-in directory names; refuses aliases,
+    unexpected repart/dashed drop-in directories and unexpected `service.d`
+    drop-ins.
+    """
     root = Path(root)
-    problems = []
+    problems = _check_repart_refusals(root)
+    unit_dirs = _active_unit_dirs(root)
     repart_service_seen = False
-    for unit in _repart_units(root):
+    for unit in REPART_UNITS:
+        if any(
+            "alias symlink from checked unit" in p and f"/{unit} -> " in p
+            for p in problems
+        ):
+            continue
         files = _unit_files(root, unit)
         if files == []:
             continue
@@ -940,6 +977,24 @@ def repart_root_ok(root):
             repart_service_seen = True
         if files is None:
             continue  # masked: cannot run
+        for path in files:
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text()
+            except OSError:
+                continue
+            for key, value in _section_assignments(text, "Install"):
+                if key != "Alias":
+                    continue
+                rel = path.relative_to(root.resolve()).as_posix()
+                problems.append(f"refused [Install] Alias={value!r} in {rel}")
+                for alias in value.split():
+                    for directory in unit_dirs:
+                        if (root / directory / f"{alias}.d").is_dir():
+                            problems.append(
+                                f"refused alias drop-in directory {directory}/{alias}.d"
+                            )
         commands = _effective_exec_start(files)
         if commands is None:
             problems.append(f"{unit}: unreadable unit or drop-in")
@@ -1136,6 +1191,49 @@ def _parse_ls_row(line):
     return ("other", _norm_archive_path(rest), 0)
 
 
+def _select_initramfs_repart_entries(all_rows):
+    """Select repart units, drop-ins, service.d, repart.d and alias symlinks/drop-ins."""
+    unit_dir_set = set(SYSTEMD_UNIT_DIRS)
+    symlink_targets = {}
+    for kind, rel, meta in all_rows:
+        if kind != "symlink" or meta == "/dev/null":
+            continue
+        parent, _, name = rel.rpartition("/")
+        if parent in unit_dir_set and name:
+            symlink_targets.setdefault(name, set()).add(Path(meta).name)
+    alias_names = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, targets in symlink_targets.items():
+            if name in alias_names:
+                continue
+            if re.fullmatch(REPART_NAME, name) or any(
+                re.fullmatch(REPART_NAME, t) or t in alias_names for t in targets
+            ):
+                alias_names.add(name)
+                changed = True
+    alias_dropin_dirs = {f"{a}.d" for a in alias_names}
+    selected = []
+    for kind, rel, meta in all_rows:
+        if kind in ("file", "symlink") and INITRAMFS_REPART_RE.match(rel):
+            selected.append((kind, rel, meta))
+            continue
+        parent, _, name = rel.rpartition("/")
+        if kind == "symlink" and parent in unit_dir_set and name in alias_names:
+            selected.append((kind, rel, meta))
+            continue
+        grand, _, dname = parent.rpartition("/")
+        if (
+            kind in ("file", "symlink")
+            and grand in unit_dir_set
+            and dname in alias_dropin_dirs
+            and name.endswith(".conf")
+        ):
+            selected.append((kind, rel, meta))
+    return selected
+
+
 def _parse_lsinitrd_listing(listing):
     """Parse lsinitrd stdout requiring opening and closing 72-'=' section framing.
 
@@ -1155,7 +1253,6 @@ def _parse_lsinitrd_listing(listing):
             "incomplete lsinitrd listing: truncated after file rows without closing separator"
         )
     all_rows = []
-    repart_entries = []
     for idx in range(len(rule_indices) - 1):
         section = [
             line
@@ -1169,11 +1266,9 @@ def _parse_lsinitrd_listing(listing):
         for line in section:
             kind, rel, meta = _parse_ls_row(line)
             all_rows.append((kind, rel, meta))
-            if kind in ("file", "symlink") and INITRAMFS_REPART_RE.match(rel):
-                repart_entries.append((kind, rel, meta))
     if not all_rows:
         raise PolicyError("incomplete lsinitrd listing: no recognized file rows")
-    return all_rows, repart_entries
+    return all_rows, _select_initramfs_repart_entries(all_rows)
 
 
 def inspect_initramfs(img, lsinitrd_cmd=None, archive_path=None):
@@ -1239,8 +1334,8 @@ def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False, archive_pat
                     return False, [f"cannot extract {rel} from {img}"]
                 dest.write_bytes(extracted.stdout)
         if forbid_repart:
-            problems = []
-            for unit in _repart_units(tree):
+            problems = _check_repart_refusals(tree)
+            for unit in REPART_UNITS:
                 files = _unit_files(tree, unit)
                 if files:
                     problems.append(f"initramfs contains active {unit}")
