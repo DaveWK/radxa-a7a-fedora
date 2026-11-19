@@ -643,6 +643,11 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
                     f"forwarded={extra in forwarded})"
                 )
         assert not violations, "; ".join(violations)
+        # The harness captures the actual stage script without building an image.
+        overlay_copy = stage.index('cp -a --no-preserve=ownership "$OVERLAY"')
+        assert (
+            stage.index(check) < overlay_copy < stage.rindex(check)
+        ), "installed-RPM gates do not bracket the overlay copy"
 
         # Step 3: truncated RPM snapshot fails closed.
         manifest = second / "rpm-snapshot.json"

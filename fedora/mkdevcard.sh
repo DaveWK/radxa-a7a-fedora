@@ -564,6 +564,8 @@ if [ -n "$OVERLAY" ]; then
     done
     chroot "$ROOT" ldconfig
     (cd "$OVERLAY" && find . -type f | LC_ALL=C sort | xargs sha256sum) >"$W/overlay.sha256"
+    # The overlay may have replaced the rpmdb after the post-DNF check.
+    python3 -I "$TOP/fedora/devcard-policy.py" check-installed-rpms "$ROOT" "$RPM_RECORDS"
 fi
 
 # Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
