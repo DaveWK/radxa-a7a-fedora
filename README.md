@@ -71,10 +71,11 @@ firmware `.seek` file is present, its LBA must be inside the reserved gap.
 `mkdevcard.sh` writes `OUT.devcard-manifest.json`, `OUT.build-receipt.json` and
 `OUT.sha256`. The checksum file uses standard `sha256sum -c` rows for the
 image, manifest, receipt and, when generated, its `.xz` copy. The build
-receipt records the source commit, seal times, run ID, profile, snapshot
+receipt records the image-builder commit, seal times, run ID, profile, snapshot
 digest, packed image and manifest digests, DTB stamp digests, and the bound
 initramfs digest set. Source, profile and RPM inputs are **build records**,
-not facts independently recovered from the image.
+not facts independently recovered from the image. The RPM snapshot identifies
+the consumed RPM bytes, not the commit that built those RPMs.
 
 Task 147 must retain the receipt as its own CI artifact and copy it into A7A
 evidence before acceptance or publication. Use the manifest digest from that
@@ -82,6 +83,9 @@ retained receipt, not from the copy next to the image:
 
     TMPDIR="$HOME/approved-devcard-scratch" \
       fedora/verify-devcard.sh IMAGE MANIFEST --expect-manifest-sha256 HEX
+
+Use `--firmware FILE` to request firmware verification. A legacy `FW` value
+other than `none` is rejected rather than silently ignored.
 
 Create that scratch directory first, outside `/tmp` and `/var/tmp`. The
 verifier makes dense copies of the ESP and root partition: budget each
@@ -124,7 +128,8 @@ Integrity checks are independent of that profile:
 | `zstd -t --check` | Stream integrity only. | Newc validity, content, or which initramfs boots. |
 
 Effective systemd state and initramfs content belong to on-board acceptance,
-not an offline simulation.
+not an offline simulation. The protective settings are not independent
+write/discard protection.
 
 ## Tests
 

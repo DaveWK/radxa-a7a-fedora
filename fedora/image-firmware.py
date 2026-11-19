@@ -27,10 +27,9 @@ Inputs (audit/check/strip), any number of each:
   --list FILE       a listing of paths (- for stdin): one path per line, or lsinitrd /
                     ls -l output (directories skipped, "a -> b" counts as a)
 
-This tool walks plain directory trees and path listings only. It reads no
-archive or filesystem format: initramfs listings come from the build's own
-lsinitrd capture, and the whole-disk ext4 walk it used to do was removed when
-verify moved to an exact build manifest (fedora/devcard-manifest.py).
+This tool walks plain directory trees and supplied path listings only. The
+build audits the staged root and does not capture an initramfs listing. This
+tool reads no archive or filesystem image format.
 
 Exit 0: clean (or audit/strip done). Exit 1: check found files. Exit 2: usage
 or input error.
