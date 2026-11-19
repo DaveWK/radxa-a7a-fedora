@@ -1020,14 +1020,19 @@ def _norm_archive_path(name):
     return rel if rel else "."
 
 
-def _decompress_zstd_members(data, start_pos):
-    """Decompress one or more zstd frames starting at START_POS, member by member.
+def _decompress_zstd_single_frame(data, start_pos):
+    """Decompress exactly one complete zstd frame spanning START_POS to EOF.
 
-    Our build's dracut configuration uses Fedora's default compressor (zstd:
-    dracut-cubie-a7a.conf and /usr/lib/dracut/dracut.conf.d/01-dist.conf leave
-    compress unset, /usr/bin/dracut selects $DRACUT_COMPRESS_ZSTD first, and
-    the dracut RPM requires zstd). Any other compressor, truncated frame,
-    skippable frame or trailing bytes after the last frame is refused.
+    Pinned to what our build produces: Fedora's dracut compresses the main
+    archive with zstd (dracut-cubie-a7a.conf and
+    /usr/lib/dracut/dracut.conf.d/01-dist.conf leave compress unset,
+    /usr/bin/dracut selects $DRACUT_COMPRESS_ZSTD first, the dracut RPM
+    requires zstd) as one frame; the real a7a-fedora-01 initramfs is one frame
+    consuming all of its bytes. Frames are never joined: Linux decompresses
+    each frame and requires every cpio header to lie within one
+    (lib/decompress_unzstd.c, init/initramfs.c), so a second frame, a
+    skippable frame, a truncated frame, another compressor or trailing bytes
+    is refused ("multi-frame zstd initramfs rejected").
     """
     try:
         zstd = importlib.import_module("compression.zstd")
@@ -1040,36 +1045,30 @@ def _decompress_zstd_members(data, start_pos):
     length = len(data)
     if pos >= length:
         raise PolicyError("missing zstd initramfs payload")
-    chunks = []
-    members = 0
-    while pos < length:
-        if bytes(view[pos : pos + 4]) != ZSTD_MAGIC:
-            raise PolicyError(
-                f"refused non-zstd or trailing initramfs bytes at offset {pos}: "
-                f"{bytes(view[pos : pos + 8])!r}"
-            )
-        dec = zstd.ZstdDecompressor()
-        try:
-            out = dec.decompress(view[pos:])
-        except Exception as exc:
-            raise PolicyError(
-                f"truncated or corrupt zstd initramfs frame {members + 1} at offset {pos}: {exc}"
-            ) from exc
-        if not dec.eof:
-            raise PolicyError(
-                f"truncated zstd initramfs frame {members + 1} at offset {pos}: missing end-of-frame"
-            )
-        consumed = (length - pos) - len(dec.unused_data)
-        if consumed <= 0:
-            raise PolicyError(
-                f"zstd initramfs frame {members + 1} at offset {pos} consumed zero bytes"
-            )
-        chunks.append(out)
-        pos += consumed
-        members += 1
-    if members == 0 or pos != length:
-        raise PolicyError("incomplete zstd initramfs consumption")
-    return b"".join(chunks)
+    if bytes(view[pos : pos + 4]) != ZSTD_MAGIC:
+        raise PolicyError(
+            f"refused non-zstd initramfs payload at offset {pos}: "
+            f"{bytes(view[pos : pos + 8])!r}"
+        )
+    dec = zstd.ZstdDecompressor()
+    try:
+        out = dec.decompress(view[pos:])
+    except Exception as exc:
+        raise PolicyError(
+            f"truncated or corrupt zstd initramfs frame at offset {pos}: {exc}"
+        ) from exc
+    if not dec.eof:
+        raise PolicyError(
+            f"truncated zstd initramfs frame at offset {pos}: missing end-of-frame"
+        )
+    if dec.unused_data:
+        end = length - len(dec.unused_data)
+        raise PolicyError(
+            f"refused multi-frame zstd initramfs: {len(dec.unused_data)} bytes after "
+            f"the zstd frame ending at offset {end} "
+            f"({bytes(dec.unused_data[:8])!r}); exactly one frame is accepted"
+        )
+    return out
 
 
 def _parse_cpio_one(data, offset):
@@ -1144,9 +1143,8 @@ def parse_cpio_initramfs(archive_path):
 
     Leading uncompressed early-CPIO segments (if present) must each end cleanly
     at TRAILER!!! with only NUL alignment bytes before the zstd payload. The
-    main payload must consist solely of one or more complete zstd frames
-    consuming the input to exact EOF, and its decompressed cpio stream(s) must
-    each terminate cleanly at TRAILER!!!.
+    main payload must be exactly one complete zstd frame ending at EOF, and
+    its decompressed cpio stream(s) must each terminate cleanly at TRAILER!!!.
     """
     path = Path(archive_path)
     try:
@@ -1170,7 +1168,7 @@ def parse_cpio_initramfs(archive_path):
             entries.extend(part)
             continue
         break
-    decompressed = _decompress_zstd_members(data, pos)
+    decompressed = _decompress_zstd_single_frame(data, pos)
     entries.extend(parse_cpio_stream(decompressed))
     if not entries:
         raise PolicyError(f"initramfs {path} contains no entries")

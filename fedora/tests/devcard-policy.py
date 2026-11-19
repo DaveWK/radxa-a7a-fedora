@@ -30,9 +30,13 @@ policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
 FAILURES = []
+# A7A_TEST_ONLY=fn1,fn2 runs only the named test functions (red/green runs).
+ONLY = {n for n in os.environ.get("A7A_TEST_ONLY", "").split(",") if n}
 
 
 def case(name, fn):
+    if ONLY and fn.__name__ not in ONLY:
+        return
     try:
         fn()
     except AssertionError as exc:
@@ -1009,8 +1013,8 @@ def repart_silent_truncated_listing():
             not ok
         ), f"silent truncated listing (with forged closing rule) passed: {problems}"
 
-        # Case 3: valid two-part initramfs (early cpio + zstd main cpio) and
-        # multi-frame zstd pass.
+        # Case 3: valid two-part initramfs (early cpio + one zstd frame) passes;
+        # multi-frame zstd is refused (zstd_single_frame_cases).
         import bz2
         import compression.zstd as zstd
         import gzip
@@ -1028,11 +1032,6 @@ def repart_silent_truncated_listing():
         combo.write_bytes(raw_early + zstd_main)
         ok, problems = policy.repart_initramfs_ok(combo)
         assert ok, ("early+zstd", problems)
-
-        multi = work / "multi-zstd.img"
-        multi.write_bytes(zstd.compress(raw_main[:64]) + zstd.compress(raw_main[64:]))
-        ok, problems = policy.repart_initramfs_ok(multi)
-        assert ok, ("multi-zstd", problems)
 
         # Case 4 (B2): valid zstd frame followed by truncated frame, garbage or trailing NUL is refused.
         for label, bad_bytes in (
@@ -1103,6 +1102,61 @@ def repart_silent_truncated_listing():
             raise AssertionError("embedded non-NUL after NUL in newc name must fail")
         except policy.PolicyError:
             pass
+
+
+def zstd_single_frame_cases():
+    """F6 B1: exactly one zstd frame after an optional early cpio; frames never joined."""
+    import compression.zstd as zstd
+
+    with fixture() as work:
+        tree = work / "main"
+        write(tree / "usr/lib/modules/placeholder", "ok\n")
+        write(tree / "etc/hello.txt", "hi\n")
+        raw = _raw_cpio(tree)
+        early_tree = work / "early"
+        write(early_tree / "early_cpio", "1\n")
+        raw_early = _raw_cpio(early_tree)
+
+        # One frame (with and without early cpio) passes.
+        for label, blob in (
+            ("one-frame", zstd.compress(raw)),
+            ("early+one-frame", raw_early + zstd.compress(raw)),
+        ):
+            img = work / f"{label}.img"
+            img.write_bytes(blob)
+            rels = [r for _, r, _ in policy.parse_cpio_initramfs(img)]
+            assert "etc/hello.txt" in rels, (label, rels)
+
+        # A cpio header split across two frames (Linux rejects it) is refused.
+        second = raw.index(b"070701", 1)
+        split_at = second + 40  # inside the second 110-byte newc header
+        split = zstd.compress(raw[:split_at]) + zstd.compress(raw[split_at:])
+        # A second frame on an entry boundary is refused too: never join frames.
+        boundary = zstd.compress(raw[:second]) + zstd.compress(raw[second:])
+        skip_after = (
+            zstd.compress(raw) + b"\x50\x2a\x4d\x18" + (4).to_bytes(4, "little")
+        )
+        skip_after += b"SKIP"
+        skip_before = b"\x50\x2a\x4d\x18" + (4).to_bytes(4, "little") + b"SKIP"
+        skip_before += zstd.compress(raw)
+        for label, blob in (
+            ("split-header", split),
+            ("two-frames-on-boundary", boundary),
+            ("early+split-header", raw_early + split),
+            ("skippable-after", skip_after),
+            ("skippable-before", skip_before),
+        ):
+            img = work / f"{label}.img"
+            img.write_bytes(blob)
+            try:
+                policy.parse_cpio_initramfs(img)
+            except policy.PolicyError as exc:
+                msg = str(exc)
+                assert "multi-frame" in msg or "non-zstd" in msg, (label, msg)
+            else:
+                raise AssertionError(f"{label}: multi-frame zstd initramfs accepted")
+            ok, problems = policy.repart_initramfs_ok(img)
+            assert not ok, (label, problems)
 
 
 def initramfs_check_truncation_cases():
@@ -1529,6 +1583,10 @@ def main():
     case(
         "repart: silent truncated lsinitrd listing fails closed (B2)",
         repart_silent_truncated_listing,
+    )
+    case(
+        "initramfs: exactly one zstd frame, split header and skippable refused (F6 B1)",
+        zstd_single_frame_cases,
     )
     case(
         "initramfs-check: silent truncation of lsinitrd and -f fails closed (S0-9)",
