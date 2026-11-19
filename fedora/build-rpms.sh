@@ -159,12 +159,20 @@ published_rpms=()
 for rpm_file in "${built_rpms[@]}"; do
     published_rpms+=("$publish/${rpm_file#"$OUT"/}")
 done
-python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
-    "$publish/RPMS" "$publish/RPMS/checked-rpms.json" --kind noarch \
-    "${published_rpms[@]}"
-if [ "$FWREPO" = none ]; then
-    rm -f "$publish/RPMS/checked-aarch64-rpms.json"
+# Always clear any prior aarch64 manifest (even when FWREPO is set): the new
+# noarch run gets a fresh run_id, and build-aarch64-rpms.sh must bind its
+# aarch64 manifest to that exact run_id.
+rm -f "$publish/RPMS/checked-aarch64-rpms.json"
+manifest_args=(--kind noarch)
+if [ "$FWREPO" != none ]; then
+    manifest_args+=(--expect-aarch64)
 fi
+if [ -n "${RPM_BUILD_RUN_ID:-}" ]; then
+    manifest_args+=(--run-id "$RPM_BUILD_RUN_ID")
+fi
+python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
+    "$publish/RPMS" "$publish/RPMS/checked-rpms.json" "${manifest_args[@]}" \
+    "${published_rpms[@]}"
 for rpm_file in "$OUT"/SRPMS/*.rpm "${built_rpms[@]}"; do
     printf '%s/%s\n' "$publish" "${rpm_file#"$OUT"/}"
 done

@@ -52,6 +52,7 @@ import importlib
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -1437,12 +1438,50 @@ OPTIONAL_NOARCH_PACKAGES = (
 )
 OPTIONAL_AARCH64_PACKAGES = ("cubie-a7a-fwlog",)
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+RUN_ID_RE = re.compile(r"^[0-9a-f]{32,64}$")
+RPM_MANIFEST_VERSION = 2
 
 
-def write_rpm_manifest(rpms_dir, out_manifest, rpm_paths, kind="noarch"):
-    """Write an atomic checked-RPM manifest with exact relpaths and sha256s."""
+def write_rpm_manifest(
+    rpms_dir,
+    out_manifest,
+    rpm_paths,
+    kind="noarch",
+    run_id=None,
+    expect_aarch64=False,
+    bind_noarch=None,
+):
+    """Write an atomic checked-RPM manifest bound to one run_id with sha256s."""
     if kind not in ("noarch", "aarch64"):
         raise PolicyError(f"invalid rpm manifest kind: {kind!r}")
+    if kind == "noarch":
+        if bind_noarch is not None:
+            raise PolicyError("--bind-noarch is only valid for kind='aarch64'")
+        if run_id is None:
+            run_id = secrets.token_hex(16)
+        if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+            raise PolicyError(f"invalid run_id: {run_id!r}")
+    else:
+        if bind_noarch is not None:
+            _, bound_run_id, bound_expect = _load_rpm_manifest(
+                rpms_dir,
+                bind_noarch,
+                "noarch",
+                set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES),
+            )
+            if not bound_expect:
+                raise PolicyError(
+                    f"{bind_noarch}: noarch run did not expect aarch64 packages (FWREPO=none)"
+                )
+            if run_id is not None and run_id != bound_run_id:
+                raise PolicyError(
+                    f"run_id {run_id!r} disagrees with bound noarch manifest run_id {bound_run_id!r}"
+                )
+            run_id = bound_run_id
+        elif run_id is None:
+            raise PolicyError("aarch64 manifest requires --bind-noarch or --run-id")
+        if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+            raise PolicyError(f"invalid run_id: {run_id!r}")
     allowed = (
         set(REQUIRED_BOARD_PACKAGES) | set(OPTIONAL_NOARCH_PACKAGES)
         if kind == "noarch"
@@ -1478,11 +1517,14 @@ def write_rpm_manifest(rpms_dir, out_manifest, rpm_paths, kind="noarch"):
     if not records:
         raise PolicyError(f"no {kind} RPMs provided for manifest")
     payload = {
-        "version": 1,
+        "version": RPM_MANIFEST_VERSION,
         "kind": kind,
+        "run_id": run_id,
         "count": len(records),
         "rpms": records,
     }
+    if kind == "noarch":
+        payload["expect_aarch64"] = bool(expect_aarch64)
     out_path = Path(out_manifest)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -1515,11 +1557,21 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
         raise PolicyError(f"corrupt or truncated RPM manifest {mpath}: {exc}") from exc
     if not isinstance(data, dict):
         raise PolicyError(f"invalid RPM manifest {mpath}: expected object")
-    if data.get("version") != 1 or data.get("kind") != expected_kind:
+    if data.get("version") != RPM_MANIFEST_VERSION or data.get("kind") != expected_kind:
         raise PolicyError(
             f"invalid RPM manifest {mpath}: version={data.get('version')!r}, "
             f"kind={data.get('kind')!r}"
         )
+    run_id = data.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise PolicyError(f"invalid RPM manifest {mpath}: missing or bad run_id")
+    expect_aarch64 = None
+    if expected_kind == "noarch":
+        expect_aarch64 = data.get("expect_aarch64")
+        if not isinstance(expect_aarch64, bool):
+            raise PolicyError(
+                f"invalid RPM manifest {mpath}: missing boolean expect_aarch64"
+            )
     rpms = data.get("rpms")
     count = data.get("count")
     if (
@@ -1567,18 +1619,19 @@ def _load_rpm_manifest(rpms_dir, manifest_path, expected_kind, allowed_packages)
                 f"(actual {actual_sha}, manifest {expected_sha})"
             )
         selected[pkg] = target
-    return selected
+    return selected, run_id, expect_aarch64
 
 
 def select_checked_rpms(rpms_dir):
     """Select board RPMs strictly from the checked manifest(s) under RPMS_DIR.
 
     Never globs the directory; verifies JSON framing, entry count, safe paths,
-    and every RPM's SHA-256 digest.
+    every RPM's SHA-256 digest, and that noarch and aarch64 manifests belong
+    to the exact same build run_id.
     """
     base = Path(rpms_dir)
     noarch_manifest = base / "checked-rpms.json"
-    selected = _load_rpm_manifest(
+    selected, noarch_run_id, expect_aarch64 = _load_rpm_manifest(
         base,
         noarch_manifest,
         "noarch",
@@ -1588,11 +1641,25 @@ def select_checked_rpms(rpms_dir):
         if req not in selected:
             raise PolicyError(f"{noarch_manifest}: missing required package {req}")
     aarch64_manifest = base / "checked-aarch64-rpms.json"
-    if aarch64_manifest.exists() or aarch64_manifest.is_symlink():
-        arch_selected = _load_rpm_manifest(
+    has_aarch64 = aarch64_manifest.exists() or aarch64_manifest.is_symlink()
+    if has_aarch64:
+        if not expect_aarch64:
+            raise PolicyError(
+                f"{aarch64_manifest}: unexpected aarch64 manifest (noarch run {noarch_run_id} built with FWREPO=none)"
+            )
+        arch_selected, arch_run_id, _ = _load_rpm_manifest(
             base, aarch64_manifest, "aarch64", set(OPTIONAL_AARCH64_PACKAGES)
         )
+        if arch_run_id != noarch_run_id:
+            raise PolicyError(
+                f"{aarch64_manifest}: run_id {arch_run_id} does not match "
+                f"{noarch_manifest} run_id {noarch_run_id}"
+            )
         selected.update(arch_selected)
+    elif expect_aarch64:
+        raise PolicyError(
+            f"{aarch64_manifest}: missing aarch64 manifest for FWREPO run {noarch_run_id}"
+        )
     order = (
         REQUIRED_BOARD_PACKAGES + OPTIONAL_AARCH64_PACKAGES + OPTIONAL_NOARCH_PACKAGES
     )
@@ -1874,6 +1941,9 @@ def main(argv=None):
     p.add_argument("rpms_dir", type=Path)
     p.add_argument("manifest", type=Path)
     p.add_argument("--kind", choices=("noarch", "aarch64"), default="noarch")
+    p.add_argument("--run-id")
+    p.add_argument("--expect-aarch64", action="store_true")
+    p.add_argument("--bind-noarch", type=Path)
     p.add_argument("rpms", nargs="+", type=Path)
     p = sub.add_parser("select-rpms")
     p.add_argument("rpms_dir", type=Path)
@@ -2007,7 +2077,15 @@ def main(argv=None):
         return 0
     if a.cmd == "write-rpm-manifest":
         try:
-            write_rpm_manifest(a.rpms_dir, a.manifest, a.rpms, kind=a.kind)
+            write_rpm_manifest(
+                a.rpms_dir,
+                a.manifest,
+                a.rpms,
+                kind=a.kind,
+                run_id=a.run_id,
+                expect_aarch64=a.expect_aarch64,
+                bind_noarch=a.bind_noarch,
+            )
         except PolicyError as exc:
             print(f"write-rpm-manifest: {exc}", file=sys.stderr)
             return 1

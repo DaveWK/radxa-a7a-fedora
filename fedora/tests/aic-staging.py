@@ -620,6 +620,191 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
         ), "mkdevcard accepted tampered RPM bytes"
 
 
+def test_rpm_manifests_bound_to_one_run():
+    """Should-fix 4a: noarch and aarch64 manifests share one run_id; stale/other-run refused."""
+    if not shutil.which("rpmbuild") or not shutil.which("dtc"):
+        raise AssertionError("rpmbuild and dtc are required")
+    policy_script = repo_fedora / "devcard-policy.py"
+    with tempfile.TemporaryDirectory(prefix="a7a-runid-") as td:
+        root = Path(td)
+        out = root / "rpmbuild"
+        # Build a valid fixture cubie-a7a-fwlog RPM to plant as a prior-run aarch64 output.
+        spec_dir = root / "fwlog-rpm"
+        for d in ("SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS", "tmp"):
+            (spec_dir / d).mkdir(parents=True)
+        spec_file = spec_dir / "SPECS/cubie-a7a-fwlog.spec"
+        spec_file.write_text(
+            "Name: cubie-a7a-fwlog\nVersion: 0.1\nRelease: 1\n"
+            "Summary: test\nLicense: GPL-2.0-only\nBuildArch: noarch\n"
+            "%description\ntest\n%install\nmkdir -p %{buildroot}/usr/bin\n"
+            "echo hi > %{buildroot}/usr/bin/a7a-fwlog\n"
+            "%files\n/usr/bin/a7a-fwlog\n"
+        )
+        subprocess.run(
+            [
+                "rpmbuild",
+                "--define",
+                f"_topdir {spec_dir}",
+                "--define",
+                f"_tmppath {spec_dir}/tmp",
+                "-bb",
+                str(spec_file),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        fwlog_rpm = next((spec_dir / "RPMS/noarch").glob("cubie-a7a-fwlog-*.rpm"))
+        (out / "RPMS/aarch64").mkdir(parents=True)
+        dst_fwlog = out / "RPMS/aarch64" / fwlog_rpm.name
+        shutil.copy2(fwlog_rpm, dst_fwlog)
+        old_run_id = "a" * 32
+        r_old = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(policy_script),
+                "write-rpm-manifest",
+                str(out / "RPMS"),
+                str(out / "RPMS/checked-aarch64-rpms.json"),
+                "--kind",
+                "aarch64",
+                "--run-id",
+                old_run_id,
+                str(dst_fwlog),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r_old.returncode == 0, r_old.stderr
+        saved_old_manifest = (out / "RPMS/checked-aarch64-rpms.json").read_text()
+
+        # Run build-rpms.sh WITH FWREPO set: prior checked-aarch64-rpms.json MUST be cleared.
+        fwrepo = root / "fwrepo"
+        (fwrepo / "tools/a7a-fwlog").mkdir(parents=True)
+        (fwrepo / "tools/a7a-fwlog/a7a-fwlog.c").write_text(
+            "int main(void){return 0;}\n"
+        )
+        (fwrepo / "docs").mkdir(parents=True)
+        (fwrepo / "docs/fwlog.md").write_text("# fwlog\n")
+        r_bld = subprocess.run(
+            ["bash", str(repo_fedora / "build-rpms.sh"), str(out)],
+            env={
+                **os.environ,
+                "FWREPO": str(fwrepo),
+                "AIC8800_SRC": str(root / "absent-aic"),
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert r_bld.returncode == 0, r_bld.stderr
+        assert not (
+            out / "RPMS/checked-aarch64-rpms.json"
+        ).exists(), "build-rpms.sh left stale checked-aarch64-rpms.json when FWREPO set"
+
+        # Missing aarch64 manifest for FWREPO run MUST fail select-rpms.
+        r_miss = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(policy_script),
+                "select-rpms",
+                str(out / "RPMS"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            r_miss.returncode != 0
+        ), "select-rpms must refuse missing aarch64 manifest for FWREPO run"
+
+        # Planting the prior run's checked-aarch64-rpms.json (different run_id) MUST fail.
+        (out / "RPMS/checked-aarch64-rpms.json").write_text(saved_old_manifest)
+        r_stale = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(policy_script),
+                "select-rpms",
+                str(out / "RPMS"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            r_stale.returncode != 0 and "does not match" in r_stale.stderr
+        ), f"select-rpms accepted mismatched run_id: {r_stale.stdout}\n{r_stale.stderr}"
+
+        # Binding aarch64 manifest to this run's checked-rpms.json succeeds and shares run_id.
+        r_bind = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(policy_script),
+                "write-rpm-manifest",
+                str(out / "RPMS"),
+                str(out / "RPMS/checked-aarch64-rpms.json"),
+                "--kind",
+                "aarch64",
+                "--bind-noarch",
+                str(out / "RPMS/checked-rpms.json"),
+                str(dst_fwlog),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r_bind.returncode == 0, r_bind.stderr
+        r_ok = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(policy_script),
+                "select-rpms",
+                str(out / "RPMS"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r_ok.returncode == 0 and "cubie-a7a-fwlog\t" in r_ok.stdout, (
+            r_ok.returncode,
+            r_ok.stdout,
+            r_ok.stderr,
+        )
+
+        # FWREPO=none run refuses any stray checked-aarch64-rpms.json.
+        r_none = subprocess.run(
+            ["bash", str(repo_fedora / "build-rpms.sh"), str(out)],
+            env={
+                **os.environ,
+                "FWREPO": "none",
+                "AIC8800_SRC": str(root / "absent-aic"),
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert r_none.returncode == 0, r_none.stderr
+        (out / "RPMS/checked-aarch64-rpms.json").write_text(saved_old_manifest)
+        r_stray = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(policy_script),
+                "select-rpms",
+                str(out / "RPMS"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert (
+            r_stray.returncode != 0
+        ), "select-rpms must refuse stray aarch64 manifest when FWREPO=none"
+
+
 def main():
     case("stage: copies only the listed inputs", test_stage_copies_only_listed_inputs)
     case("stage: refuses firmware in the source", test_stage_refuses_firmware_in_source)
@@ -654,6 +839,10 @@ def main():
     case(
         "mkdevcard: consumes only checked manifest RPMs, never stale globs (Should-fix/S0-6)",
         test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest,
+    )
+    case(
+        "build-rpms: noarch and aarch64 manifests bound to one run_id (Should-fix 4a)",
+        test_rpm_manifests_bound_to_one_run,
     )
     if FAILURES:
         print(f"{len(FAILURES)} test(s) FAILED")

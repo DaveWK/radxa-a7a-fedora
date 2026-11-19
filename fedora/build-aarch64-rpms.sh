@@ -59,5 +59,6 @@ if ((${#built_aarch64[@]} == 0)); then
 fi
 python3 -I "$TOP/fedora/devcard-policy.py" write-rpm-manifest \
     "$OUT/RPMS" "$OUT/RPMS/checked-aarch64-rpms.json" --kind aarch64 \
+    --bind-noarch "$OUT/RPMS/checked-rpms.json" \
     "${built_aarch64[@]}"
 printf '%s\n' "${built_aarch64[@]}"
