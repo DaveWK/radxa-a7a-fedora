@@ -185,6 +185,12 @@ def manifest_roundtrip():
         manifest = tmp / "devcard-manifest.json"
         r = run(
             "write",
+            "--boot-modes",
+            "protective",
+            "--grow-root",
+            "no",
+            "--first-boot",
+            "",
             str(img),
             str(root),
             str(rpms),
@@ -196,6 +202,11 @@ def manifest_roundtrip():
         manifest_sha = r.stdout.strip()
         assert len(manifest_sha) == 64, manifest_sha
         assert manifest_sha == hashlib.sha256(manifest.read_bytes()).hexdigest()
+        assert json.loads(manifest.read_text())["profile"] == {
+            "boot_modes": "protective",
+            "first_boot": "",
+            "grow_root": "no",
+        }
 
         r = run("verify", str(img), str(manifest))
         assert r.returncode == 0, (r.stderr, r.stdout)
@@ -213,6 +224,12 @@ def manifest_refuses_differences():
         manifest = tmp / "devcard-manifest.json"
         r = run(
             "write",
+            "--boot-modes",
+            "protective",
+            "--grow-root",
+            "no",
+            "--first-boot",
+            "",
             str(img),
             str(root),
             str(rpms),

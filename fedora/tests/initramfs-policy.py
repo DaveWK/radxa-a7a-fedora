@@ -32,6 +32,17 @@ def cases(work):
     args = [str(root), str(kernels), str(record)]
     check([*SCRIPT, "capture-digest", *args], 0)
     check([*SCRIPT, "verify-digest", *args], 0)
+    # In particular, valid zstd is not evidence of valid newc.
+    compressed = subprocess.run(
+        ["zstd", "-qc", "--check"],
+        input=b"not a newc archive",
+        capture_output=True,
+        check=True,
+    ).stdout
+    good.write_bytes(compressed)
+    check(["zstd", "-t", "--check", "--", str(good)], 0)
+    good.write_bytes(compressed[:-1])
+    check(["zstd", "-t", "--check", "--", str(good)], 1)
     good.write_bytes(b"replacement initramfs bytes")
     check([*SCRIPT, "verify-digest", *args], 1, "digest differs")
     extra = bootdir / "initramfs-extra.img"

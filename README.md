@@ -58,6 +58,34 @@ is the only login, the password is `Fedora123` (`ROOT_PASSWORD`), sshd and
 DHCP are on, and the image holds no SSH keys of anyone (host keys are
 generated on first boot).
 
+### Dev card pre-boot checks
+
+`fedora/mkdevcard.sh` records the requested profile in the build manifest. The
+staged policy below runs after the overlay for `BOOT_MODES=protective`,
+`GROW_ROOT=no`, with no `FIRST_BOOT` selection. These checks read plain files
+and compare symlink target strings, not effective systemd state.
+
+| Check | Proves | Does not prove |
+| --- | --- | --- |
+| BLS triples, default, kernel/initrd paths and options | The final entries match those staged by the build for `kernel.txt`, and point to its kernel and digest-bound initramfs. The default has the expected root UUID, `ro`, and journal no-replay (`rootflags=noload` in `fedora/bootmodes/cubie-a7a-bootmode`). | Which entry, kernel or initramfs actually booted. |
+| First boot | The build's `grub.cfg` uses `saved_entry` when no `next_entry` is present; the saved entry is protective, the installed helper files match, and the protective overlay adds no service or timer files. | Effective systemd units or runtime boot actions. |
+| Growth | `repart.d` entries are listed and contain no `.conf` files; fstab has no `x-systemd.growfs`; the three growth mask targets are exactly `/dev/null`. | Runtime growth or absence of disk writes. |
+| Identity | The machine ID remains empty, as staged by the build; there is no random seed or SSH host key. | The identity generated on boot. |
+| Accounts | The staged root password matches the build-selected password, no other account has an unlocked password, and there is exactly one UID 0 account (`root`) and no other human UID. No password hash is printed. | Live PAM, NSS or SSH login behaviour. |
+| Wi-Fi | No persisted NetworkManager connection in `/etc/NetworkManager/system-connections/` and no staged `wpa_supplicant` network block in the standard `/etc` configuration locations. | Live networking or hardware isolation. |
+
+Integrity checks are independent of that profile:
+
+| Check | Proves | Does not prove |
+| --- | --- | --- |
+| AIC firmware signer and digests | The staged AIC firmware matches Fedora-signed RPM records before the final dracut run. | Which firmware actually loaded on the board. |
+| Overlay veto | The overlay cannot write `/boot/initramfs-*` or the firmware directory (including its `/lib` alias). | What is inside the initramfs. |
+| Initramfs SHA-256 | The final staged initramfs bytes match those captured immediately after building the shipping images with dracut. | Archive content, device nodes or the actual boot handoff. |
+| `zstd -t --check` | Stream integrity only. | Newc validity, content, or which initramfs boots. |
+
+Effective systemd state and initramfs content belong to on-board acceptance,
+not an offline simulation.
+
 ## Tests
 
     python3 fedora/tests/pinctrl-bank-supply.py

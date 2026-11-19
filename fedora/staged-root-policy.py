@@ -3,6 +3,8 @@
 """Final staged-root policy and two targeted checks on the packed root FS."""
 
 import argparse
+import hashlib
+import hmac
 import os
 import re
 import stat
@@ -12,7 +14,12 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from staged_paths import resolve, walk
+from runpy import run_path
+
+account_policy = run_path(str(Path(__file__).with_name("devcard-policy.py")))
+passwd_sole_root = account_policy["passwd_sole_root"]
+shadow_fields = account_policy["shadow_fields"]
+from staged_paths import physical, walk
 
 
 class PolicyError(RuntimeError):
@@ -20,49 +27,66 @@ class PolicyError(RuntimeError):
 
 
 def regular(root, relative):
-    path = resolve(root, relative)
-    if not path.is_file() or path.is_symlink():
+    path = physical(root, relative)
+    if not stat.S_ISREG(path.lstat().st_mode):
         raise PolicyError(f"{relative}: expected a regular file")
     return path
 
 
 def absent_glob(root, directory, pattern):
-    path = root / directory
-    if not os.path.lexists(path):
+    directory = optional_dir(root, directory)
+    if directory is None:
         return
-    directory = resolve(root, directory)
     for entry in directory.glob(pattern):
         raise PolicyError(f"unexpected staged entry: {entry.relative_to(root)}")
 
 
 def absent_text(root, roots, regex, skip=None):
     for name in roots:
-        if not os.path.lexists(root / name):
+        path = physical(root, name, missing=True)
+        if path is None:
             continue
-        for entry in walk(resolve(root, name)):
+        for entry in walk(path):
             if entry.name == skip:
                 continue
             rel = entry.relative_to(root)
             if entry.is_symlink():
-                entry = resolve(root, rel)
-            if entry.is_file() and regex.search(entry.read_text(errors="replace")):
+                raise PolicyError(f"{rel}: unexpected symlink in Wi-Fi policy")
+            if stat.S_ISREG(entry.lstat().st_mode) and regex.search(
+                entry.read_text(errors="replace")
+            ):
                 raise PolicyError(f"{rel}: forbidden Wi-Fi policy {regex.pattern!r}")
 
 
+def optional_dir(root, relative):
+    path = physical(root, relative, missing=True)
+    if path is not None and not stat.S_ISDIR(path.lstat().st_mode):
+        raise PolicyError(f"{relative}: expected a real directory")
+    return path
+
+
 def first_boot(root):
+    # Plain initial identity state only, not the identity generated on boot.
     for directory, pattern in (
         ("etc/ssh", "ssh_host_*"),
         ("root/.ssh", "authorized_keys*"),
     ):
         absent_glob(root, directory, pattern)
     for name in (".autorelabel", "var/lib/systemd/random-seed"):
-        if os.path.lexists(root / name):
+        if physical(root, name, missing=True) is not None:
             raise PolicyError(f"unexpected first-boot state: {name}")
     if regular(root, "etc/machine-id").stat().st_size:
         raise PolicyError("etc/machine-id is not empty for first boot")
 
 
 def wifi(root):
+    # No persisted connection profiles or wpa_supplicant network blocks; not live policy.
+    absent_glob(root, "etc/NetworkManager/system-connections", "*")
+    absent_text(
+        root,
+        ("etc/wpa_supplicant", "etc/wpa_supplicant.conf"),
+        re.compile(r"^[ \t]*network[ \t]*=", re.M),
+    )
     absent_text(
         root,
         ("etc/NetworkManager", "usr/lib/NetworkManager/conf.d"),
@@ -98,7 +122,8 @@ def wifi(root):
 def bls(path):
     result = {}
     for line in path.read_text().splitlines():
-        field, _, value = line.partition(" ")
+        parts = line.split(maxsplit=1)
+        field, value = (parts + [""])[:2] if parts else ("", "")
         if field in ("linux", "initrd", "version", "options", "title"):
             if field in result or not value.strip():
                 raise PolicyError(f"{path}: duplicate or empty BLS {field}")
@@ -108,7 +133,8 @@ def bls(path):
     return result
 
 
-def grubenv(root, defaults, first):
+def grubenv(root, saved_entry):
+    # GRUB's shipped grub.cfg selects saved_entry only if next_entry is absent.
     path = regular(root, "boot/grub2/grubenv")
     data = path.read_bytes()
     if len(data) != 1024 or not data.startswith(b"# GRUB Environment Block\n"):
@@ -119,118 +145,126 @@ def grubenv(root, defaults, first):
             continue
         key, sep, value = line.partition("=")
         if not sep or key in variables:
-            raise PolicyError(f"{path}: invalid or duplicate GRUB setting {key}")
+            raise PolicyError(f"{path}: invalid or duplicate GRUB setting")
         variables[key] = value
-    saved = variables.get("saved_entry")
-    if saved not in defaults:
-        raise PolicyError(f"{path}: saved_entry is not a protective default")
-    if first == "maintenance":
-        if variables.get("next_entry") != f"{saved}~maintenance":
-            raise PolicyError(
-                f"{path}: next_entry is not the one-shot maintenance entry"
-            )
-    elif "next_entry" in variables:
+    if variables.get("saved_entry") != saved_entry:
+        raise PolicyError(f"{path}: saved_entry is not the build's protective default")
+    if "next_entry" in variables:
         raise PolicyError(f"{path}: unexpected next_entry")
 
 
-def protective(root, default_args, first):
-    hat = "cubie_a7a.hat=0"
-    protection = set(default_args.split()) - {hat}
-    wanted = protection | {hat}
-    if not protection:
-        raise PolicyError("missing protective default arguments")
-    helper = "usr/local/bin/cubie-a7a-bootmode"
-    plugin = "etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
-    for name in (helper, plugin):
-        if not (regular(root, name).stat().st_mode & stat.S_IXUSR):
-            raise PolicyError(f"{name}: expected an executable")
-    if "/usr/local/bin/cubie-a7a-bootmode" not in regular(root, plugin).read_text():
-        raise PolicyError(f"{plugin}: does not call the staged helper")
-    for mode in ("ro", "next"):
-        unit = f"cubie-a7a-bootmode-{mode}.service"
+BOOT_HELPER = "usr/local/bin/cubie-a7a-bootmode"
+BOOT_PLUGIN = "etc/kernel/install.d/96-cubie-a7a-bootmodes.install"
+BOOT_UNITS = ("cubie-a7a-bootmode-ro.service", "cubie-a7a-bootmode-next.service")
+
+
+def expected_files(root, expected):
+    # Match build GRUB config and owned helpers as plain files, not effective units.
+    for name in ("boot/grub2/grub.cfg", "etc/default/grub", "etc/kernel/cmdline"):
+        if regular(root, name).read_bytes() != regular(expected, name).read_bytes():
+            raise PolicyError(f"{name}: changed since build staging")
+    for name in (BOOT_HELPER, BOOT_PLUGIN):
+        live = regular(root, name)
+        if (
+            not live.stat().st_mode & stat.S_IXUSR
+            or live.read_bytes() != regular(expected, name).read_bytes()
+        ):
+            raise PolicyError(f"{name}: expected the build's executable")
+    for unit in BOOT_UNITS:
         rel = f"etc/systemd/system/{unit}"
-        link = root / "etc/systemd/system/sysinit.target.wants" / unit
-        text = regular(root, rel).read_text().splitlines()
-        if not link.is_symlink() or resolve(root, link.relative_to(root)) != root / rel:
-            raise PolicyError(f"{link}: expected persistent boot-mode enablement")
-        if not any(
-            line.startswith("ExecStart=/usr/local/bin/cubie-a7a-bootmode ")
-            for line in text
-        ):
-            raise PolicyError(f"{rel}: does not call the staged helper")
-        if mode == "next" and (
-            "ConditionKernelCommandLine=!systemd.volatile=overlay" not in text
-            or "ExecStart=/usr/local/bin/cubie-a7a-bootmode consume-next" not in text
-        ):
-            raise PolicyError(f"{rel}: invalid one-shot consumption policy")
-    cmdline = regular(root, "etc/kernel/cmdline")
-    defaults = regular(root, "etc/default/grub")
-    match = re.search(r'^GRUB_CMDLINE_LINUX="([^"\n]*)"$', defaults.read_text(), re.M)
+        link = physical(root, f"etc/systemd/system/sysinit.target.wants/{unit}")
+        # Compare target strings; never let the OS resolve the unit symlink.
+        if not link.is_symlink() or os.readlink(link) not in (f"../{unit}", f"/{rel}"):
+            raise PolicyError(f"{link}: expected the build's boot-mode link")
+        if regular(root, rel).read_bytes() != regular(expected, rel).read_bytes():
+            raise PolicyError(f"{rel}: changed since build staging")
     if (
-        not wanted <= set(cmdline.read_text().split())
-        or not match
-        or not wanted <= set(match[1].split())
+        regular(root, "etc/kernel/cmdline").stat().st_mtime_ns
+        <= regular(root, "etc/default/grub").stat().st_mtime_ns
     ):
-        raise PolicyError("kernel cmdline or GRUB defaults lack protective arguments")
-    if cmdline.stat().st_mtime_ns <= defaults.stat().st_mtime_ns:
         raise PolicyError("etc/kernel/cmdline must be newer than etc/default/grub")
-    for name in (
+    for unit in (
         "cubie-a7a-dtb.service",
         "systemd-repart.service",
         "systemd-growfs-root.service",
     ):
-        regular(root, "usr/lib/systemd/system/" + name)
-    grub = regular(root, "boot/grub2/grub.cfg").read_text()
-    if (
-        'set default="${next_entry}"' not in grub
-        or re.findall(r"(?m)^\s*save_env\s+(\S+)\s*$", grub) != ["next_entry"]
-        or grub.count("save_env") != 1
-    ):
-        raise PolicyError(
-            "boot/grub2/grub.cfg: only the one-shot next_entry may be saved"
-        )
-    directory = root / "boot/loader/entries"
-    paths = {entry.stem: entry for entry in directory.glob("*.conf")}
-    heads = {name for name in paths if "~" not in name}
-    kernels = {p.name for p in (root / "usr/lib/modules").iterdir() if p.is_dir()}
+        regular(root, "usr/lib/systemd/system/" + unit)
+
+
+def bls_entries(root):
+    base = optional_dir(root, "boot/loader/entries")
+    if base is None:
+        raise PolicyError("missing boot/loader/entries")
+    return {p.stem: regular(root, p.relative_to(root)) for p in base.glob("*.conf")}
+
+
+def boot_entries(root, expected, kernels, root_uuid, default_args, saved):
+    # Bind BLS triples/options and their files to this build, not a boot transcript.
+    files = bls_entries(root)
+    built = bls_entries(expected)
+    heads = {name for name in built if "~" not in name}
     if (
         not heads
-        or len(heads) != len(kernels)
-        or set(paths)
+        or saved not in heads
+        or files.keys() != built.keys()
+        or set(files)
         != {name + mode for name in heads for mode in ("", "~maintenance", "~full")}
     ):
-        raise PolicyError(f"{directory}: expected three entries per installed kernel")
-    versions = set()
-    for id in sorted(heads):
-        default, maintenance, full = (
-            bls(regular(root, paths[id + mode].relative_to(root)))
-            for mode in ("", "~maintenance", "~full")
+        raise PolicyError(
+            "boot/loader/entries: expected the build's three entries per kernel"
         )
-        versions.add(default["version"])
-        if any(
-            len({entry[field] for entry in (default, maintenance, full)}) != 1
-            for field in ("linux", "initrd", "version")
-        ):
-            raise PolicyError(
-                f"{id}: protective BLS entries boot different kernel/initramfs"
-            )
+    versions = []
+    command_line = regular(expected, "etc/kernel/cmdline").read_text().split()
+    hat = "cubie_a7a.hat=0"
+    protection = set(default_args.split()) - {hat}
+    for head in sorted(heads):
+        default, maintenance, full = (
+            bls(files[head + mode]) for mode in ("", "~maintenance", "~full")
+        )
+        version = default["version"]
+        if version not in kernels:
+            raise PolicyError(f"{head}: BLS version is not a build kernel")
+        versions.append(version)
+        linux = f"/boot/vmlinuz-{version}"
+        initrd = f"/boot/initramfs-{version}.img"
+        for entry in (default, maintenance, full):
+            if (entry["version"], entry["linux"], entry["initrd"]) != (
+                version,
+                linux,
+                initrd,
+            ):
+                raise PolicyError(
+                    f"{head}: BLS paths are not the build kernel/initramfs"
+                )
+        with regular(root, linux.removeprefix("/")).open("rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual != regular(expected, f"vmlinuz-{version}.sha256").read_text().strip():
+            raise PolicyError(f"{head}: vmlinuz digest differs from build output")
+        # The profile-independent digest check separately verifies this initramfs path.
+        regular(root, initrd.removeprefix("/"))
         primary = default["options"].split()
-        middle = maintenance["options"].split()
-        last = full["options"].split()
-        if (
-            not wanted <= set(primary)
-            or middle != [word for word in primary if word not in protection]
-            or hat not in middle
-            or last != [word for word in middle if word != hat]
-            or any(
-                word.startswith(("cubie_a7a.hat", "systemd.volatile")) for word in last
-            )
+        middle = [word for word in primary if word not in protection]
+        root_flags = [word for word in primary if word.startswith("rootflags=")]
+        if len(root_flags) != 1 or not {"noload", "norecovery"}.intersection(
+            root_flags[0].split("=", 1)[1].split(",")
         ):
             raise PolicyError(
-                f"{id}: invalid protective, maintenance or full BLS options"
+                f"{head}: BLOCKED: protective options need a journal no-replay flag"
             )
-        for entry, suffix in zip(
-            (default, maintenance, full),
+        if (
+            primary != command_line
+            or not protection | {hat} <= set(primary)
+            or [word for word in primary if word.startswith("root=")]
+            != [f"root=UUID={root_uuid}"]
+            or [word for word in primary if word in ("ro", "rw")] != ["ro"]
+            or middle != maintenance["options"].split()
+            or [word for word in middle if word != hat] != full["options"].split()
+        ):
+            raise PolicyError(
+                f"{head}: invalid protective, maintenance or full BLS options"
+            )
+        for mode, suffix in zip(
+            ("", "~maintenance", "~full"),
             (
                 "(protective: ro overlay, hat=0)",
                 " maintenance (rw, hat=0)",
@@ -238,20 +272,73 @@ def protective(root, default_args, first):
             ),
             strict=True,
         ):
-            if not entry["title"].endswith(suffix):
-                raise PolicyError(f"{id}: BLS title does not name the boot mode")
-    if versions != kernels:
-        raise PolicyError("protective BLS versions differ from installed kernels")
-    newest = subprocess.run(
-        ["sort", "-rV"],
-        input="\n".join(paths) + "\n",
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.splitlines()[0]
-    if newest not in heads:
-        raise PolicyError("protective BLS default must sort ahead of its alternates")
-    grubenv(root, heads, first)
+            name = head + mode
+            if (
+                not bls(files[name])["title"].endswith(suffix)
+                or files[name].read_bytes() != built[name].read_bytes()
+            ):
+                raise PolicyError(f"{name}: BLS entry differs from the build")
+    if sorted(versions) != sorted(kernels):
+        raise PolicyError("protective BLS versions differ from kernel.txt")
+    grubenv(root, saved)
+
+
+def growth(root):
+    # Proves no staged repart configs, fstab growfs option or unmasked unit path.
+    # A runtime unit or generator's behaviour is for board acceptance.
+    entries = []
+    for prefix in ("etc", "usr/lib", "usr/local/lib", "run"):
+        directory = optional_dir(root, prefix + "/repart.d")
+        if directory is not None:
+            entries.extend(
+                p.relative_to(root).as_posix() for p in sorted(directory.iterdir())
+            )
+    if any(name.endswith(".conf") for name in entries):
+        raise PolicyError(f"unexpected repart.d config: {entries}")
+    print(f"protective repart.d entries: {entries}")
+    for line in regular(root, "etc/fstab").read_text().splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 4 and "x-systemd.growfs" in fields[3].split(","):
+            raise PolicyError("etc/fstab: unexpected x-systemd.growfs")
+    for unit in (
+        "systemd-repart.service",
+        "systemd-repart@.service",
+        "systemd-growfs-root.service",
+    ):
+        rel = f"etc/systemd/system/{unit}"
+        path = physical(root, rel, missing=True)
+        if path is None or not path.is_symlink() or os.readlink(path) != "/dev/null":
+            raise PolicyError(f"{rel}: expected an exact /dev/null mask")
+
+
+def accounts(root, expected):
+    # Match the build's intended root password and sole-human-account policy;
+    # never emit password material or infer live NSS/sshd behaviour.
+    text = regular(root, "etc/shadow").read_text()
+    _, password, others = shadow_fields(text)
+    rows = [line.split(":", 2) for line in text.splitlines()]
+    if (
+        sum(row[0] == "root" for row in rows) != 1
+        or not expected.startswith("$6$")
+        or not hmac.compare_digest(password.encode(), expected.encode())
+        or others
+        or any(
+            len(row) < 2 or (row[0] != "root" and not row[1].startswith(("!", "*")))
+            for row in rows
+        )
+    ):
+        raise PolicyError("etc/shadow: expected only the build's root password")
+    if not passwd_sole_root(regular(root, "etc/passwd").read_text()):
+        raise PolicyError("etc/passwd: expected root as the sole human account")
+
+
+def overlay_units(overlay):
+    # No overlay-defined first-boot services/timers; does not resolve units.
+    for prefix in ("etc", "run", "usr/local/lib", "usr/lib", "lib"):
+        name = prefix + "/systemd/system"
+        path = optional_dir(overlay, name)
+        if path is not None and any(path.iterdir()):
+            raise PolicyError(f"protective overlay writes units or timers: {name}")
 
 
 def debugfs(image, command):
@@ -284,8 +371,13 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     staged = sub.add_parser("staged")
     staged.add_argument("root", type=Path)
-    staged.add_argument("--default-args")
-    staged.add_argument("--first-boot", choices=("", "maintenance"), default="")
+    staged.add_argument("expected", type=Path)
+    staged.add_argument("kernels", type=Path)
+    staged.add_argument("root_uuid")
+    staged.add_argument("default_args")
+    staged.add_argument("saved_entry")
+    overlay = sub.add_parser("overlay")
+    overlay.add_argument("directory", type=Path)
     packed = sub.add_parser("packed")
     packed.add_argument("root_image", type=Path)
     packed.add_argument("--protective", action="store_true")
@@ -294,8 +386,19 @@ def main():
         if args.command == "staged":
             first_boot(args.root)
             wifi(args.root)
-            if args.default_args is not None:
-                protective(args.root, args.default_args, args.first_boot)
+            growth(args.root)
+            accounts(args.root, sys.stdin.read().rstrip("\n"))
+            boot_entries(
+                args.root,
+                args.expected,
+                args.kernels.read_text().splitlines(),
+                args.root_uuid,
+                args.default_args,
+                args.saved_entry,
+            )
+            expected_files(args.root, args.expected)
+        elif args.command == "overlay":
+            overlay_units(args.directory)
         else:
             packed_root(args.root_image, args.protective)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:

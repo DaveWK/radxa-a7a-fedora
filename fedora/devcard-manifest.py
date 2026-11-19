@@ -20,7 +20,8 @@ Commands:
       every partition's bytes and of the firmware gap (LBA 256 to the first
       partition), the whole-image sha256, the ESP files (from DIR or FILE),
       the initramfs files under ROOT/boot, the DTB stamps, and board RPMs (NEVRA, %{ARCH}, sha256) using the
-       JSON records retained from RPM selection. IMG and ROOT are only read.
+       JSON records retained from RPM selection, plus the requested build
+       profile. IMG and ROOT are only read.
   verify IMG MANIFEST
       Load MANIFEST, check its schema, and recompute every value from IMG:
       the GPT, each partition's and the gap's sha256, the whole image, the
@@ -248,11 +249,12 @@ def _rpm_model(records):
     return sorted(entries, key=lambda e: e["nevra"])
 
 
-def write_manifest(img, root, esp_files, rpm_records, manifest):
+def write_manifest(img, root, esp_files, rpm_records, manifest, profile):
     img = Path(img)
     root = Path(root)
     payload = {
         "schema": SCHEMA,
+        "profile": profile,
         "gpt": _partition_table_model(img),
         "gap": _gap_model(img),
         "esp": {"files": esp_files},
@@ -445,6 +447,9 @@ def main(argv=None):
     p.add_argument("root", type=Path)
     p.add_argument("rpm_records")
     p.add_argument("manifest", type=Path)
+    p.add_argument("--boot-modes", choices=("", "protective"), required=True)
+    p.add_argument("--grow-root", choices=("yes", "no"), required=True)
+    p.add_argument("--first-boot", choices=("", "maintenance"), required=True)
     esp = p.add_mutually_exclusive_group(required=True)
     esp.add_argument("--esp-dir", type=Path)
     esp.add_argument("--esp-model", type=Path)
@@ -490,6 +495,11 @@ def main(argv=None):
                 esp_files,
                 rpm_records,
                 a.manifest,
+                {
+                    "boot_modes": a.boot_modes,
+                    "grow_root": a.grow_root,
+                    "first_boot": a.first_boot,
+                },
             )
             print(_sha256_path(a.manifest))
         else:

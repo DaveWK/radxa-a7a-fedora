@@ -511,6 +511,25 @@ fi
 rm -rf "$ROOT"/var/cache/dnf/* "$ROOT"/var/lib/dnf/repos "$ROOT"/var/log/dnf* \
     "$ROOT"/var/lib/systemd/random-seed "$ROOT"/tmp/*
 
+acceptance=no
+if [ "$BOOT_MODES" = protective ] && [ "$GROW_ROOT" = no ] && [ -z "$FIRST_BOOT" ]; then
+    acceptance=yes
+    expected=$W/preboot
+    mkdir -- "$expected"
+    expected=$(realpath -e -- "$expected")
+    # Retain the build-owned BLS/GRUB inputs before the overlay can edit them.
+    (
+        cd "$ROOT"
+        cp --parents -- boot/loader/entries/*.conf boot/grub2/grub.cfg \
+            etc/default/grub etc/kernel/cmdline usr/local/bin/cubie-a7a-bootmode \
+            etc/kernel/install.d/96-cubie-a7a-bootmodes.install \
+            etc/systemd/system/cubie-a7a-bootmode-{ro,next}.service "$expected/"
+        while IFS= read -r k; do
+            sha256sum <"boot/vmlinuz-$k" | cut -d ' ' -f1 >"$expected/vmlinuz-$k.sha256"
+        done <"$W/kernel.txt"
+    )
+fi
+
 # Every AIC8800 file under usr/lib/firmware must be owned by a signed Fedora
 # package and match that package's recorded digest: provenance, not path.
 # Fedora's linux-firmware owns aic/aic8800d80 and passes; an unowned file
@@ -533,6 +552,9 @@ python3 -I "$TOP/fedora/initramfs-policy.py" capture-digest "$ROOT" "$W/kernel.t
 # it are enabled, and the dynamic linker cache is refreshed.
 if [ -n "$OVERLAY" ]; then
     python3 -I "$TOP/fedora/initramfs-policy.py" overlay "$OVERLAY"
+    if [ "$acceptance" = yes ]; then
+        python3 -I "$TOP/fedora/staged-root-policy.py" overlay "$OVERLAY"
+    fi
     # Refuse AIC8800 firmware paths and manifest-named AIC files before the
     # copy: only a Fedora package may put those files in an image (DECISIONS
     # 2026-11-11; Dave 2026-11-19: linux-firmware's own files are fine, ours
@@ -588,12 +610,12 @@ find "$ROOT/dev" -mindepth 1 -empty -type d -delete
 # before the final staged checks and packing. This still runs in the builder
 # namespace, after overlays and after removing the original dev/null mount.
 "$TOP/fedora/check-sshd.sh" "$ROOT" "$W/effective-sshd.txt"
-root_policy_args=()
-if [ "$BOOT_MODES" = protective ]; then
+if [ "$acceptance" = yes ]; then
     default_args=$("$TOP/fedora/bootmodes/cubie-a7a-bootmode" default-args)
-    root_policy_args+=(--default-args "$default_args" --first-boot "$FIRST_BOOT")
+    printf '%s\n' "$PW_HASH" |
+        python3 -I "$TOP/fedora/staged-root-policy.py" staged "$ROOT" "$expected" \
+            "$W/kernel.txt" "$ROOT_UUID" "$default_args" "$def"
 fi
-python3 -I "$TOP/fedora/staged-root-policy.py" staged "$ROOT" "${root_policy_args[@]}"
 STAGE1
 
 # zstd -t --check: stream integrity only; not newc validity, not content, not which initramfs boots.
@@ -705,7 +727,8 @@ EOF
 MANIFEST_PATH="$OUT.devcard-manifest.json"
 manifest_sha=$(python3 -I "$TOP/fedora/devcard-manifest.py" write "$OUT" "$ROOT" \
     "$RPM_RECORDS" "$MANIFEST_PATH" \
-    --esp-model "$W/esp-model.json") ||
+    --esp-model "$W/esp-model.json" --boot-modes "$BOOT_MODES" \
+    --grow-root "$GROW_ROOT" --first-boot "$FIRST_BOOT") ||
     die "cannot write the build manifest"
 cat >>"$W/manifest.txt" <<EOF
 manifest    $MANIFEST_PATH sha256 $manifest_sha
