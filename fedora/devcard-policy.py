@@ -45,11 +45,17 @@ Commands:
 
 import argparse
 import base64
+import bz2
 import errno
+import gzip
 import hashlib
+import importlib
+import lzma
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -947,54 +953,263 @@ def repart_root_ok(root):
     return (not problems, problems)
 
 
-def _parse_lsinitrd_listing(listing):
-    """Return list of (kind, relpath, size_or_target) for repart-related entries."""
+LSINITRD_RULE = "=" * 72
+LS_ROW_RE = re.compile(r"^([dlcbps-])[rwxsStT-]{9}[.+@]?\s")
+CPIO_NEWC_MAGICS = (b"070701", b"070702")
+
+
+def _norm_archive_path(name):
+    rel = name.lstrip("/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel if rel else "."
+
+
+def _decompress_initramfs_segment(buf):
+    """Decompress a compressed initramfs segment, failing closed on truncation/error."""
+    if buf.startswith(b"\x1f\x8b"):
+        try:
+            return gzip.decompress(buf)
+        except OSError as exc:
+            raise PolicyError(f"truncated or corrupt gzip initramfs: {exc}") from exc
+    if buf.startswith(b"\xfd7zXZ\x00"):
+        try:
+            return lzma.decompress(buf)
+        except lzma.LZMAError as exc:
+            raise PolicyError(f"truncated or corrupt xz initramfs: {exc}") from exc
+    if buf.startswith(b"BZh"):
+        try:
+            return bz2.decompress(buf)
+        except OSError as exc:
+            raise PolicyError(f"truncated or corrupt bzip2 initramfs: {exc}") from exc
+    if buf.startswith(b"\x28\xb5\x2f\xfd"):
+        try:
+            zstd = importlib.import_module("compression.zstd")
+            return zstd.decompress(buf)
+        except ImportError:
+            pass
+        except Exception as exc:
+            raise PolicyError(f"truncated or corrupt zstd initramfs: {exc}") from exc
+        if not shutil.which("zstd"):
+            raise PolicyError("zstd is unavailable to verify zstd initramfs")
+        res = subprocess.run(["zstd", "-qdc"], input=buf, capture_output=True)
+        if res.returncode != 0 or res.stderr.strip():
+            raise PolicyError(
+                f"truncated or corrupt zstd initramfs: {res.stderr.decode(errors='replace').strip()}"
+            )
+        return res.stdout
+    if buf.startswith((b"\x04\x22\x4d\x18", b"\x02\x21\x4c\x18")):
+        if not shutil.which("lz4"):
+            raise PolicyError("lz4 is unavailable to verify lz4 initramfs")
+        res = subprocess.run(["lz4", "-qdc"], input=buf, capture_output=True)
+        if res.returncode != 0 or res.stderr.strip():
+            raise PolicyError(
+                f"truncated or corrupt lz4 initramfs: {res.stderr.decode(errors='replace').strip()}"
+            )
+        return res.stdout
+    raise PolicyError(f"unrecognized initramfs segment magic {buf[:8]!r}")
+
+
+def _parse_cpio_one(data, offset):
+    """Parse one cpio newc/crc archive starting at OFFSET, requiring TRAILER!!!."""
     entries = []
-    recognized = 0
-    for line in listing.splitlines():
-        if not line or line[0] not in ("-", "l"):
-            continue
-        parts = line.split(None, 8)
-        if len(parts) < 9 or not parts[4].isdigit():
-            continue
-        recognized += 1
-        mode, size_str, rest = parts[0], parts[4], parts[8]
-        if mode.startswith("l"):
-            if " -> " not in rest:
-                continue
-            rel, target = rest.split(" -> ", 1)
-            rel = rel.lstrip("/")
-            if rel.startswith("./"):
-                rel = rel[2:]
-            if INITRAMFS_REPART_RE.match(rel):
-                entries.append(("symlink", rel, target))
+    pos = offset
+    length = len(data)
+    while True:
+        if pos + 110 > length:
+            raise PolicyError("truncated cpio header before TRAILER!!!")
+        magic = data[pos : pos + 6]
+        if magic not in CPIO_NEWC_MAGICS:
+            raise PolicyError(f"bad cpio magic {magic!r} at offset {pos}")
+        try:
+            fields = [
+                int(data[pos + 6 + i * 8 : pos + 14 + i * 8], 16) for i in range(13)
+            ]
+        except ValueError as exc:
+            raise PolicyError(f"corrupt cpio header at offset {pos}") from exc
+        mode, filesize, namesize = fields[1], fields[6], fields[11]
+        pos += 110
+        if namesize < 1 or pos + namesize > length:
+            raise PolicyError("truncated cpio entry name before TRAILER!!!")
+        raw_name = data[pos : pos + namesize]
+        if not raw_name.endswith(b"\x00"):
+            raise PolicyError("unterminated cpio entry name")
+        name = os.fsdecode(raw_name[:-1])
+        pos += namesize
+        if pos % 4:
+            pos += 4 - (pos % 4)
+        if pos + filesize > length:
+            raise PolicyError(f"truncated cpio payload for {name!r}")
+        payload = data[pos : pos + filesize]
+        pos += filesize
+        if pos % 4:
+            pos += 4 - (pos % 4)
+        if name == "TRAILER!!!":
+            return entries, pos
+        rel = _norm_archive_path(name)
+        if stat.S_ISLNK(mode):
+            entries.append(("symlink", rel, os.fsdecode(payload)))
+        elif stat.S_ISREG(mode):
+            entries.append(("file", rel, filesize))
         else:
-            rel = rest.lstrip("/")
-            if rel.startswith("./"):
-                rel = rel[2:]
-            if INITRAMFS_REPART_RE.match(rel):
-                size = int(size_str) if size_str.isdigit() else 0
-                entries.append(("file", rel, size))
-    return recognized, entries
+            entries.append(("other", rel, 0))
 
 
-def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
-    """Extract systemd-repart units/drop-ins from IMG and verify effective command.
+def parse_cpio_stream(data):
+    """Parse one or more concatenated cpio newc/crc archives, each ending in TRAILER!!!."""
+    entries = []
+    pos = 0
+    length = len(data)
+    archives = 0
+    while pos < length:
+        while pos < length and data[pos] == 0:
+            pos += 1
+        if pos >= length:
+            break
+        if data[pos : pos + 6] not in CPIO_NEWC_MAGICS:
+            raise PolicyError(f"trailing non-cpio bytes at offset {pos}")
+        part, pos = _parse_cpio_one(data, pos)
+        entries.extend(part)
+        archives += 1
+    if archives == 0 or not entries:
+        raise PolicyError("cpio archive contains no entries")
+    return entries
 
-    Never accepts a drop-in by filename alone; fails closed when lsinitrd fails.
+
+def parse_cpio_initramfs(archive_path):
+    """Independently parse an initramfs image (early uncompressed + compressed cpio).
+
+    Every cpio segment must terminate cleanly at TRAILER!!! and every compressed
+    segment must decompress cleanly with zero unparsed trailing bytes.
+    """
+    path = Path(archive_path)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise PolicyError(f"cannot read initramfs {path}: {exc}") from exc
+    if not data:
+        raise PolicyError(f"empty initramfs archive {path}")
+    entries = []
+    pos = 0
+    length = len(data)
+    while pos < length:
+        while pos < length and data[pos] == 0:
+            pos += 1
+        if pos >= length:
+            break
+        if data[pos : pos + 6] in CPIO_NEWC_MAGICS:
+            part, pos = _parse_cpio_one(data, pos)
+            entries.extend(part)
+        else:
+            decompressed = _decompress_initramfs_segment(data[pos:])
+            entries.extend(parse_cpio_stream(decompressed))
+            pos = length
+    if not entries:
+        raise PolicyError(f"initramfs {path} contains no entries")
+    return entries
+
+
+def _parse_ls_row(line):
+    """Parse one lsinitrd `ls -l` row -> (kind, rel, meta), or raise PolicyError."""
+    match = LS_ROW_RE.match(line)
+    if not match:
+        raise PolicyError(f"malformed lsinitrd listing row: {line!r}")
+    ftype = match.group(1)
+    if ftype in ("c", "b"):
+        parts = line.split(None, 9)
+        if len(parts) < 10 or not parts[4].endswith(",") or not parts[5].isdigit():
+            raise PolicyError(f"malformed lsinitrd device row: {line!r}")
+        return ("other", _norm_archive_path(parts[9]), 0)
+    parts = line.split(None, 8)
+    if len(parts) < 9 or not parts[4].isdigit():
+        raise PolicyError(f"malformed lsinitrd listing row: {line!r}")
+    size_str, rest = parts[4], parts[8]
+    if ftype == "l":
+        if " -> " not in rest:
+            raise PolicyError(f"malformed lsinitrd symlink row: {line!r}")
+        rel, target = rest.split(" -> ", 1)
+        return ("symlink", _norm_archive_path(rel), target)
+    if ftype == "-":
+        return ("file", _norm_archive_path(rest), int(size_str))
+    return ("other", _norm_archive_path(rest), 0)
+
+
+def _parse_lsinitrd_listing(listing):
+    """Parse lsinitrd stdout requiring opening and closing 72-'=' section framing.
+
+    Returns (all_rows, repart_entries) where all_rows is a list of
+    (kind, relpath, size_or_target) across every file-listing section.
+    Raises PolicyError on missing closing separator, malformed listing row, or
+    empty listing.
+    """
+    lines = listing.splitlines()
+    rule_indices = [i for i, line in enumerate(lines) if line == LSINITRD_RULE]
+    if len(rule_indices) < 2:
+        raise PolicyError("incomplete lsinitrd listing: missing closing separator")
+    # If file-listing rows appear after the last closing separator, output was truncated.
+    trailing = lines[rule_indices[-1] + 1 :]
+    if any(LS_ROW_RE.match(line) for line in trailing):
+        raise PolicyError(
+            "incomplete lsinitrd listing: truncated after file rows without closing separator"
+        )
+    all_rows = []
+    repart_entries = []
+    for idx in range(len(rule_indices) - 1):
+        section = [
+            line
+            for line in lines[rule_indices[idx] + 1 : rule_indices[idx + 1]]
+            if line
+        ]
+        if not section:
+            continue
+        if not any(LS_ROW_RE.match(line) for line in section):
+            continue
+        for line in section:
+            kind, rel, meta = _parse_ls_row(line)
+            all_rows.append((kind, rel, meta))
+            if kind in ("file", "symlink") and INITRAMFS_REPART_RE.match(rel):
+                repart_entries.append((kind, rel, meta))
+    if not all_rows:
+        raise PolicyError("incomplete lsinitrd listing: no recognized file rows")
+    return all_rows, repart_entries
+
+
+def inspect_initramfs(img, lsinitrd_cmd=None, archive_path=None):
+    """Run lsinitrd and cross-check its framed listing against the raw cpio archive.
+
+    Returns (all_rows, repart_entries). Raises PolicyError if lsinitrd fails,
+    emits stderr, lacks closing section framing, or disagrees with the
+    independently parsed cpio archive (which requires TRAILER!!! on every segment).
     """
     cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
     listing = subprocess.run(cmd + [str(img)], capture_output=True, text=True)
-    if (
-        listing.returncode != 0
-        or listing.stderr.strip()
-        or "========" not in listing.stdout
-    ):
+    if listing.returncode != 0 or listing.stderr.strip():
         msg = listing.stderr.strip() or listing.stdout.strip() or "lsinitrd failed"
-        return False, [f"cannot inspect initramfs {img}: {msg}"]
-    recognized, entries = _parse_lsinitrd_listing(listing.stdout)
-    if not recognized:
-        return False, [f"cannot inspect initramfs {img}: no recognized file rows"]
+        raise PolicyError(f"cannot inspect initramfs {img}: {msg}")
+    all_rows, repart_entries = _parse_lsinitrd_listing(listing.stdout)
+    archive = Path(archive_path) if archive_path is not None else Path(img)
+    cpio_entries = parse_cpio_initramfs(archive)
+    listed_paths = sorted(rel for _, rel, _ in all_rows)
+    cpio_paths = sorted(rel for _, rel, _ in cpio_entries)
+    if listed_paths != cpio_paths:
+        raise PolicyError(
+            f"initramfs {img} listing mismatch: lsinitrd reported {len(listed_paths)} "
+            f"entries, cpio archive holds {len(cpio_paths)}"
+        )
+    return all_rows, repart_entries
+
+
+def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False, archive_path=None):
+    """Extract systemd-repart units/drop-ins from IMG and verify effective command.
+
+    Never accepts a drop-in by filename alone; fails closed when lsinitrd fails
+    or disagrees with the independently parsed cpio archive.
+    """
+    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
+    try:
+        _, entries = inspect_initramfs(img, lsinitrd_cmd=cmd, archive_path=archive_path)
+    except PolicyError as exc:
+        return False, [str(exc)]
     if not entries:
         return True, []
     with tempfile.TemporaryDirectory(prefix="a7a-initramfs-repart-") as td:
@@ -1037,6 +1252,73 @@ def repart_initramfs_ok(img, lsinitrd_cmd=None, forbid_repart=False):
         return repart_root_ok(tree)
 
 
+def initramfs_check(
+    img,
+    lsinitrd_cmd=None,
+    archive_path=None,
+    require_paths=(),
+    forbid_paths=(),
+    file_rel=None,
+    require_text=(),
+    forbid_text=(),
+):
+    """Verify path and member-text requirements against a completeness-checked initramfs."""
+    cmd = list(lsinitrd_cmd) if lsinitrd_cmd else ["lsinitrd"]
+    try:
+        all_rows, _ = inspect_initramfs(
+            img, lsinitrd_cmd=cmd, archive_path=archive_path
+        )
+    except PolicyError as exc:
+        return False, [str(exc)]
+    problems = []
+    paths = [rel for _, rel, _ in all_rows]
+    for pattern in require_paths:
+        if not any(re.search(pattern, p) for p in paths):
+            problems.append(f"initramfs {img} missing path matching {pattern!r}")
+    for pattern in forbid_paths:
+        if any(re.search(pattern, p) for p in paths):
+            problems.append(
+                f"initramfs {img} contains forbidden path matching {pattern!r}"
+            )
+    if file_rel is not None:
+        norm = _norm_archive_path(file_rel)
+        matches = [
+            (kind, meta)
+            for kind, rel, meta in all_rows
+            if rel == norm and kind == "file"
+        ]
+        if not matches:
+            if require_text:
+                problems.append(f"initramfs {img} missing file {norm}")
+        else:
+            expected_size = matches[-1][1]
+            extracted = subprocess.run(
+                cmd + ["-f", norm, str(img)], capture_output=True
+            )
+            if (
+                extracted.returncode != 0
+                or extracted.stderr.strip()
+                or len(extracted.stdout) != expected_size
+            ):
+                problems.append(
+                    f"cannot extract complete {norm} from {img} "
+                    f"(got {len(extracted.stdout)} bytes, expected {expected_size})"
+                )
+            else:
+                text = extracted.stdout.decode("utf-8", errors="replace")
+                for pattern in require_text:
+                    if not re.search(pattern, text):
+                        problems.append(
+                            f"{norm} in {img} missing text matching {pattern!r}"
+                        )
+                for pattern in forbid_text:
+                    if re.search(pattern, text):
+                        problems.append(
+                            f"{norm} in {img} contains forbidden text matching {pattern!r}"
+                        )
+    return (not problems, problems)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1055,6 +1337,16 @@ def main(argv=None):
     runner.add_argument("--chroot", type=Path)
     runner.add_argument("--run-build-ns", type=Path)
     p.add_argument("--forbid-repart", action="store_true")
+    p = sub.add_parser("initramfs-check")
+    p.add_argument("img")
+    ic_runner = p.add_mutually_exclusive_group()
+    ic_runner.add_argument("--chroot", type=Path)
+    ic_runner.add_argument("--run-build-ns", type=Path)
+    p.add_argument("--require-path", action="append", default=[])
+    p.add_argument("--forbid-path", action="append", default=[])
+    p.add_argument("--file")
+    p.add_argument("--require-text", action="append", default=[])
+    p.add_argument("--forbid-text", action="append", default=[])
     p = sub.add_parser("enabled-repos")
     p.add_argument("dirs", nargs="+", type=Path)
     p = sub.add_parser("dumpe2fs")
@@ -1099,17 +1391,43 @@ def main(argv=None):
         return 0 if ok else 1
     if a.cmd == "repart-initramfs":
         lsinitrd_cmd = None
+        archive_path = None
         if a.chroot:
             lsinitrd_cmd = ["chroot", str(a.chroot), "lsinitrd"]
+            archive_path = a.chroot / a.img.lstrip("/")
         elif a.run_build_ns:
             lsinitrd_cmd = [str(a.run_build_ns), "user", "lsinitrd"]
         try:
             ok, problems = repart_initramfs_ok(
-                a.img, lsinitrd_cmd=lsinitrd_cmd, forbid_repart=a.forbid_repart
+                a.img,
+                lsinitrd_cmd=lsinitrd_cmd,
+                forbid_repart=a.forbid_repart,
+                archive_path=archive_path,
             )
         except PolicyError as exc:
             print(f"repart-initramfs: {exc}", file=sys.stderr)
             return 1
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 0 if ok else 1
+    if a.cmd == "initramfs-check":
+        lsinitrd_cmd = None
+        archive_path = None
+        if a.chroot:
+            lsinitrd_cmd = ["chroot", str(a.chroot), "lsinitrd"]
+            archive_path = a.chroot / a.img.lstrip("/")
+        elif a.run_build_ns:
+            lsinitrd_cmd = [str(a.run_build_ns), "user", "lsinitrd"]
+        ok, problems = initramfs_check(
+            a.img,
+            lsinitrd_cmd=lsinitrd_cmd,
+            archive_path=archive_path,
+            require_paths=a.require_path,
+            forbid_paths=a.forbid_path,
+            file_rel=a.file,
+            require_text=a.require_text,
+            forbid_text=a.forbid_text,
+        )
         for problem in problems:
             print(problem, file=sys.stderr)
         return 0 if ok else 1

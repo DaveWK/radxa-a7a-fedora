@@ -1029,6 +1029,124 @@ def unreadable_directories_fail_closed():
             repo.chmod(0o644)
 
 
+def repart_silent_truncated_listing():
+    """B2: silent partial lsinitrd (exit 0, no stderr, cut after 1 valid row) fails."""
+    with fixture() as work:
+        tree = work / "tree"
+        write(tree / "usr/lib/modules/placeholder", "ok\n")
+        write(
+            tree / "usr/lib/systemd/system/systemd-repart.service",
+            "[Unit]\nDescription=Repart\n[Service]\nExecStart=systemd-repart\n",
+        )
+        img = work / "real.img"
+        _build_cpio_initramfs(tree, img)
+        rule = "=" * 72
+        row = "-rw-r--r--   1 root     root            3 Nov 19 06:00 usr/lib/modules/placeholder"
+        inject_log = work / "inject.log"
+
+        # Case 1: exit 0, no stderr, truncated after 1 valid row (no closing rule).
+        fake_open = work / "lsinitrd-trunc-open"
+        fake_open.write_text(
+            "#!/bin/sh\n"
+            f'echo "injected-open:$*" >> "{inject_log}"\n'
+            f'printf "%s\\n%s\\n" "{rule}" "{row}"\n'
+            "exit 0\n"
+        )
+        fake_open.chmod(0o755)
+        ok, problems = policy.repart_initramfs_ok(img, [str(fake_open)])
+        assert "injected-open:" in inject_log.read_text(), "fault was not injected"
+        assert not ok, f"silent truncated listing (no closing rule) passed: {problems}"
+
+        # Case 2: exit 0, no stderr, truncated after 1 valid row WITH closing rule
+        # (simulates internal cpio pipe truncation before sort in lsinitrd).
+        fake_closed = work / "lsinitrd-trunc-closed"
+        fake_closed.write_text(
+            "#!/bin/sh\n"
+            f'echo "injected-closed:$*" >> "{inject_log}"\n'
+            f'printf "%s\\n%s\\n%s\\n" "{rule}" "{row}" "{rule}"\n'
+            "exit 0\n"
+        )
+        fake_closed.chmod(0o755)
+        ok, problems = policy.repart_initramfs_ok(img, [str(fake_closed)])
+        assert "injected-closed:" in inject_log.read_text(), "fault was not injected"
+        assert (
+            not ok
+        ), f"silent truncated listing (with forged closing rule) passed: {problems}"
+
+        # Case 3: valid two-part initramfs (early cpio + gzip/xz/zstd main cpio) passes.
+        early = work / "early"
+        write(early / "early_cpio", "1\n")
+        early_img = work / "early.cpio"
+        _build_cpio_initramfs(early, early_img)
+        main_tree = work / "main"
+        build_repart_root(main_tree)
+        main_cpio = work / "main.cpio"
+        _build_cpio_initramfs(main_tree, main_cpio)
+        raw_main = main_cpio.read_bytes()
+        import gzip
+        import lzma
+
+        for name, compressed in (
+            ("gzip", gzip.compress(raw_main)),
+            ("xz", lzma.compress(raw_main)),
+        ):
+            combo = work / f"combo-{name}.img"
+            combo.write_bytes(early_img.read_bytes() + compressed)
+            ok, problems = policy.repart_initramfs_ok(combo)
+            assert ok, (name, problems)
+
+
+def initramfs_check_truncation_cases():
+    """S0-9: initramfs-check absence checks reject silent lsinitrd and -f truncation."""
+    with fixture() as work:
+        tree = work / "tree"
+        write(tree / "usr/lib/modules/extra/sun60i-a733-ccu.ko", "ko")
+        write(
+            tree / "etc/cmdline.d/20-force_drivers.conf",
+            'force_drivers+=" sun60i_a733_ccu pinctrl_sun60i_a733 "\n',
+        )
+        img = work / "rd.img"
+        _build_cpio_initramfs(tree, img)
+
+        # Clean positive check passes; forbidden text present fails.
+        ok, problems = policy.initramfs_check(
+            img,
+            require_paths=[r"/extra/sun60i-a733-ccu\.ko"],
+            forbid_paths=[r"pinctrl-sun60i-a733"],
+        )
+        assert ok, problems
+        ok, _ = policy.initramfs_check(
+            img,
+            file_rel="etc/cmdline.d/20-force_drivers.conf",
+            forbid_text=[r"pinctrl"],
+        )
+        assert not ok, "forbidden pinctrl text must fail"
+
+        # Silent truncation of `lsinitrd -f` after `sun60i_a733_ccu` before `pinctrl`
+        # must fail closed (byte-size mismatch against verified listing).
+        real_lsinitrd = shutil.which("lsinitrd")
+        inject_log = work / "inject-f.log"
+        wrapper = work / "lsinitrd-trunc-f"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-f" ]; then\n'
+            f'  echo "injected-f:$*" >> "{inject_log}"\n'
+            "  printf 'force_drivers+=\" sun60i_a733_ccu '\n"
+            "  exit 0\n"
+            "fi\n"
+            f'exec "{real_lsinitrd}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        ok, problems = policy.initramfs_check(
+            img,
+            lsinitrd_cmd=[str(wrapper)],
+            file_rel="etc/cmdline.d/20-force_drivers.conf",
+            forbid_text=[r"pinctrl"],
+        )
+        assert "injected-f:" in inject_log.read_text(), "fault was not injected"
+        assert not ok, f"truncated lsinitrd -f passed forbid_text: {problems}"
+
+
 def repart_incomplete_listing():
     with fixture() as work:
         fake = work / "listing"
@@ -1163,6 +1281,14 @@ def main():
     case(
         "policy: unreadable directories and repo files fail closed",
         unreadable_directories_fail_closed,
+    )
+    case(
+        "repart: silent truncated lsinitrd listing fails closed (B2)",
+        repart_silent_truncated_listing,
+    )
+    case(
+        "initramfs-check: silent truncation of lsinitrd and -f fails closed (S0-9)",
+        initramfs_check_truncation_cases,
     )
     case("repart: incomplete listing fails closed", repart_incomplete_listing)
     case("repart: good root", repart_good_root)

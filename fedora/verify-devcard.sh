@@ -175,16 +175,33 @@ for e in "$ROOT"/boot/loader/entries/*.conf; do
     # The root-on-SD path of this kernel series (release.sh): the board
     # kmods from extra/, and the stock modules.
     for m in ${boot_kmods%% -- *}; do
-        check "initramfs has the board kmod $m (extra/)" bash -c "'$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null | grep -q '/extra/$m.ko'"
+        check "initramfs has the board kmod $m (extra/)" \
+            python3 -I "$TOP/fedora/devcard-policy.py" initramfs-check \
+            --run-build-ns "$TOP/fedora/run-build-ns.sh" \
+            --require-path "/extra/${m}\\.ko" "$rd"
     done
     for m in ${boot_kmods##* -- }; do
-        check "initramfs has $m" bash -c "'$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null | grep -q '/$m.ko'"
+        check "initramfs has $m" \
+            python3 -I "$TOP/fedora/devcard-policy.py" initramfs-check \
+            --run-build-ns "$TOP/fedora/run-build-ns.sh" \
+            --require-path "/${m}\\.ko" "$rd"
     done
     if [ "$pinctrl_builtin" = yes ]; then
-        check "initramfs carries no A733 pinctrl module (the kernel's built-in driver binds)" bash -c "! '$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null | grep -q 'pinctrl-sun60i-a733'"
-        check "initramfs does not force-load a pinctrl module" bash -c "! '$TOP/fedora/run-build-ns.sh' user lsinitrd -f etc/cmdline.d/20-force_drivers.conf '$rd' 2>/dev/null | grep -q pinctrl"
+        check "initramfs carries no A733 pinctrl module (the kernel's built-in driver binds)" \
+            python3 -I "$TOP/fedora/devcard-policy.py" initramfs-check \
+            --run-build-ns "$TOP/fedora/run-build-ns.sh" \
+            --forbid-path "pinctrl-sun60i-a733" "$rd"
+        check "initramfs does not force-load a pinctrl module" \
+            python3 -I "$TOP/fedora/devcard-policy.py" initramfs-check \
+            --run-build-ns "$TOP/fedora/run-build-ns.sh" \
+            --file etc/cmdline.d/20-force_drivers.conf \
+            --forbid-text pinctrl "$rd"
     fi
-    check "initramfs force-loads the A733 drivers" bash -c "'$TOP/fedora/run-build-ns.sh' user lsinitrd -f etc/cmdline.d/20-force_drivers.conf '$rd' 2>/dev/null | grep -q sun60i_a733_ccu"
+    check "initramfs force-loads the A733 drivers" \
+        python3 -I "$TOP/fedora/devcard-policy.py" initramfs-check \
+        --run-build-ns "$TOP/fedora/run-build-ns.sh" \
+        --file etc/cmdline.d/20-force_drivers.conf \
+        --require-text sun60i_a733_ccu "$rd"
 done
 if [ "$pinctrl_builtin" = yes ]; then
     dkms_mods="sun60i-a733-ccu axp318w axp318-regulator dwmac-sun55i sun8i_thermal nvmem_sunxi_sid"
@@ -435,7 +452,12 @@ if [ "$BOOT_MODES" = protective ]; then
     for e in "$ROOT"/boot/loader/entries/*.conf; do
         case "$(basename "$e")" in *~*) continue ;; esac
         rd=$ROOT$(python3 -I "$TOP/fedora/devcard-policy.py" loader-entry "$e" initrd)
-        check "$(basename "$e" .conf): initramfs has systemd-volatile-root and overlay.ko" bash -c "l=\$('$TOP/fedora/run-build-ns.sh' user lsinitrd '$rd' 2>/dev/null); grep -q 'systemd/systemd-volatile-root\$' <<<\"\$l\" && grep -q 'systemd-volatile-root.service\$' <<<\"\$l\" && grep -q '/overlay.ko' <<<\"\$l\""
+        check "$(basename "$e" .conf): initramfs has systemd-volatile-root and overlay.ko" \
+            python3 -I "$TOP/fedora/devcard-policy.py" initramfs-check \
+            --run-build-ns "$TOP/fedora/run-build-ns.sh" \
+            --require-path 'systemd/systemd-volatile-root$' \
+            --require-path 'systemd-volatile-root\.service$' \
+            --require-path '/overlay\.ko' "$rd"
     done
 fi
 unsigned=$(grep -v -E '^gpg-pubkey' "$PACKAGES" | grep '(none)' | cut -d' ' -f1 | tr '\n' ' ')
