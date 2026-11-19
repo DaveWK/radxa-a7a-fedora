@@ -219,6 +219,79 @@ else
     bad "Should-fix 4c: remove deleted files before validating stream (rc=$rc, first=$(test -e "$tmp/fw-remove/first.bin" && echo yes || echo no), second=$(test -e "$tmp/fw-remove/second.bin" && echo yes || echo no)): $out"
 fi
 
+# F6 should-fix: remove reads one snapshot of the entry stream, checks its
+# producer's exit status, refuses an unterminated last line and validates
+# every field itself before deleting anything.
+mkdir -p "$tmp/bin-f6"
+cat >"$tmp/bin-f6/python3" <<EOF
+#!$real_py
+import os, subprocess, sys
+from pathlib import Path
+real = "$real_py"
+log_path = Path("$tmp/inject-f6.log")
+count_path = Path("$tmp/f6-call-count")
+stdin_bytes = sys.stdin.buffer.read()
+res = subprocess.run([real] + sys.argv[1:], input=stdin_bytes, capture_output=True)
+mode = os.environ.get("WIFI_F6_INJECT", "")
+if b'print(f"#END {count}")' in stdin_bytes and res.returncode == 0 and mode:
+    calls = (int(count_path.read_text()) if count_path.is_file() else 0) + 1
+    count_path.write_text(str(calls))
+    if calls >= 2:  # call 1 is check_manifest's; call 2 is remove's producer
+        out = res.stdout
+        with log_path.open("a") as fh:
+            fh.write(f"injected:{mode}:call={calls}\\n")
+        if mode == "badsha":
+            first = out.split(b"\\n", 1)
+            parts = first[0].split(b" ")
+            parts[2] = b"not-a-sha256"
+            out = b" ".join(parts) + b"\\n" + first[1]
+            sys.stdout.buffer.write(out)
+            sys.exit(0)
+        if mode == "exit1":
+            sys.stdout.buffer.write(out)
+            sys.exit(1)
+sys.stdout.buffer.write(res.stdout)
+sys.stderr.buffer.write(res.stderr)
+sys.exit(res.returncode)
+EOF
+chmod 0755 "$tmp/bin-f6/python3"
+f6_remove() { # NAME MODE MANIFEST
+    local name=$1 mode=$2 manifest=$3 out rc
+    rm -rf "$tmp/fw-f6" "$tmp/inject-f6.log" "$tmp/f6-call-count"
+    mkdir -p "$tmp/fw-f6"
+    printf 'aaa' >"$tmp/fw-f6/first.bin"
+    printf 'bbb' >"$tmp/fw-f6/second.bin"
+    out=$(env PATH="$tmp/bin-f6:$PATH" WIFI_F6_INJECT="$mode" \
+        CUBIE_A7A_WIFI_MANIFEST="$manifest" \
+        CUBIE_A7A_WIFI_FWDIR="$tmp/fw-f6" \
+        CUBIE_A7A_LINUX_FWDIR="$tmp/lf" \
+        CUBIE_A7A_SYSFS="$tmp/sysfs" \
+        "$script" remove 2>&1)
+    rc=$?
+    if [ -n "$mode" ] && [ ! -s "$tmp/inject-f6.log" ]; then
+        bad "$name: fault was never injected"
+    elif [ "$rc" -ne 0 ] && [ -f "$tmp/fw-f6/first.bin" ] && [ -f "$tmp/fw-f6/second.bin" ]; then
+        ok "$name"
+    else
+        bad "$name: remove deleted files or exited 0 (rc=$rc): $out"
+    fi
+}
+f6_remove "F6: remove refuses when the stream producer exits nonzero" exit1 "$tmp/two.manifest"
+f6_remove "F6: remove validates every field of its own snapshot (bad sha256)" badsha "$tmp/two.manifest"
+printf 'first.bin 3 %s required\nsecond.bin 3 %s required' "$sha_first" "$sha_b" >"$tmp/unterminated.manifest"
+f6_remove "F6: remove refuses a manifest whose last line is unterminated" "" "$tmp/unterminated.manifest"
+# Control: the same manifest, terminated, is removed.
+rm -rf "$tmp/fw-f6"
+mkdir -p "$tmp/fw-f6"
+printf 'aaa' >"$tmp/fw-f6/first.bin"
+if env CUBIE_A7A_WIFI_MANIFEST="$tmp/two.manifest" CUBIE_A7A_WIFI_FWDIR="$tmp/fw-f6" \
+    CUBIE_A7A_LINUX_FWDIR="$tmp/lf" CUBIE_A7A_SYSFS="$tmp/sysfs" \
+    "$script" remove >/dev/null 2>&1 && [ ! -e "$tmp/fw-f6/first.bin" ]; then
+    ok "F6: control: a valid manifest removes its files"
+else
+    bad "F6: control: a valid manifest did not remove its files"
+fi
+
 if [ "$fail" -gt 0 ]; then
     echo "$fail test(s) FAILED ($pass passed)"
     exit 1

@@ -45,12 +45,19 @@ EOF
 }
 
 # name size sha256 role, one manifest entry per line, followed by "#END <count>".
+# The manifest is read once; an unterminated last line is an error (exit 1,
+# no "#END"), never a silently dropped entry.
 entries() {
     [ -r "$MANIFEST" ] || die "manifest $MANIFEST missing"
     python3 -I - "$MANIFEST" <<'PY'
 import sys
+with open(sys.argv[1], "rb") as fh:
+    data = fh.read()
+if data and not data.endswith(b"\n"):
+    sys.stderr.write(f"cubie-a7a-wifi-firmware: manifest {sys.argv[1]}: unterminated last line\n")
+    sys.exit(1)
 count = 0
-for line in open(sys.argv[1]):
+for line in data.decode("utf-8").splitlines():
     if line.strip() and not line.lstrip().startswith("#"):
         parts = line.split()
         print(" ".join((parts + ["", "", "", ""])[:4]))
@@ -398,7 +405,11 @@ cmd_remove() {
         exit 2
     }
     [ -n "${CUBIE_A7A_WIFI_FWDIR:-}" ] || [ "$(id -u)" = 0 ] || die "remove needs root"
-    # Validate the entire manifest entry stream before deleting anything.
+    # One snapshot of the manifest's entry stream, its producer's exit status
+    # checked; every entry and the count validated here, from that snapshot,
+    # before anything is deleted.
+    local stream req=0
+    stream=$(entries) || die "manifest $MANIFEST could not be read in full; nothing removed"
     while read -r name size sha role; do
         if [ -n "$end_count" ]; then
             extra=1
@@ -411,12 +422,20 @@ cmd_remove() {
         fi
         [ -n "$name" ] && [[ $name =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] && [[ $name != *".."* ]] ||
             die "manifest entry stream invalid name: $name"
+        [[ $size =~ ^[0-9]+$ ]] && [[ $sha =~ ^[0-9a-fA-F]{64}$ ]] ||
+            die "manifest entry stream invalid size or sha256 for $name"
+        case $role in
+        required) req=$((req + 1)) ;;
+        optional) ;;
+        *) die "manifest entry stream invalid role for $name: $role" ;;
+        esac
         seen=$((seen + 1))
         names+=("$name")
-    done < <(entries)
+    done <<<"$stream"
     [ "$extra" = 0 ] || die "manifest entry stream has trailing lines after #END"
     [ -n "$end_count" ] && [ "$seen" = "$end_count" ] && [ "$seen" -gt 0 ] ||
         die "manifest entry stream truncated (saw $seen, expected ${end_count:-none})"
+    [ "$req" -gt 0 ] || die "manifest $MANIFEST has no required entries"
     for name in "${names[@]}"; do
         for f in "$FWDIR/$name" "$FWDIR/$name.xz" "$FWDIR/$name.zst"; do
             if [ -e "$f" ] || [ -L "$f" ]; then
