@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# shellcheck shell=bash disable=SC2034 # sourced: the callers use the variables
+# shellcheck shell=bash
 #
 # The Fedora release an image or package build targets. Sourced by
 # mkdevcard.sh, verify-devcard.sh and the build-*rpms.sh scripts (TOP set).
@@ -76,3 +76,9 @@ cubie_boot_kmods() {
     *) echo "sun60i-a733-ccu axp318w axp318-regulator -- sun6i-dma sunxi-mmc i2c-mv64xxx" ;;
     esac
 }
+
+# Sourced by mkdevcard.sh, verify-devcard.sh and build-*rpms.sh: reference the
+# exported release variables here so shellcheck sees them used without a disable.
+: "${FEDORA_RELEASE}" "${FEDORA_RAWHIDE_VERSION}" "${RELEASEVER}" "${RELEASE_NUM}" \
+    "${RELEASE_SUFFIX}" "${RELEASE_REPOS[*]}" "${RELEASE_PACKAGES[*]}" \
+    "${RELEASE_LABEL}" "${DIST}" "${REPOSDIR}"

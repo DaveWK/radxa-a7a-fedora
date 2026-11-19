@@ -1,6 +1,6 @@
 Name:           cubie-a7a-hat
 Version:        0.8
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Radxa Cubie A7A: router HAT (PCIe), NPU, GPU, display and video decoder bring-up service
 License:        GPL-2.0-only
 BuildArch:      noarch
@@ -12,7 +12,7 @@ Source4:        cubie-a7a-npu-selftest
 BuildRequires:  systemd-rpm-macros
 %{?systemd_requires}
 Requires:       cubie-a7a-board-support >= 0.7
-Requires:       kmod pciutils coreutils grep
+Requires:       kmod pciutils coreutils grep python3
 
 %description
 cubie-a7a-board-support keeps the A733 PCK-600 power-domain, SerDes and PCIe
@@ -59,6 +59,10 @@ install -Dpm0755 %{SOURCE4} %{buildroot}%{_bindir}/cubie-a7a-npu-selftest
 %{_prefix}/lib/modprobe.d/cubie-a7a-hat.conf
 
 %changelog
+* Thu Nov 19 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.8-2
+- Require python3 and fail closed (treat modules as blocked, load nothing)
+  when python3 is absent or a modprobe.d check cannot run
+
 * Wed Nov 11 2026 DaveWK <13626476+DaveWK@users.noreply.github.com> - 0.8-1
 - 0.6 behaviour restored (0.7 is withdrawn): powervr is in the module list
   again, cubie_a7a.gpu=0 skips it, and the package blacklists powervr from

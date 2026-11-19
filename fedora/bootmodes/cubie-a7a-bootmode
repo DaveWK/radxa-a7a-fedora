@@ -57,7 +57,8 @@ HAT_OFF=cubie_a7a.hat=0
 # The ro set the test board ran on first (set by hand then),
 # plus systemd-repart (the card's /etc/repart.d grows the root partition).
 PROTECT_ARGS="systemd.volatile=overlay fsck.mode=skip systemd.journald.storage=volatile rootflags=noload systemd.mask=boot-efi.mount systemd.mask=cubie-a7a-dtb.service systemd.mask=systemd-growfs-root.service systemd.mask=systemd-repart.service"
-# shellcheck disable=SC1091 # optional local override
+# Optional local override on the target board (not in this repository).
+# shellcheck source=/dev/null
 [ -f /etc/cubie-a7a/bootmodes.conf ] && . /etc/cubie-a7a/bootmodes.conf
 
 die() {

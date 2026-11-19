@@ -36,7 +36,7 @@ def case(name, fn):
     except AssertionError as exc:
         FAILURES.append(f"{name}: {exc}")
         print(f"FAIL {name}: {exc}")
-    except Exception as exc:  # noqa: BLE001 - a test error is a failure
+    except Exception as exc:  # a test error is a failure, not a pass
         FAILURES.append(f"{name}: {exc!r}")
         print(f"FAIL {name}: {exc!r}")
     else:
@@ -373,6 +373,25 @@ def passwd_sole_root_cases():
     )
 
 
+def passwd_malformed_ids_fail():
+    assert not policy.passwd_sole_root(
+        "root:x:oops:0:root:/root:/bin/bash\n"
+    ), "a malformed UID must fail, not read as 0"
+    assert not policy.passwd_sole_root(
+        "root:x:0:oops:root:/root:/bin/bash\n"
+    ), "a malformed GID must fail"
+    assert not policy.passwd_sole_root(
+        "root:x:0:0:root:/root:/bin/bash\ndave:x:1000::/home/dave:/bin/sh\n"
+    ), "a missing GID must fail"
+    assert not policy.passwd_sole_root("root:x:-1:0:root:/root:/bin/bash\n")
+    with fixture() as root:
+        p = root / "passwd"
+        write(p, "root:x:oops:0:root:/root:/bin/bash\n")
+        assert policy.main(["passwd-sole-root", str(p)]) == 1
+        write(p, "root:x:0:0:root:/root:/bin/bash\n")
+        assert policy.main(["passwd-sole-root", str(p)]) == 0
+
+
 REPART_UNIT = "usr/lib/systemd/system/systemd-repart.service"
 REPART_DROPIN = (
     "etc/systemd/system/systemd-repart.service.d/10-cubie-a7a-no-discard.conf"
@@ -620,6 +639,7 @@ def main():
     case("loader entry: empty and whitespace", loader_entry_empty_and_ws)
     case("shadow: root, others, empty", shadow_cases)
     case("passwd: sole root policy", passwd_sole_root_cases)
+    case("passwd: malformed uid/gid fails", passwd_malformed_ids_fail)
     case("repart: good root", repart_good_root)
     case("repart: indented override drops flag", repart_indented_override_drops_flag)
     case(

@@ -42,6 +42,14 @@ dmarker=$state/display-enable.trying
 vmarker=$state/vdec-enable.trying
 modules="sun55i_pck600 sun60i_a733_serdes sun60i_a733_pcie vipcore powervr"
 
+# The modprobe.d decisions below run through python3.  If python3 cannot run,
+# treat the HAT as blocked (fail closed): a module an administrator blocked
+# must never be loaded by name past that decision.
+command -v python3 >/dev/null 2>&1 || {
+    echo "cubie-a7a-hat-enable: python3 is required to check modprobe.d; refusing to load the HAT" >&2
+    exit 1
+}
+
 read -r cmdline <"$cmdline_file"
 case " $cmdline " in
 *" cubie_a7a.hat=0 "*)
@@ -77,7 +85,10 @@ for line in sys.stdin:
     if len(parts) >= 2 and parts[0] == "install" and parts[1].replace("-", "_") == want:
         print(" ".join(parts[2:]))
         break
-' "$n")
+' "$n") || {
+        echo "modprobe.d install check failed (python3 unavailable or errored; fail closed)"
+        return 0
+    }
     case ${cmd%% *} in
     false | true | */false | */true)
         echo "blocked in modprobe.d: install $n $cmd"
@@ -87,7 +98,8 @@ for line in sys.stdin:
     for d in $admin_dirs; do
         for f in "$d"/*.conf; do
             [ -f "$f" ] || continue
-            if python3 -I - "$n" "$f" <<'PY'; then
+            brc=0
+            python3 -I - "$n" "$f" <<'PY' || brc=$?
 import sys
 want, path = sys.argv[1], sys.argv[2]
 found = False
@@ -95,11 +107,19 @@ for line in open(path):
     parts = line.split()
     if len(parts) >= 2 and parts[0] == "blacklist" and parts[1].replace("-", "_") == want:
         found = True
-sys.exit(0 if found else 1)
+sys.exit(0 if found else 2)
 PY
+            case $brc in
+            0)
                 echo "blocked in modprobe.d: blacklist $n in $f"
                 return 0
-            fi
+                ;;
+            2) ;;
+            *)
+                echo "modprobe.d blacklist check failed for $f (python3 errored; fail closed)"
+                return 0
+                ;;
+            esac
         done
     done
     return 1

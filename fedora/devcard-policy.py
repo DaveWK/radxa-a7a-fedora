@@ -496,18 +496,22 @@ def shadow_fields(text):
 def passwd_sole_root(text):
     """Exactly one uid 0, named root, and no other human (1000-59999) user.
 
-    Mirrors the check-sshd awk over /etc/passwd.
+    A malformed UID or GID field is an error, never 0: ``root:x:oops:0:...``
+    must fail.
     """
     roots = 0
     for line in text.splitlines():
-        parts = line.split(":")
-        if len(parts) < 3:
+        if not line.strip():
             continue
-        user, uid = parts[0], parts[2]
-        try:
-            uid = int(uid)
-        except ValueError:
-            uid = 0
+        parts = line.split(":")
+        if len(parts) < 4:
+            return False
+        user, uid_field, gid_field = parts[0], parts[2], parts[3]
+        if not re.fullmatch(r"[0-9]+", uid_field) or not re.fullmatch(
+            r"[0-9]+", gid_field
+        ):
+            return False
+        uid = int(uid_field)
         if uid == 0:
             if user != "root":
                 return False
@@ -862,7 +866,12 @@ def main(argv=None):
         print(f"{salt}\t{root_hash}\t{' '.join(others)}")
         return 0
     if a.cmd == "passwd-sole-root":
-        if not passwd_sole_root(Path(a.path).read_text()):
+        try:
+            text = Path(a.path).read_text()
+        except OSError as exc:
+            print(f"{a.path}: unreadable ({exc})", file=sys.stderr)
+            return 1
+        if not passwd_sole_root(text):
             print(
                 f"{a.path}: not exactly one root login and no other human user",
                 file=sys.stderr,
