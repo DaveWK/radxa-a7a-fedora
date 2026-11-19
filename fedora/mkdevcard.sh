@@ -267,6 +267,8 @@ export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH FEDORA_RELEASE FEDORA_RAWHIDE_VERSI
 "$TOP/fedora/run-build-ns.sh" mount bash -s \
     "${PACKAGES[@]}" -- "${EXCLUDES[@]}" <<'STAGE1'
 set -euo pipefail
+# The namespace wrapper starts a fresh Bash; load this checkout's root helpers.
+. "$TOP/fedora/release.sh"
 pkgs=(); ex=()
 while [ $# -gt 0 ] && [ "$1" != -- ]; do pkgs+=("$1"); shift; done
 shift; ex=("$@")

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Synthetic staged-tree integrity fixtures."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,48 +20,69 @@ def check(args, rc, want=None):
     return result.stdout
 
 
-def root_selection(work):
+def root_selection(work, source):
+    # Run the real STAGE1 prologue and module loop through its fresh bash -s
+    # boundary, omitting unrelated mount, DNF and dracut work.
+    stage = source.split("<<'STAGE1'\n", 1)[1].split("\nSTAGE1\n", 1)[0]
+    prologue = stage.split("pkgs=(); ex=()", 1)[0]
+    marker = "    # Recheck root module ownership/depmod selection after overlays."
+    start = stage.rindex("while IFS= read -r k; do\n", 0, stage.index(marker))
+    end = stage.index('done <"$W/kernel.txt"\n', stage.index(marker))
+    module_loop = stage[start:end] + 'done <"$W/kernel.txt"\n'
     root = work / "kernel-root"
     version = "7.4.fixture"
     config = root / "usr/lib/modules" / version / "config"
-    config.parent.mkdir(parents=True)
+    extra = config.parent / "extra"
+    extra.mkdir(parents=True)
     config.write_text("CONFIG_PINCTRL_SUN60I_A733=y\n")
-    args = [
-        "bash",
-        "-euc",
-        r"""
-. "$1"
+    (work / "kernel.txt").write_text(f"{version}\n")
+    for module in ("sun60i-a733-serdes", "sun60i-a733-pcie", "sun55i-pck600"):
+        (extra / f"{module}.ko").touch()
+    stub = r"""
 chroot() {
-    [[ $1 == "$fixture_root" ]] || return 99
+    [[ $1 == "$ROOT" ]] || return 99
     case "$2" in
     modinfo)
         [[ $3 == -k && $5 == -n ]] || return 99
-        if [[ $6 == dwmac-sun55i && $mode == wrong-selection ]]; then
+        if [[ $6 == dwmac-sun55i && $MODE == wrong-selection ]]; then
             printf '/lib/modules/%s/kernel/%s.ko.zst\n' "$4" "$6"
         else
             printf '/lib/modules/%s/extra/%s.ko.zst\n' "$4" "$6"
         fi
         ;;
     test)
-        [[ $3 == -f && $4 == /lib/modules/*/extra/*.ko.zst && $mode != missing-file ]]
+        [[ $3 == -f && $4 == /lib/modules/*/extra/*.ko.zst && $MODE != missing-file ]]
         ;;
     *) return 99 ;;
     esac
 }
-mode=$4
-fixture_root=$2
-cubie_check_root_kmods "$2" "$3"
-""",
-        "root-fixture",
-        str(FEDORA / "release.sh"),
-        str(root),
-        version,
-    ]
-    check([*args, "good"], 0)
-    check([*args, "wrong-selection"], 1)
-    check([*args, "missing-file"], 1)
+"""
+
+    def launch(mode):
+        return subprocess.run(
+            ["bash", "-s", "--", "fixture-package", "--", "fixture-exclude"],
+            input=prologue + stub + module_loop,
+            env={
+                "PATH": os.environ["PATH"],
+                "TOP": str(FEDORA.parent),
+                "ROOT": str(root),
+                "W": str(work),
+                "MODE": mode,
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    good = launch("good")
+    if good.returncode:
+        sys.stderr.write(good.stderr)
+        raise SystemExit(good.returncode)
+    for mode in ("wrong-selection", "missing-file"):
+        bad = launch(mode)
+        assert bad.returncode == 1 and "board kmods incomplete" in bad.stderr, bad
     config.write_text("# pinctrl is not set\n")
-    check([*args, "good"], 1)
+    bad = launch("good")
+    assert bad.returncode == 1 and "board kmods incomplete" in bad.stderr, bad
 
 
 def cases(work):
@@ -138,7 +160,7 @@ def cases(work):
     assert indexes == sorted(indexes)
     assert stage.count('devcard-policy.py" aic-provenance') == 2
     assert "/usr/libexec/cubie-a7a/kernel check" not in stage
-    root_selection(work)
+    root_selection(work, stage)
     print("staged initramfs paths, overlay veto and root module checks passed")
 
 
