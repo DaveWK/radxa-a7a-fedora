@@ -19,3 +19,13 @@ This is a conservative literal-reference inventory, not a shell interpreter.
 It cannot discover targets assembled from fragments and run through `$cmd`.
 Keep repository program names visible in source and add a line-specific,
 reviewed argv sample when the inventory cannot safely recover a call.
+
+Manual samples bind to the whole caller and its in-tree argv-producing
+inputs. This includes argument assignments, conditional appends and
+conditionals; a changed input requires reviewing the samples before
+updating its hash. Simple checked arrays are expanded from source instead
+of duplicating their options. The `.mutation` fixtures change one such
+assignment without editing the call. The escaped-whitespace fixture
+keeps the escaped space and the adjacent `#` in argv.
+
+Fixtures run in memory and do not use a system temporary directory.

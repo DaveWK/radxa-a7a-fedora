@@ -24,9 +24,11 @@ import types
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+# Inventory at the Fedora ESP-fix/reword baseline.
 MIN_CLI_CALLS = 32
 MIN_INLINE_CALLS = 14
 MIN_MODULE_LOADS = 2
+MIN_ARGV_SAMPLES = 59
 DIGEST = "a" * 64
 VALUES = {
     # mkdevcard.sh: profile defaults, protective/maintenance choices and firmware fields.
@@ -61,20 +63,38 @@ INITRAMFS = "fedora/initramfs-policy.py"
 STAGED = "fedora/staged-root-policy.py"
 SELINUX = "fedora/selinux-label.py"
 MKDEV = "fedora/mkdevcard.sh"
-PROFILES = tuple(
-    ("--boot-modes", boot, "--grow-root", grow, "--first-boot", first)
-    for boot, grow, first in product(
-        VALUES["BOOT_MODES"], VALUES["GROW_ROOT"], VALUES["FIRST_BOOT"]
-    )
-)
-FIRMWARE = (
-    "--firmware-sha256",
-    DIGEST,
-    "--firmware-seek",
-    "256",
-    "--firmware-size",
-    "1024",
-)
+# A sampled call is bound to the complete caller, not just its invocation.
+# This deliberately includes every assignment, condition and array append,
+# even if a future change moves them into another branch of the same script.
+# Pin the in-tree sourced/argv-producing files too; no shell code is evaluated.
+ARGV_SHA256 = {
+    MKDEV: "df59352d067ad0cd08c5b257cae4a40913bbe4df32e4856cb80d62859852b70a",
+    "fedora/build-aarch64-rpms.sh": "a4385c42e6f662b0e15b78661a02129fa1fbfb8b519a20803ef2955aa71108d2",
+    "fedora/build-rpms.sh": "129c9b5452746ba6612e3337173aae1f1e4f0b8ef3a35342f2a51924e9edfb18",
+    "fedora/verify-devcard.sh": "6014641e021af19ccaf4f5ee97fe220563198dba7aaa2a6b9cfb1b152acffdc1",
+    "fedora/release.sh": "5837f8288befda61852227486211ddcff34711bc3204a1f6118882c34fddc6e6",
+    "fedora/bootmodes/cubie-a7a-bootmode": "7ebd7ff865a77c14f7933cb1d90e5e33a37561fe3cef9ecc017f48bfbb049bd5",
+    POLICY: "7b61dd68d6017fc01b75accc7245ed87e100e1c0a42f5e0f54719e7c95dc2b65",
+    MANIFEST: "bbc7ef17a5e94756c76172cdc07b565343b1ddea450ef9582f079d3b1e0489fd",
+    "fedora/stage-aic8800.py": "c3381b3bd7b7ca8e455a1f5ab39a889c1000171e3612d5c160312018cb1777c1",
+}
+ARGV_INPUTS = {
+    MKDEV: (
+        "fedora/release.sh",
+        POLICY,
+        MANIFEST,
+        "fedora/bootmodes/cubie-a7a-bootmode",
+    ),
+    "fedora/build-aarch64-rpms.sh": ("fedora/release.sh", POLICY),
+    "fedora/build-rpms.sh": ("fedora/release.sh", POLICY, "fedora/stage-aic8800.py"),
+    "fedora/verify-devcard.sh": (),
+}
+DERIVED_ARRAYS = {
+    "profile_args",
+    "firmware_args",
+    "aic_overlay_args",
+    "packed_policy_args",
+}
 MANUAL_RECORDS = {
     ("fedora/build-aarch64-rpms.sh", 32): (
         "e1f97bac420a4e3888255828c3839b9366f020d41b69a80c8d85dcaa3f7dd525",
@@ -130,10 +150,7 @@ MANUAL_RECORDS = {
     (MKDEV, 614): (
         "b00cc7922af34a2c39f78f65076ebe21af023cf1284408d53e97cc0e49bd0495",
         POLICY,
-        (
-            "aic-overlay /stub/OVERLAY",
-            "aic-overlay /stub/OVERLAY --manifest /stub/ROOT/usr/share/cubie-a7a/aic8800-d80-usb.manifest",
-        ),
+        ("${aic_overlay_args[@]}",),
     ),
     (MKDEV, 618): (
         "258dcc19199c8288f7c11d2fc90f2b0ec98c4af5a33aec16fae93f650d2f5c8b",
@@ -185,58 +202,25 @@ MANUAL_RECORDS = {
     (MKDEV, 723): (
         "513c9c1bca2e1315b2bc34f839c79b7fad9b055a745443a48f899f551da9bb5c",
         STAGED,
-        ("packed /stub/rootimg", "packed /stub/rootimg --protective"),
+        ("packed /stub/rootimg ${packed_policy_args[@]}",),
     ),
     (MKDEV, 785): (
         "5ffbce4d8e73b0432cd3323f95dbcfd5c061b5ca370e7c4ceb9b94de4cfb9ffc",
         MANIFEST,
-        tuple(
-            shlex.join(
-                (
-                    "write",
-                    "/stub/OUT",
-                    "/stub/ROOT",
-                    "[]",
-                    "/stub/manifest",
-                    "--esp-model",
-                    "/stub/W/esp-model.json",
-                    *profile,
-                    *firmware,
-                )
-            )
-            for profile, firmware in product(PROFILES, ((), FIRMWARE))
+        (
+            "write /stub/OUT /stub/ROOT '[]' /stub/manifest "
+            "--esp-model /stub/W/esp-model.json ${profile_args[@]} ${firmware_args[@]}",
         ),
     ),
     (MKDEV, 795): (
         "b6b04e75a2a8195d8bb225b88bd71db35aa0e2dea687b922fe87dd0842e2bcc1",
         MANIFEST,
-        tuple(
-            shlex.join(
-                (
-                    "seal",
-                    "/stub/OUT",
-                    "/stub/manifest",
-                    "/stub/receipt",
-                    "/stub/RPM_SNAPSHOT",
-                    "/stub/W/initramfs-digests.json",
-                    *profile,
-                    "--dram-identity",
-                    "",
-                    "--source-commit",
-                    "a" * 40,
-                    "--run-id",
-                    "fixture-run",
-                    "--started-utc",
-                    "2026-01-01T00:00:00Z",
-                    "--finished-utc",
-                    "2026-01-01T00:01:00Z",
-                    "--expect-manifest-sha256",
-                    DIGEST,
-                    "--expect-snapshot-sha256",
-                    DIGEST,
-                )
-            )
-            for profile in PROFILES
+        (
+            "seal /stub/OUT /stub/manifest /stub/receipt /stub/RPM_SNAPSHOT "
+            "/stub/W/initramfs-digests.json ${profile_args[@]} --dram-identity '' "
+            f"--source-commit {'a' * 40} --run-id fixture-run "
+            "--started-utc 2026-01-01T00:00:00Z --finished-utc 2026-01-01T00:01:00Z "
+            f"--expect-manifest-sha256 {DIGEST} --expect-snapshot-sha256 {DIGEST}",
         ),
     ),
 }
@@ -328,8 +312,11 @@ def shell_lex(text, quote=None, comments=False):
             and quote is None
             and (
                 position == 0
-                or text[position - 1].isspace()
-                or text[position - 1] in STOP
+                or (
+                    position - 1 in contexts
+                    and contexts[position - 1] is None
+                    and (text[position - 1].isspace() or text[position - 1] in STOP)
+                )
             )
         ):
             return contexts, quote, position
@@ -520,17 +507,57 @@ def expand(words, arrays, forwarded, seen=()):
     return tuple(dict.fromkeys(sum(group, ()) for group in product(*choices)))
 
 
-def manual_call(path, line, detail):
+def verify_argv_sources(path, source):
+    for name in (path, *ARGV_INPUTS[path]):
+        data = source.encode() if name == path else (ROOT / name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != ARGV_SHA256[name]:
+            raise ValueError(
+                f"{path}: argv-construction source changed: {name}; "
+                "re-audit its manual argv samples before repinning"
+            )
+
+
+def append_array(arrays, match):
+    name, operator, value = match.groups()
+    args = tuple(shlex.split(value))
+    if operator == "+=":
+        arrays[name].extend(prior + args for prior in tuple(arrays[name]))
+    else:
+        arrays[name].append(args)
+
+
+def derive_manual_arrays(source):
+    """Read the simple argv-array assignments, only after source validation."""
+    arrays = defaultdict(list)
+    for line in source.split("\n"):
+        if (match := ARRAY_ASSIGN.fullmatch(line)) and match[1] in DERIVED_ARRAYS:
+            append_array(arrays, match)
+    if arrays.keys() != DERIVED_ARRAYS or not all(arrays.values()):
+        raise ValueError("missing source assignments for sampled argv arrays")
+    return arrays
+
+
+def manual_call(path, line, detail, arrays=None):
     try:
         target, variants, reason = UNRESOLVED[(path, line)]
     except KeyError:
         raise ValueError(f"{path}:{line}: unlisted unresolved call: {detail}") from None
     if not variants or not reason:
         raise ValueError(f"{path}:{line}: manual override lacks argv samples or reason")
-    return Call(path, line, target, variants, "unresolved/sample", reason)
+    resolved = tuple(
+        dict.fromkeys(
+            argv for sample in variants for argv in expand(sample, arrays or {}, ())
+        )
+    )
+    if not resolved:
+        raise ValueError(f"{path}:{line}: no argv variants from manual override")
+    return Call(path, line, target, resolved, "unresolved/sample", reason)
 
 
 def shell_calls(path, source, programs, used_manual, used_forwarded):
+    if path in ARGV_INPUTS:
+        verify_argv_sources(path, source)
+    manual_arrays = derive_manual_arrays(source) if path == MKDEV else {}
     aliases = {}
     used_aliases = set()
     arrays = defaultdict(list)
@@ -547,12 +574,14 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
             )
         key = (path, line)
         if key in MANUAL_RECORDS:
+            if path not in ARGV_INPUTS:
+                raise ValueError(f"{path}:{line}: manual argv needs a source binding")
             fingerprint = hashlib.sha256(raw.encode()).hexdigest()
             if fingerprint != MANUAL_RECORDS[key][0] or body != reviewed_body(key):
                 raise ValueError(
                     f"{path}:{line}: source changed; re-audit the manual argv"
                 )
-        call = manual_call(path, line, detail)
+        call = manual_call(path, line, detail, manual_arrays)
         used_manual.add((path, line))
         used_aliases.update(
             match[1] or match[2]
@@ -612,12 +641,7 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
             if mentions:
                 yield unresolved(line, "repository Python reference in command array")
                 continue
-            name, operator, value = match.groups()
-            args = tuple(shlex.split(value))
-            if operator == "+=":
-                arrays[name].extend(previous + args for previous in tuple(arrays[name]))
-            else:
-                arrays[name].append(args)
+            append_array(arrays, match)
             continue
         if match := ASSIGN.fullmatch(text):
             name, value = match.groups()
@@ -677,6 +701,8 @@ def shell_calls(path, source, programs, used_manual, used_forwarded):
                         raise ValueError(f"unresolved script {script!r}")
                 reason, forwarded = FORWARDED.get((path, line), ("", ()))
                 if forwarded:
+                    if path not in ARGV_INPUTS:
+                        raise ValueError("forwarded sample needs a source binding")
                     used_forwarded.add((path, line))
                 variants = expand([token[0] for token in tokens], arrays, forwarded)
                 if not variants:
@@ -919,6 +945,30 @@ def check_argv(target, argv):
 def fixture_failures():
     target = "fedora/devcard-policy.py"
     folder = Path(__file__).parent / "fixtures" / "cli-calls"
+    source = (ROOT / MKDEV).read_bytes().decode()
+    for name in ("boot-modes.mutation", "manifest.mutation", "protective.mutation"):
+        before, after = (folder / name).read_text().splitlines()
+        if source.count(before) != 1:
+            yield f"fixture {name}: expected exactly one assignment"
+            continue
+        mutated = source.replace(before, after, 1)
+        before_lines = source.split("\n")
+        after_lines = mutated.split("\n")
+        changed = [
+            (a, b) for a, b in zip(before_lines, after_lines, strict=True) if a != b
+        ]
+        if len(changed) != 1 or "python3 " in changed[0][0]:
+            yield f"fixture {name}: edit must change only one argv assignment, not a call"
+            continue
+        try:
+            list(shell_calls(MKDEV, mutated, {target}, set(), set()))
+        except ValueError as exc:
+            if f"argv-construction source changed: {MKDEV}" in str(exc):
+                print(f"Fixture {name}: PASS (assignment-only change rejected)")
+            else:
+                yield f"fixture {name}: unexpected error: {exc}"
+        else:
+            yield f"fixture {name}: changed argv assignment was not rejected"
     for source, diagnostic in (
         ("cat <<$dynamic\n", "unsupported heredoc delimiter"),
         ("cat <<END-PY\nEND\n", "unterminated heredoc END-PY"),
@@ -939,6 +989,7 @@ def fixture_failures():
         ("inline-fake-heredoc.sh.fixture", None, 2),
         ("hyphenated-heredoc.sh.fixture", None, 4),
         ("unquoted-heredoc-body.sh.fixture", "in heredoc body", None),
+        ("escaped-whitespace-hash.sh.fixture", None, 1),
     ):
         path = folder / name
         try:
@@ -965,7 +1016,12 @@ def fixture_failures():
             yield f"fixture {name}: unresolved form did not raise an inventory error"
             continue
         quoted = ("|",) if name == "quoted-operator.sh.fixture" else ()
-        argv = ("passwd-sole-root", "/stub/path", *quoted, "--unexpected")
+        argument = (
+            "/stub/path #literal"
+            if name == "escaped-whitespace-hash.sh.fixture"
+            else "/stub/path"
+        )
+        argv = ("passwd-sole-root", argument, *quoted, "--unexpected")
         actual = [
             (call.line, call.target, variant)
             for call in calls
@@ -993,8 +1049,14 @@ def main():
     inline = sum(call.note == "inline Python" for call in calls)
     loads = sum(call.note == "module load" for call in calls)
     cli = counts["CLI"] + counts["unresolved/sample"]
+    samples = sum(len(call.variants) for call in calls)
     print(f"Inventory: {cli} CLI calls, {inline} inline Python, {loads} module loads")
-    if cli < MIN_CLI_CALLS or inline < MIN_INLINE_CALLS or loads < MIN_MODULE_LOADS:
+    if (
+        cli < MIN_CLI_CALLS
+        or inline < MIN_INLINE_CALLS
+        or loads < MIN_MODULE_LOADS
+        or samples < MIN_ARGV_SAMPLES
+    ):
         failures.append("inventory dropped below the pinned minimum")
     for call in calls:
         location = f"{call.path}:{call.line}"
@@ -1016,9 +1078,7 @@ def main():
             print(f"  {shlex.join(argv)}")
     for error in failures:
         print(f"FAIL: {error}", file=sys.stderr)
-    print(
-        f"Checked {sum(len(call.variants) for call in calls)} argv; {len(failures)} failure(s)"
-    )
+    print(f"Checked {samples} argv; {len(failures)} failure(s)")
     return bool(failures)
 
 
