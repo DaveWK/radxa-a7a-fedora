@@ -576,9 +576,13 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
         # Stub run-build-ns.sh in the fixture copy so mkdevcard.sh stops cleanly at STAGE1
         # after recording its exact PACKAGES (including BOARD_RPMS) argument vector.
         recorded = root / "recorded-stage1-args.txt"
+        stage_script = root / "stage-one.sh"
         stub = repo_fed / "run-build-ns.sh"
         stub.write_text(
-            "#!/usr/bin/env bash\n" f'printf "%s\\n" "$@" > "{recorded}"\n' "exit 42\n"
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$@" > "{recorded}"\n'
+            f'cat > "{stage_script}"\n'
+            "exit 42\n"
         )
         stub.chmod(0o755)
 
@@ -598,6 +602,12 @@ def test_mkdevcard_ignores_stale_rpms_and_rejects_truncated_manifest():
         assert res.returncode == 42, f"mkdevcard did not reach STAGE1:\n{res.stderr}"
         selected = recorded.read_text().splitlines()
         assert str(real_dtb.resolve()) in selected, selected
+        stage = stage_script.read_text()
+        assert (
+            "--repofrompath" not in stage
+        ), "board RPM directory is still a DNF source"
+        check = 'check-installed-rpms "$ROOT" "$RPM_RECORDS"'
+        assert stage.index("dnf5 -y install") < stage.index(check)
         assert not any(
             "cubie-a7a-aic8800-usb" in arg for arg in selected
         ), f"mkdevcard selected stale AIC RPM after skip: {selected}"

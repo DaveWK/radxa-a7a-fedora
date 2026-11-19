@@ -51,6 +51,8 @@ trees and real tool output, so a format is never re-derived from packed bytes:
   seal-rpm-run RUN    snapshot and freeze built RPMs, then make the local repo.
   load-rpm-run RUN    check local RPM copies, output the retained records and
                       tab-separated package, digest and path rows.
+  check-installed-rpms ROOT RECORDS
+                      compare the staged root rpmdb with the retained snapshot.
   write-rpm-manifest, stage-srpm, select-rpms
                       private provenance checks for the optional aarch64 stage.
   verify-rpmdb-list, absence-check
@@ -966,6 +968,10 @@ RUN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
 RPM_MANIFEST_VERSION = 3
 FWLOG_SRPM_PACKAGE = "cubie-a7a-fwlog"
 RPM_ITEM_RE = re.compile(r"(?:noarch|aarch64)/[A-Za-z0-9_.+~-]+\.rpm")
+RPM_SNAPSHOT_FIELDS = ("package", "nevra", "evr", "arch", "payload_sha256")
+RPM_SNAPSHOT_QUERY = (
+    r"%{NAME}\t%{NEVRA}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{ARCH}\t%{PAYLOADSHA256}\n"
+)
 
 
 def rpm_run_id():
@@ -1008,9 +1014,25 @@ def _check_rpm_digest(path, expected):
         raise PolicyError(f"sha256 mismatch for snapshot RPM: {path}")
 
 
-def _rpm_inventory(base):
+def _rpm_inventory(base, *, repodata=False):
+    if base.is_symlink() or not base.is_dir():
+        raise PolicyError(f"{base}: expected a regular RPM inventory directory")
     paths = []
     for arch in sorted(base.iterdir()):
+        if (
+            repodata
+            and arch.name == "repodata"
+            and arch.is_dir()
+            and not arch.is_symlink()
+        ):
+            for entry in sorted(arch.iterdir()):
+                if (
+                    entry.is_symlink()
+                    or not entry.is_file()
+                    or entry.suffix.lower() == ".rpm"
+                ):
+                    raise PolicyError(f"{entry}: unexpected repository metadata entry")
+            continue
         if (
             arch.name not in ("aarch64", "noarch")
             or arch.is_symlink()
@@ -1029,6 +1051,37 @@ def _rpm_inventory(base):
     return paths
 
 
+def _check_rpm_inventory(base, wanted, *, repodata=False):
+    found = {
+        p.relative_to(base).as_posix() for p in _rpm_inventory(base, repodata=repodata)
+    }
+    extras = sorted(found - wanted)
+    if extras:
+        raise PolicyError(f"{base / extras[0]}: not in RPM snapshot")
+    missing = sorted(wanted - found)
+    if missing:
+        raise PolicyError(f"{base / missing[0]}: missing from RPM inventory")
+
+
+def _rpm_snapshot_identity(path):
+    query = subprocess.run(
+        ["rpm", "-qp", "--qf", RPM_SNAPSHOT_QUERY, str(path)],
+        capture_output=True,
+        text=True,
+    )
+    fields = tuple(query.stdout.strip().split("\t"))
+    if (
+        query.returncode
+        or len(fields) != len(RPM_SNAPSHOT_FIELDS)
+        or not all(fields)
+        or not SHA256_HEX_RE.fullmatch(fields[-1])
+    ):
+        raise PolicyError(
+            f"{path}: no valid RPM identity or PAYLOADSHA256: {query.stderr.strip()}"
+        )
+    return fields
+
+
 def _allowed_rpm(package, arch):
     if arch == "noarch":
         return package in REQUIRED_BOARD_PACKAGES or package in OPTIONAL_NOARCH_PACKAGES
@@ -1042,8 +1095,6 @@ def seal_rpm_run(run):
     if os.path.lexists(snapshot) or os.path.lexists(repo):
         raise PolicyError(f"{run}: RPM snapshot or repository already exists")
     base = run / "out"
-    if base.is_symlink() or not base.is_dir():
-        raise PolicyError(f"{base}: expected the run's regular output directory")
     paths = _rpm_inventory(base)
     checks = run / "rpm-checks"
     if checks.exists():
@@ -1055,7 +1106,8 @@ def seal_rpm_run(run):
     records = []
     seen = set()
     for path in paths:
-        package, nevra, arch = _rpm_name_nevra_arch(path)
+        identity = _rpm_snapshot_identity(path)
+        package, _, _, arch, _ = identity
         if (
             arch != path.parent.name
             or not _allowed_rpm(package, arch)
@@ -1067,9 +1119,7 @@ def seal_rpm_run(run):
         seen.add(package)
         records.append(
             {
-                "package": package,
-                "nevra": nevra,
-                "arch": arch,
+                **dict(zip(RPM_SNAPSHOT_FIELDS, identity, strict=True)),
                 "relpath": path.relative_to(base).as_posix(),
                 "sha256": _file_digest(path, "sha256"),
             }
@@ -1122,10 +1172,11 @@ def load_rpm_run(run):
         raise PolicyError(f"{snapshot}: invalid run identity or RPM records")
     selected = []
     seen = set()
+    relpaths = set()
     for rec in data["rpms"]:
         if not isinstance(rec, dict) or not all(
             isinstance(rec.get(key), str) and rec[key]
-            for key in ("package", "nevra", "arch", "relpath", "sha256")
+            for key in (*RPM_SNAPSHOT_FIELDS, "relpath", "sha256")
         ):
             raise PolicyError(f"{snapshot}: incomplete RPM record")
         package, arch, rel = rec["package"], rec["arch"], rec["relpath"]
@@ -1133,8 +1184,10 @@ def load_rpm_run(run):
             not RPM_ITEM_RE.fullmatch(rel)
             or not rel.startswith(arch + "/")
             or not SHA256_HEX_RE.fullmatch(rec["sha256"])
+            or not SHA256_HEX_RE.fullmatch(rec["payload_sha256"])
             or not _allowed_rpm(package, arch)
             or package in seen
+            or rel in relpaths
         ):
             raise PolicyError(
                 f"{snapshot}: invalid or duplicate RPM record for {package!r}"
@@ -1142,12 +1195,68 @@ def load_rpm_run(run):
         path = repo / rel
         if path.parent.is_symlink() or any(c in str(path) for c in "\t\n\r"):
             raise PolicyError(f"{snapshot}: unsupported RPM path: {path!r}")
-        _check_rpm_digest(path, rec["sha256"])
         seen.add(package)
+        relpaths.add(rel)
         selected.append({**rec, "path": str(path)})
     if not set(REQUIRED_BOARD_PACKAGES) <= seen:
         raise PolicyError(f"{snapshot}: missing required board RPMs")
+    outputs = run / "out"
+    _check_rpm_inventory(outputs, relpaths)
+    _check_rpm_inventory(repo, relpaths, repodata=True)
+    for rec in selected:
+        source, copy = outputs / rec["relpath"], Path(rec["path"])
+        # Both files must match the snapshot byte for byte; query the copy's
+        # actual metadata rather than trusting the JSON identity fields.
+        _check_rpm_digest(source, rec["sha256"])
+        _check_rpm_digest(copy, rec["sha256"])
+        if _rpm_snapshot_identity(copy) != tuple(rec[k] for k in RPM_SNAPSHOT_FIELDS):
+            raise PolicyError(f"{copy}: RPM identity differs from snapshot")
     return selected
+
+
+def check_installed_rpms(root, records):
+    """Require exactly one installed match for every RPM selected for DNF."""
+    if not isinstance(records, list) or not records:
+        raise PolicyError("no selected RPM snapshot records")
+    wanted = {}
+    for rec in records:
+        if not isinstance(rec, dict) or not all(
+            isinstance(rec.get(key), str) and rec[key] for key in RPM_SNAPSHOT_FIELDS
+        ):
+            raise PolicyError("incomplete selected RPM snapshot record")
+        name = rec["package"]
+        if name in wanted or not SHA256_HEX_RE.fullmatch(rec["payload_sha256"]):
+            raise PolicyError(
+                f"{name}: invalid or duplicate selected RPM snapshot record"
+            )
+        wanted[name] = tuple(rec[key] for key in RPM_SNAPSHOT_FIELDS)
+    query = subprocess.run(
+        ["rpm", "--root", str(root), "-qa", "--qf", RPM_SNAPSHOT_QUERY],
+        capture_output=True,
+        text=True,
+    )
+    if query.returncode != 0:
+        raise PolicyError(
+            f"{root}: cannot query installed RPMs: {query.stderr.strip()}"
+        )
+    found = set()
+    for line in query.stdout.splitlines():
+        actual = tuple(line.split("\t"))
+        name = actual[0]
+        if name not in wanted:
+            continue
+        if name in found:
+            raise PolicyError(f"{root}: multiple installed RPMs named {name}")
+        expected = wanted[name]
+        if actual != expected:
+            raise PolicyError(
+                f"{root}: installed {name} differs from snapshot "
+                f"(NEVRA, EVR, ARCH, PAYLOADSHA256): got {actual[1:]}, expected {expected[1:]}"
+            )
+        found.add(name)
+    missing = sorted(wanted.keys() - found)
+    if missing:
+        raise PolicyError(f"{root}: snapshot RPM not installed: {', '.join(missing)}")
 
 
 def _rpm_name_nevra_arch(path):
@@ -1713,6 +1822,9 @@ def main(argv=None):
     p.add_argument("run", type=Path)
     p = sub.add_parser("load-rpm-run")
     p.add_argument("run", type=Path)
+    p = sub.add_parser("check-installed-rpms")
+    p.add_argument("root", type=Path)
+    p.add_argument("records")
     p = sub.add_parser("verify-rpmdb-list")
     p.add_argument("root", type=Path)
     p.add_argument("packages_file", type=Path)
@@ -1759,6 +1871,13 @@ def main(argv=None):
             return 1
         if not ok:
             print(f"unit-config: {msg}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "check-installed-rpms":
+        try:
+            check_installed_rpms(a.root, json.loads(a.records))
+        except (PolicyError, OSError, ValueError) as exc:
+            print(f"check-installed-rpms: {exc}", file=sys.stderr)
             return 1
         return 0
     if a.cmd == "unit-enabled":

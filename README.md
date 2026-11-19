@@ -45,7 +45,9 @@ hosts.
 Each build creates a new `runs/<id>` directory. With `FWREPO` set, run
 `fedora/build-aarch64-rpms.sh "$run"` before making the image. The final
 stage records `rpm-snapshot.json`, seals the RPM outputs and creates the
-local repository from verified copies.
+local repository from verified copies. Image builds pass only the checked
+RPM paths to DNF, without enabling that repository. After the transaction,
+the installed board RPMs must match the retained snapshot.
 
 `mkdevcard.sh FIRMWARE_BIN RUN_DIR` builds the image rootless. It installs
 Fedora packages with dnf5 into an aarch64 installroot inside a user

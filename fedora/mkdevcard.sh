@@ -142,8 +142,6 @@ DTB_RPM_SHA=
 rpm_inputs=$(python3 -I "$TOP/fedora/devcard-policy.py" load-rpm-run "$RPM_RUN") ||
     die "cannot select checked board RPMs from $RPM_RUN"
 RPM_RECORDS=${rpm_inputs%%$'\n'*}
-RPM_REPO_ID=a7a-board-${RPM_RUN##*/}
-RPM_REPO_URL=$(python3 -I -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).as_uri())' "$RPM_RUN/repo")
 while IFS=$'\t' read -r pkg rpm_sha rpm_path; do
     [ -n "$pkg" ] || continue
     BOARD_RPMS+=("$rpm_path")
@@ -254,7 +252,7 @@ echo "mkdevcard: root UUID $ROOT_UUID, ESP $ESP_UUID"
 # REPOSDIR and the repository names come from fedora/release.sh.
 DNF_CACHE=${DNF_CACHE:-$W/../dnf/cache-ns$RELEASE_SUFFIX}
 RELEASE_REPO_ARGS=${RELEASE_REPOS[*]}
-export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH FEDORA_RELEASE FEDORA_RAWHIDE_VERSION RELEASEVER RELEASE_LABEL RELEASE_REPO_ARGS DNF_CACHE KERNEL_VERSION FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT RPM_REPO_ID RPM_REPO_URL
+export TOP ROOT W ROOT_UUID ESP_UUID PW_HASH FEDORA_RELEASE FEDORA_RAWHIDE_VERSION RELEASEVER RELEASE_LABEL RELEASE_REPO_ARGS DNF_CACHE KERNEL_VERSION FIRMWARE_DTB_VERSION BUILD_JOBS REPOSDIR OVERLAY BOOT_MODES FIRST_BOOT GROW_ROOT RPM_RECORDS
 "$TOP/fedora/run-build-ns.sh" mount bash -s \
     "${PACKAGES[@]}" -- "${EXCLUDES[@]}" <<'STAGE1'
 set -euo pipefail
@@ -315,17 +313,17 @@ exclude=$(IFS=,; echo "${ex[*]}")
 mkdir -p "$W/rpm-home"
 echo '%_install_langs en_US' >"$W/rpm-home/.rpmmacros"
 # persistdir is relative to the installroot (a host path would be recreated
-# inside the image). Explicit local paths pin the exact board package files;
-# Fedora's package signature policy stays enabled for the Fedora repositories.
+# inside the image). Offer board RPMs only by their checked local paths; the
+# sealed copy directory is not enabled as a DNF repo. Fedora repos retain signature
+# checking, and their solver candidates must not replace any selected board RPM.
 read -ra release_repos <<<"$RELEASE_REPO_ARGS"
 HOME=$W/rpm-home dnf5 -y install --use-host-config --installroot="$ROOT" --forcearch=aarch64 --releasever="$RELEASEVER" \
     --setopt=reposdir="$REPOSDIR" --setopt=cachedir="$DNF_CACHE" \
     --setopt=persistdir=/var/lib/dnf --setopt=countme=False \
     --setopt=install_weak_deps=False --setopt=tsflags=nocontexts,nodocs \
     --setopt=keepcache=True --setopt=gpgcheck=True --setopt=localpkg_gpgcheck=False \
-    --repofrompath="$RPM_REPO_ID,$RPM_REPO_URL" --repo="$RPM_REPO_ID" \
-    --setopt="$RPM_REPO_ID.gpgcheck=False" --setopt="$RPM_REPO_ID.repo_gpgcheck=False" \
     --exclude="$exclude" "${release_repos[@]}" "${pkgs[@]}"
+python3 -I "$TOP/fedora/devcard-policy.py" check-installed-rpms "$ROOT" "$RPM_RECORDS"
 
 # BOOT_MODES=protective: every kernel's maintenance and full entries, with
 # the arguments the board package added to all entries after the kernel's
