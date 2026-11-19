@@ -129,14 +129,11 @@ check "boot/grub2/grub.cfg sets root to UUID $uuid" bash -c "'$TOP/fedora/run-bu
 fwstamp=$(cat "$ROOT/var/lib/cubie-a7a/firmware-dtb-version")
 pkgstamp=$(cat "$ROOT/usr/lib/cubie-a7a/dtb/VERSION")
 if [ "$fwstamp" -lt "$pkgstamp" ]; then
-    check "ESP DTB override present (firmware stamp $fwstamp < package $pkgstamp)" mtype -i "$ESP" ::/dtb/allwinner/sun60i-a733-cubie-a7a.dtb
+    check "ESP DTB override present and full ESP layout matches (firmware stamp $fwstamp < package $pkgstamp)" \
+        python3 -I "$TOP/fedora/devcard-policy.py" esp-check "$ESP" --expect-dtb
 else
-    esp_root_entries=$(mdir -b -i "$ESP" ::/ 2>/dev/null) || esp_root_entries=
-    if grep -qx '::/EFI/' <<<"$esp_root_entries" && ! grep -qixE '::/dtb/?' <<<"$esp_root_entries"; then
-        ok "no DTB override on the ESP (firmware DTB is current)"
-    else
-        bad "no DTB override on the ESP (firmware DTB is current)"
-    fi
+    check "no DTB override on the ESP and full ESP layout matches (firmware DTB is current)" \
+        python3 -I "$TOP/fedora/devcard-policy.py" esp-check "$ESP" --no-dtb
 fi
 
 echo "== kernel, BLS, initramfs"

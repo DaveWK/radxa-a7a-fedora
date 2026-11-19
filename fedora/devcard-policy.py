@@ -1718,6 +1718,120 @@ def check_absence(
     return (not problems, problems)
 
 
+ESP_BASE_ENTRIES = frozenset(
+    (
+        "efi",
+        "efi/boot",
+        "efi/fedora",
+        "efi/boot/bootaa64.efi",
+        "efi/boot/fbaa64.efi",
+        "efi/fedora/bootaa64.csv",
+        "efi/fedora/grub.cfg",
+        "efi/fedora/grubaa64.efi",
+        "efi/fedora/mmaa64.efi",
+        "efi/fedora/shim.efi",
+        "efi/fedora/shimaa64.efi",
+    )
+)
+ESP_DTB_ENTRIES = frozenset(
+    (
+        "dtb",
+        "dtb/allwinner",
+        "dtb/allwinner/sun60i-a733-cubie-a7a.dtb",
+        "dtb/allwinner/sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb",
+    )
+)
+FSCK_FAT_FOOTER_RE = re.compile(r": (\d+) files, \d+/\d+ clusters$")
+
+
+def esp_check(esp_img, expect_dtb):
+    """Verify the full ESP entry set with mdir, fsck.fat and our exact file list.
+
+    Cross-checks `mdir -/ -b` against independent `fsck.fat -n -l` (requiring
+    its positive `<N> files, ... clusters` footer to match the emitted rows)
+    and compares the verified entry set against the exact paths our build
+    places on the ESP. Anything missing or extra is refused.
+    """
+    esp = str(esp_img)
+    r_mdir = subprocess.run(
+        ["mdir", "-/", "-b", "-i", esp, "::/"], capture_output=True, text=True
+    )
+    if r_mdir.returncode != 0 or r_mdir.stderr.strip():
+        raise PolicyError(
+            f"mdir failed on {esp}: {r_mdir.stderr.strip() or f'exit {r_mdir.returncode}'}"
+        )
+    mdir_entries = set()
+    for raw in r_mdir.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not line.startswith("::/"):
+            raise PolicyError(f"malformed mdir row on {esp}: {raw!r}")
+        rel = line[3:].rstrip("/").lower()
+        if not rel or rel in mdir_entries:
+            raise PolicyError(f"invalid or duplicate mdir entry on {esp}: {raw!r}")
+        mdir_entries.add(rel)
+
+    r_fsck = subprocess.run(
+        ["fsck.fat", "-n", "-l", esp], capture_output=True, text=True
+    )
+    if r_fsck.returncode != 0 or r_fsck.stderr.strip():
+        raise PolicyError(
+            f"fsck.fat failed on {esp}: "
+            f"{r_fsck.stderr.strip() or r_fsck.stdout.strip() or f'exit {r_fsck.returncode}'}"
+        )
+    fsck_lines = [ln.strip() for ln in r_fsck.stdout.splitlines() if ln.strip()]
+    if not fsck_lines:
+        raise PolicyError(f"empty fsck.fat output on {esp}")
+    m_footer = FSCK_FAT_FOOTER_RE.search(fsck_lines[-1])
+    if not m_footer:
+        raise PolicyError(
+            f"incomplete fsck.fat listing on {esp}: missing summary footer"
+        )
+    footer_count = int(m_footer.group(1))
+    fsck_raw = []
+    for line in fsck_lines[:-1]:
+        if not line.startswith("Checking file /"):
+            continue
+        rest = line[len("Checking file /") :]
+        if not rest:
+            continue
+        rest = re.sub(r" \([^()]+\)$", "", rest)
+        fsck_raw.append(rest.rstrip("/").lower())
+    if len(fsck_raw) != footer_count:
+        raise PolicyError(
+            f"truncated fsck.fat listing on {esp}: "
+            f"saw {len(fsck_raw)} rows, footer reports {footer_count}"
+        )
+    # mkfs.fat -n EFI creates a root volume-label entry `/EFI`, so `/EFI`
+    # appears at most twice in fsck.fat (once as volume label, once as dir).
+    fsck_entries = set()
+    label_dup = 0
+    for item in fsck_raw:
+        if item in fsck_entries:
+            if item == "efi" and label_dup == 0:
+                label_dup += 1
+                continue
+            raise PolicyError(f"unexpected duplicate fsck.fat entry on {esp}: {item!r}")
+        fsck_entries.add(item)
+    if mdir_entries != fsck_entries:
+        raise PolicyError(
+            f"ESP listing mismatch on {esp}: mdir={len(mdir_entries)}, "
+            f"fsck.fat={len(fsck_entries)}"
+        )
+    expected = ESP_BASE_ENTRIES | ESP_DTB_ENTRIES if expect_dtb else ESP_BASE_ENTRIES
+    missing = sorted(expected - mdir_entries)
+    extra = sorted(mdir_entries - expected)
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append(f"missing={missing}")
+        if extra:
+            parts.append(f"extra={extra}")
+        raise PolicyError(f"ESP layout mismatch on {esp}: {', '.join(parts)}")
+    return len(mdir_entries)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1766,6 +1880,11 @@ def main(argv=None):
     p = sub.add_parser("verify-rpmdb-list")
     p.add_argument("root", type=Path)
     p.add_argument("packages_file", type=Path)
+    p = sub.add_parser("esp-check")
+    p.add_argument("esp", type=Path)
+    dtb_grp = p.add_mutually_exclusive_group(required=True)
+    dtb_grp.add_argument("--expect-dtb", action="store_true")
+    dtb_grp.add_argument("--no-dtb", action="store_true")
     p = sub.add_parser("absence-check")
     p.add_argument("root", type=Path)
     p.add_argument(
@@ -1906,6 +2025,13 @@ def main(argv=None):
             verify_rpmdb_list(a.root, a.packages_file)
         except PolicyError as exc:
             print(f"verify-rpmdb-list: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "esp-check":
+        try:
+            esp_check(a.esp, expect_dtb=a.expect_dtb)
+        except PolicyError as exc:
+            print(f"esp-check: {exc}", file=sys.stderr)
             return 1
         return 0
     if a.cmd == "absence-check":

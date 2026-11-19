@@ -1334,6 +1334,135 @@ def repart_initramfs_cases():
         assert not ok, "missing initramfs must fail closed"
 
 
+def esp_check_cases():
+    """Step 0 mdir: full ESP layout cross-checked with fsck.fat rejects prefixes and extras."""
+    assert shutil.which("mkfs.fat") and shutil.which("mcopy")
+    assert shutil.which("mdir") and shutil.which("fsck.fat")
+    with fixture() as work:
+        esp = work / "esp.img"
+        subprocess.run(
+            ["mkfs.fat", "-F", "32", "-n", "EFI", "-C", str(esp), "34000"],
+            check=True,
+            capture_output=True,
+        )
+        src = work / "src"
+        for rel in (
+            "EFI/BOOT/BOOTAA64.EFI",
+            "EFI/BOOT/fbaa64.efi",
+            "EFI/fedora/BOOTAA64.CSV",
+            "EFI/fedora/grub.cfg",
+            "EFI/fedora/grubaa64.efi",
+            "EFI/fedora/mmaa64.efi",
+            "EFI/fedora/shim.efi",
+            "EFI/fedora/shimaa64.efi",
+        ):
+            write(src / rel, "ok\n")
+        subprocess.run(
+            ["mcopy", "-s", "-p", "-m", "-i", str(esp), str(src / "EFI"), "::"],
+            check=True,
+            capture_output=True,
+        )
+        assert policy.esp_check(esp, expect_dtb=False) == 11
+        try:
+            policy.esp_check(esp, expect_dtb=True)
+            raise AssertionError("missing DTB must fail --expect-dtb")
+        except policy.PolicyError:
+            pass
+
+        # Add our exact DTB override files.
+        for rel in (
+            "dtb/allwinner/sun60i-a733-cubie-a7a.dtb",
+            "dtb/allwinner/sun60i-a733-cubie-a7a.dtb.cubie-a7a-dtb",
+        ):
+            write(src / rel, "dtb\n")
+        subprocess.run(
+            ["mcopy", "-s", "-p", "-m", "-i", str(esp), str(src / "dtb"), "::"],
+            check=True,
+            capture_output=True,
+        )
+        assert policy.esp_check(esp, expect_dtb=True) == 15
+        try:
+            policy.esp_check(esp, expect_dtb=False)
+            raise AssertionError("present DTB must fail --no-dtb")
+        except policy.PolicyError:
+            pass
+
+        # Silent mdir prefix truncation (returns only ::/EFI/ with exit 0) fails closed.
+        inj = work / "mdir-inj.log"
+        mdir_wrap = work / "bin-mdir/mdir"
+        mdir_wrap.parent.mkdir()
+        mdir_wrap.write_text(
+            "#!/bin/sh\n"
+            f'echo "injected:mdir-prefix:$*" >> "{inj}"\n'
+            'printf "::/EFI/\\n"\n'
+            "exit 0\n"
+        )
+        mdir_wrap.chmod(0o755)
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(here.parent / "devcard-policy.py"),
+                "esp-check",
+                str(esp),
+                "--no-dtb",
+            ],
+            env={**os.environ, "PATH": f"{mdir_wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert "injected:mdir-prefix:" in inj.read_text()
+        assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+
+        # Silent fsck.fat truncation (drops footer) fails closed.
+        fsck_inj = work / "fsck-inj.log"
+        fsck_wrap = work / "bin-fsck/fsck.fat"
+        fsck_wrap.parent.mkdir()
+        fsck_wrap.write_text(
+            "#!/bin/sh\n"
+            f'echo "injected:fsck-trunc:$*" >> "{fsck_inj}"\n'
+            'printf "fsck.fat 4.2\\nChecking file /\\nChecking file /EFI\\n"\n'
+            "exit 0\n"
+        )
+        fsck_wrap.chmod(0o755)
+        r2 = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(here.parent / "devcard-policy.py"),
+                "esp-check",
+                str(esp),
+                "--expect-dtb",
+            ],
+            env={**os.environ, "PATH": f"{fsck_wrap.parent}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert "injected:fsck-trunc:" in fsck_inj.read_text()
+        assert r2.returncode != 0, (r2.returncode, r2.stdout, r2.stderr)
+
+        # Extra unexpected file on ESP is refused.
+        write(src / "EFI/stray.efi", "extra\n")
+        subprocess.run(
+            [
+                "mcopy",
+                "-i",
+                str(esp),
+                str(src / "EFI/stray.efi"),
+                "::/EFI/stray.efi",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        try:
+            policy.esp_check(esp, expect_dtb=True)
+            raise AssertionError("extra ESP file must be refused")
+        except policy.PolicyError:
+            pass
+
+
 def main():
     case("aic-overlay: refuses firmware paths", aic_overlay_refuses_firmware_paths)
     case("aic-overlay: refuses symlink", aic_overlay_refuses_symlink)
@@ -1408,6 +1537,10 @@ def main():
     case(
         "verify-rpmdb-list: silent rpm -qa truncation fails closed (S0-8)",
         verify_rpmdb_list_cases,
+    )
+    case(
+        "esp-check: mdir + fsck.fat + exact ESP layout rejects prefixes and extras (Step 0)",
+        esp_check_cases,
     )
     case(
         "absence-check: matches and unreadable dirs fail closed (S0-10)",
